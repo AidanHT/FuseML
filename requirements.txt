@@ -1,0 +1,22 @@
+# FuseML Project Dependencies
+# Python 3.10+ required
+
+# Core ML Framework & GPU Compute
+torch>=2.0.0           # PyTorch with torch.fx for graph capture
+torchvision            # Vision utilities (optional, for example models)
+torchaudio             # Audio utilities (optional)
+
+# Kernel Development (note: triton requires special handling on Windows)
+# triton>=2.0.0        # Triton for CUDA kernel generation (see SETUP.md)
+
+# Development & Testing
+numpy                  # Numerical computing
+pytest>=7.0            # Unit testing framework
+pytest-cov             # Coverage reporting
+black>=22.0            # Code formatting
+mypy>=0.990            # Static type checking
+flake8>=4.0            # Linting
+
+# Optional: Performance profiling
+# tensorboard            # Visualization
+# wandb                  # Experiment tracking

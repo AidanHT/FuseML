@@ -1,0 +1,265 @@
+# ============================================================================
+# FuseML .gitignore — Comprehensive exclusions for Python/ML projects
+# ============================================================================
+
+# Claude Code & AI Assistant Files (NEVER commit)
+# ============================================================================
+.claude/
+.claudeignore
+claude-cache/
+CLAUDE.md
+CLAUDE.md.bak
+*.claude.*
+
+# Python Virtual Environments & Package Artifacts
+# ============================================================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+venv/
+ENV/
+env/
+.venv
+
+# Conda Environments (local, not committed)
+# ============================================================================
+miniconda3/
+anaconda3/
+.conda/
+envs/
+pkgs/
+
+# IDE & Editor Settings (local only)
+# ============================================================================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+.project
+.pydevproject
+.settings/
+*.sublime-project
+*.sublime-workspace
+.vim
+.emacs.d/
+.netrwhist
+
+# Testing & Coverage Reports
+# ============================================================================
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+.pytest_cache/
+htmlcov/
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Jupyter Notebook & IPython
+# ============================================================================
+.ipynb_checkpoints/
+*.ipynb
+.ipython/
+profile_default/
+
+# Documentation Build Files
+# ============================================================================
+site/
+docs/_build/
+docs/.buildinfo
+
+# OS & System Files
+# ============================================================================
+*.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.DocumentRevisions-V100
+.fseventsd
+.Spotlight-V100
+.TemporaryItems
+.Trashes
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+*.cab
+*.msi
+*.msix
+*.msinstaller
+*.lnk
+
+# PyCharm
+# ============================================================================
+*.iml
+out/
+*.iws
+*.ipr
+*.manifest
+*.spec
+
+# Spyder IDE
+# ============================================================================
+.spyderproject
+.spyproject
+
+# Rope project settings
+# ============================================================================
+.ropeproject
+
+# mkdocs documentation
+# ============================================================================
+/site
+
+# Machine Learning & Data (large files, models)
+# ============================================================================
+*.pt
+*.pth
+*.h5
+*.pb
+*.ckpt
+*.safetensors
+*.onnx
+models/
+checkpoints/
+weights/
+data/
+datasets/
+*.tar.gz
+*.zip
+
+# CUDA & GPU Build Artifacts
+# ============================================================================
+*.cubin
+*.fatbin
+*.o
+*.a
+*.lib
+*.exp
+*.def
+*.so
+*.dll
+*.dylib
+
+# Triton Compiler Cache
+# ============================================================================
+.triton/
+triton_cache/
+*.triton
+
+# Performance Profiling & Logging
+# ============================================================================
+*.prof
+*.log
+logs/
+*.trace
+profiling/
+*.nsys-rep
+*.sqlite
+
+# Temporary & Build Files
+# ============================================================================
+*.tmp
+*.temp
+*.bak
+*.backup
+*.orig
+*.rej
+*.swp
+*.swo
+*~
+*.patch
+
+# Environment Variables (secrets — NEVER commit)
+# ============================================================================
+.env
+.env.local
+.env.*.local
+secrets/
+credentials/
+*.key
+*.pem
+*.crt
+
+# IDE Workspace Files (local state)
+# ============================================================================
+.vscode/settings.json
+.vscode/launch.json
+.vscode/extensions.json
+.vscode/*.log
+.idea/workspace.xml
+.idea/tasks.xml
+
+# Mac-specific
+# ============================================================================
+.AppleDouble
+.LSOverride
+*.swp
+.DS_Store
+._*
+.Spotlight-V100
+.Trashes
+
+# Windows-specific
+# ============================================================================
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Conda Lock Files (optional, depending on workflow)
+# ============================================================================
+conda-lock.yml
+*.lock
+
+# Poetry (if used)
+# ============================================================================
+poetry.lock
+
+# Build Directories
+# ============================================================================
+*.egg-info
+.eggs
+dist
+build
+
+# ============================================================================
+# EXPLICIT KEEP: Files to always track
+# ============================================================================
+!.gitkeep
+!requirements.txt
+!setup.py
+!pyproject.toml
+!SETUP.md
+!README.md
+!.gitignore
