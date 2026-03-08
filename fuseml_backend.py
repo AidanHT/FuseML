@@ -32,6 +32,22 @@ logger = logging.getLogger("fuseml")
 
 
 # ---------------------------------------------------------------------------
+# Placeholder for fused kernel calls (replaced by Triton codegen later)
+# ---------------------------------------------------------------------------
+def fuseml_fused_kernel_placeholder(*args):
+    """Placeholder target for fused kernel nodes inserted during graph surgery.
+
+    This function is never executed directly — it serves as a symbolic target
+    in the FX graph that downstream Triton codegen will replace with a
+    compiled kernel call.
+    """
+    raise RuntimeError(
+        "fuseml_fused_kernel_placeholder should never be called directly. "
+        "It must be replaced by a compiled Triton kernel before execution."
+    )
+
+
+# ---------------------------------------------------------------------------
 # SupportedOpsRegistry — extensible registry of low arithmetic-intensity ops
 # ---------------------------------------------------------------------------
 class SupportedOpsRegistry:
@@ -308,19 +324,61 @@ class FuseMLFusionPass:
     def _apply_surgery(self, groups: List[FusionGroup]) -> None:
         """Replace each *FusionGroup* in the graph with a fused kernel call.
 
-        For every group, this method will:
-        1. Generate the corresponding Triton kernel source.
-        2. Insert a new ``call_function`` node targeting the compiled kernel.
-        3. Rewire downstream consumers to read from the new node.
-        4. Erase the original fused nodes from the graph.
+        For every group, this method:
+        1. Inserts a new ``call_function`` node targeting
+           :func:`fuseml_fused_kernel_placeholder` immediately after the
+           group's output node.
+        2. Wires the new node's args to the group's external ``inputs``.
+        3. Rewires all downstream consumers of the output node to read
+           from the new placeholder node instead.
+        4. After all groups are processed, eliminates dead code (the
+           now-disconnected original sequences) and recompiles the
+           ``GraphModule``.
 
         Parameters
         ----------
         groups : list[FusionGroup]
             Fusion groups produced by :meth:`_find_fusion_groups`.
         """
-        # TODO: implement graph surgery + Triton codegen integration
-        pass
+        graph = self.graph_module.graph
+
+        for group in groups:
+            # --- Insert placeholder node after the group's output ----------
+            with graph.inserting_after(group.output_node):
+                new_fused_node = graph.call_function(
+                    fuseml_fused_kernel_placeholder,
+                    args=tuple(group.inputs),
+                )
+
+            # Copy metadata so downstream passes can inspect the group.
+            new_fused_node.meta["fusion_group"] = group
+            new_fused_node.meta["fused_op_names"] = [
+                n.name for n in group.all_nodes
+            ]
+
+            logger.debug(
+                "Inserted fused placeholder %s for group %s",
+                new_fused_node.name,
+                group,
+            )
+
+            # --- Rewire downstream consumers to the new node ---------------
+            group.output_node.replace_all_uses_with(
+                new_fused_node,
+                # Don't replace the use *inside* the new node itself — its
+                # args are the group's external inputs, not the output node,
+                # but guard against edge cases.
+                propagate_meta=False,
+            )
+
+        # --- Cleanup: remove dead original nodes & recompile ---------------
+        graph.eliminate_dead_code()
+        self.graph_module.recompile()
+
+        logger.info(
+            "Graph surgery complete — %d group(s) replaced with placeholder kernels.",
+            len(groups),
+        )
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -344,7 +402,6 @@ class FuseMLFusionPass:
         if groups:
             logger.info("Found %d fusion group(s) — applying graph surgery.", len(groups))
             self._apply_surgery(groups)
-            self.graph_module.recompile()
         else:
             logger.info("No fusible sequences detected — graph unchanged.")
 
