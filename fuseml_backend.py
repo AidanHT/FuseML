@@ -15,7 +15,7 @@ is preserved while the fusion infrastructure is built out.
 from __future__ import annotations
 
 import logging
-from typing import Callable, List
+from typing import Callable, Dict, List, Set
 
 import torch
 import torch.nn as nn
@@ -31,45 +31,129 @@ logger = logging.getLogger("fuseml")
 
 
 # ---------------------------------------------------------------------------
-# Fusion-candidate op targets
+# SupportedOpsRegistry — extensible registry of low arithmetic-intensity ops
 # ---------------------------------------------------------------------------
-# TorchDynamo may emit graphs at different decomposition levels:
-#   - High-level: torch.nn.functional.linear / gelu  (default backend)
-#   - Aten-level: aten.addmm.default / aten.gelu.default  (with aot_autograd)
-# We match both so the pattern detector works regardless of decomposition.
-#
-# Why these matter:
-#   addmm / linear  — produces an intermediate tensor, writes it to HBM.
-#   gelu             — immediately reads that tensor back from HBM into SRAM.
-# Fusing them keeps the intermediate in SRAM, eliminating the round-trip.
-_LINEAR_TARGETS = {
-    torch.ops.aten.addmm.default,       # aten decomposition of nn.Linear
-    torch.nn.functional.linear,          # high-level functional op
-}
-_GELU_TARGETS = {
-    torch.ops.aten.gelu.default,         # aten decomposition of nn.GELU
-    torch.nn.functional.gelu,            # high-level functional op
-}
+class SupportedOpsRegistry:
+    """Registry of ops eligible for fusion based on arithmetic intensity.
 
+    Low arithmetic-intensity (memory-bound) ops spend most of their wall-clock
+    time moving data between HBM and SRAM rather than doing FLOPs.  Fusing
+    consecutive memory-bound ops into a single Triton kernel eliminates the
+    intermediate HBM round-trips.
 
-class FuseMLBackend:
-    """Custom ``torch.compile`` backend that inspects FX graphs for fusible
-    memory-bound operator patterns.
+    Usage
+    -----
+    >>> registry = SupportedOpsRegistry()
+    >>> registry.register(torch.ops.aten.relu.default, "elementwise")
+    >>> registry.is_supported(torch.ops.aten.relu.default)
+    True
 
-    The backend is invoked by TorchDynamo once per unique graph structure.
-    It walks the graph nodes, applies lightweight pattern-matching passes,
-    and returns the *unmodified* forward callable so that eager execution
-    remains intact during this interception phase.
-
-    Attributes
-    ----------
-    fusion_candidates : list[tuple[torch.fx.Node, torch.fx.Node]]
-        Accumulated (linear_node, activation_node) pairs identified across
-        all graphs processed by this backend instance.
+    The *category* string is free-form metadata that downstream passes can use
+    to select fusion strategies (e.g. "elementwise" ops can always tile 1-D,
+    while "reduction" ops need an accumulator dimension).
     """
 
     def __init__(self) -> None:
-        self.fusion_candidates: list[tuple[torch.fx.Node, torch.fx.Node]] = []
+        # Maps op target -> category string for downstream strategy selection.
+        self._ops: Dict[Callable, str] = {}
+
+    # ------------------------------------------------------------------
+    # Mutation
+    # ------------------------------------------------------------------
+    def register(self, op_target: Callable, category: str = "memory_bound") -> None:
+        """Add *op_target* to the registry under *category*."""
+        self._ops[op_target] = category
+        logger.debug("Registered op: %s [%s]", op_target, category)
+
+    def register_many(
+        self, targets: List[Callable], category: str = "memory_bound"
+    ) -> None:
+        """Convenience batch registration."""
+        for t in targets:
+            self.register(t, category)
+
+    def unregister(self, op_target: Callable) -> None:
+        """Remove *op_target* from the registry (no-op if absent)."""
+        self._ops.pop(op_target, None)
+
+    # ------------------------------------------------------------------
+    # Queries
+    # ------------------------------------------------------------------
+    def is_supported(self, op_target: Callable) -> bool:
+        return op_target in self._ops
+
+    def get_category(self, op_target: Callable) -> str | None:
+        return self._ops.get(op_target)
+
+    @property
+    def targets(self) -> Set[Callable]:
+        """Snapshot of all registered op targets."""
+        return set(self._ops)
+
+    def __contains__(self, op_target: Callable) -> bool:
+        return self.is_supported(op_target)
+
+    def __len__(self) -> int:
+        return len(self._ops)
+
+    def __repr__(self) -> str:
+        entries = ", ".join(
+            f"{getattr(t, 'name', str(t))}({c})" for t, c in self._ops.items()
+        )
+        return f"SupportedOpsRegistry([{entries}])"
+
+
+def build_default_registry() -> SupportedOpsRegistry:
+    """Create a registry pre-loaded with the baseline set of fusible ops.
+
+    Currently registers only ``aten.addmm.default`` (the aten decomposition of
+    ``nn.Linear``).  This is the canonical memory-bound producer: it writes a
+    full intermediate activation tensor to HBM that downstream elementwise ops
+    immediately re-read.
+
+    To extend, call ``registry.register(op, category)`` after construction::
+
+        registry = build_default_registry()
+        registry.register(torch.ops.aten.relu.default,  "elementwise")
+        registry.register(torch.ops.aten.gelu.default,  "elementwise")
+        registry.register(torch.ops.aten.add.Tensor,    "elementwise")
+    """
+    registry = SupportedOpsRegistry()
+
+    # --- Baseline: linear (matmul + bias) is the primary HBM producer ------
+    registry.register(torch.ops.aten.addmm.default, "linear")
+
+    return registry
+
+
+# ---------------------------------------------------------------------------
+# FuseMLCompiler — torch.compile backend
+# ---------------------------------------------------------------------------
+class FuseMLCompiler:
+    """Custom ``torch.compile`` backend that inspects FX graphs for fusible
+    memory-bound operator patterns using a :class:`SupportedOpsRegistry`.
+
+    The compiler is invoked by TorchDynamo once per unique graph structure.
+    It walks the graph nodes, tags those whose targets appear in the registry
+    as ``fusion_candidates``, prints the annotated graph, and returns the
+    *unmodified* forward callable so eager execution remains intact during
+    this interception phase.
+
+    Parameters
+    ----------
+    registry : SupportedOpsRegistry | None
+        Op registry to match against.  Defaults to :func:`build_default_registry`.
+
+    Attributes
+    ----------
+    fusion_candidates : list[torch.fx.Node]
+        Accumulated nodes tagged as fusion candidates across all graphs
+        processed by this compiler instance.
+    """
+
+    def __init__(self, registry: SupportedOpsRegistry | None = None) -> None:
+        self.registry: SupportedOpsRegistry = registry or build_default_registry()
+        self.fusion_candidates: List[torch.fx.Node] = []
 
     # ------------------------------------------------------------------
     # Entry point called by torch.compile for each captured sub-graph
@@ -102,60 +186,62 @@ class FuseMLBackend:
             len(list(gm.graph.nodes)),
         )
 
-        self._match_linear_activation(gm)
+        self.capture_and_print_graph(gm)
 
         # ── Passthrough: return unmodified forward for eager execution ──
         return gm.forward
 
     # ------------------------------------------------------------------
-    # Pattern-matching passes
+    # Graph capture, tagging, and printing
     # ------------------------------------------------------------------
-    def _match_linear_activation(self, gm: torch.fx.GraphModule) -> None:
-        """Identify contiguous ``Linear -> GeLU`` sequences in *gm*.
+    def capture_and_print_graph(self, gm: torch.fx.GraphModule) -> None:
+        """Walk the FX graph, tag registry-matched nodes, and print the result.
 
-        Matches both high-level (functional.linear/gelu) and aten-level
-        (addmm/gelu) decompositions so detection works at any graph level.
+        For every ``call_function`` node whose target is in ``self.registry``,
+        we attach ``node.meta['fusion_candidate'] = True`` and the op's
+        registry category.  This metadata propagates to downstream passes
+        (pattern grouping, Triton codegen) without mutating the graph
+        structure itself.
 
-        Why this matters from a hardware perspective:
-        * ``addmm`` / ``linear`` produces an intermediate tensor and writes
-          it to HBM (~1.5 TB/s on A100).
-        * ``gelu`` immediately reads that tensor back from HBM into SRAM
-          (~19 TB/s on A100) just to apply an element-wise activation.
-        * Fusing these two ops into a single Triton kernel keeps the
-          intermediate entirely in SRAM, eliminating one full round-trip
-          to global memory per token per layer.
+        A formatted summary of the graph is logged at INFO level so the
+        developer can see the full node list with fusion annotations.
         """
         found: int = 0
 
         for node in gm.graph.nodes:
-            # We only care about call_function nodes — skip placeholders,
-            # getattr, output, etc.
             if node.op != "call_function":
                 continue
 
-            if node.target not in _LINEAR_TARGETS:
-                continue
+            if self.registry.is_supported(node.target):
+                node.meta["fusion_candidate"] = True
+                node.meta["fusion_category"] = self.registry.get_category(node.target)
+                self.fusion_candidates.append(node)
+                found += 1
 
-            # Check downstream consumers: does any user of this linear op
-            # immediately apply gelu?  We inspect node.users which maps
-            # consumer nodes -> number of uses.
-            for user in node.users:
-                if (
-                    user.op == "call_function"
-                    and user.target in _GELU_TARGETS
-                ):
-                    self.fusion_candidates.append((node, user))
-                    found += 1
-                    logger.info(
-                        "Fusion candidate found: [%s (Linear) -> %s (GeLU)]  "
-                        "— intermediate tensor can be kept in SRAM, "
-                        "avoiding HBM round-trip.",
-                        node.name,
-                        user.name,
-                    )
+        # ── Print annotated graph ──────────────────────────────────────
+        logger.info("--- FX Graph Dump (fusion candidates marked with *) ---")
+        for node in gm.graph.nodes:
+            is_candidate = node.meta.get("fusion_candidate", False)
+            marker = " * [FUSION CANDIDATE]" if is_candidate else ""
+            category = ""
+            if is_candidate:
+                category = f" (category={node.meta.get('fusion_category', '?')})"
+            logger.info(
+                "  %-12s %-30s target=%-40s%s%s",
+                node.op,
+                node.name,
+                str(getattr(node.target, "name", node.target))[:40],
+                marker,
+                category,
+            )
+        logger.info("--- End Graph Dump ---")
 
-        if found == 0:
-            logger.info("No Linear -> GeLU patterns detected in this graph.")
+        if found:
+            logger.info(
+                "Tagged %d node(s) as fusion candidates via registry.", found
+            )
+        else:
+            logger.info("No registry-matched ops detected in this graph.")
 
 
 # ======================================================================
@@ -171,8 +257,8 @@ def main() -> None:
         nn.GELU(),
     )
 
-    backend = FuseMLBackend()
-    compiled_model = torch.compile(model, backend=backend)
+    compiler = FuseMLCompiler()  # uses default registry (addmm only)
+    compiled_model = torch.compile(model, backend=compiler)
 
     # ── Run a forward pass to trigger graph capture ───────────────────
     x: torch.Tensor = torch.randn(4, 128)
@@ -190,7 +276,7 @@ def main() -> None:
     logger.info(
         "Validation passed — compiled output matches eager output "
         "(atol=1e-3, rtol=1e-3).  %d fusion candidate(s) logged.",
-        len(backend.fusion_candidates),
+        len(compiler.fusion_candidates),
     )
 
 
