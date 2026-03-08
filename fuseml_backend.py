@@ -188,12 +188,42 @@ class FuseMLFusionPass:
     # ------------------------------------------------------------------
     # Phase 1 — Discover fusible groups
     # ------------------------------------------------------------------
+    # Ops that act as fusion barriers — require cross-thread synchronization,
+    # reductions, or are heavy compute nodes that should start their own group.
+    _BARRIER_OPS: Set[Callable] = {
+        torch.ops.aten._softmax.default,
+        torch.ops.aten._log_softmax.default,
+        torch.ops.aten.native_layer_norm.default,
+        torch.ops.aten.addmm.default,
+        torch.ops.aten.mm.default,
+        torch.ops.aten.bmm.default,
+        torch.ops.aten.convolution.default,
+    }
+
+    # Pointwise ops eligible for absorption into an existing FusionGroup.
+    _ABSORBABLE_OPS: Set[Callable] = {
+        torch.ops.aten.relu.default,
+        torch.ops.aten.gelu.default,
+        torch.ops.aten.sigmoid.default,
+        torch.ops.aten.add.Tensor,
+        torch.ops.aten.mul.Tensor,
+    }
+
     def _find_fusion_groups(self) -> List[FusionGroup]:
         """Identify contiguous sequences of fusible memory-bound nodes.
 
-        Walks ``self.graph_module.graph`` in topological order and groups
-        consecutive nodes whose targets are present in ``self.registry``
-        into :class:`FusionGroup` instances.
+        Walks ``self.graph_module.graph`` in topological order.  When a
+        trigger node (``aten.addmm.default``) is encountered, a new
+        :class:`FusionGroup` is initialized and the algorithm greedily
+        absorbs downstream pointwise nodes that satisfy:
+
+        * **Op type** — the node's target is in ``_ABSORBABLE_OPS``.
+        * **Topology** — the node has exactly one user (no branching).
+
+        Absorption halts on barrier ops, multi-user nodes, or any op not
+        in the absorbable set.  Only groups with at least one absorbed
+        node (i.e. len > 1) are returned, since a lone ``addmm`` offers
+        no fusion benefit.
 
         Returns
         -------
@@ -201,8 +231,76 @@ class FuseMLFusionPass:
             Ordered list of fusion candidates.  Empty when no fusible
             sequences are found.
         """
-        # TODO: implement pattern-matching traversal
-        return []
+        groups: List[FusionGroup] = []
+        # Track nodes already claimed by a group to avoid overlapping fusions.
+        consumed: Set[torch.fx.Node] = set()
+
+        for node in self.graph_module.graph.nodes:
+            if node.op != "call_function":
+                continue
+            # Only trigger on the core compute op.
+            if node.target is not torch.ops.aten.addmm.default:
+                continue
+            if node in consumed:
+                continue
+
+            group = FusionGroup(base_node=node)
+            consumed.add(node)
+
+            # Collect external inputs for the base node.
+            group_node_set: Set[torch.fx.Node] = {node}
+            self._collect_external_inputs(node, group_node_set, group)
+
+            # --- Greedy forward absorption --------------------------------
+            current = node
+            while True:
+                # The current node must feed exactly one downstream consumer.
+                if len(current.users) != 1:
+                    break
+
+                successor = next(iter(current.users))
+
+                # Must be a call_function to inspect its target.
+                if successor.op != "call_function":
+                    break
+
+                # Halt on barrier / heavy-compute ops.
+                if successor.target in self._BARRIER_OPS:
+                    break
+
+                # Only absorb low-intensity pointwise ops.
+                if successor.target not in self._ABSORBABLE_OPS:
+                    break
+
+                # Absorb the successor.
+                group.fused_nodes.append(successor)
+                group.output_node = successor
+                consumed.add(successor)
+                group_node_set.add(successor)
+
+                # Record any external inputs the absorbed node requires.
+                self._collect_external_inputs(successor, group_node_set, group)
+
+                current = successor
+
+            # Only keep groups that actually fuse something (len > 1).
+            if len(group) > 1:
+                logger.debug("Fusion group found: %s", group)
+                groups.append(group)
+
+        return groups
+
+    @staticmethod
+    def _collect_external_inputs(
+        node: torch.fx.Node,
+        group_node_set: Set[torch.fx.Node],
+        group: FusionGroup,
+    ) -> None:
+        """Add *node*'s args to ``group.inputs`` if produced outside the group."""
+        for arg in node.args:
+            if isinstance(arg, torch.fx.Node) and arg not in group_node_set:
+                if arg not in group.inputs:
+                    group.inputs.append(arg)
 
     # ------------------------------------------------------------------
     # Phase 2 — Rewrite the graph
@@ -272,6 +370,18 @@ def build_default_registry() -> SupportedOpsRegistry:
 
     # --- Baseline: linear (matmul + bias) is the primary HBM producer ------
     registry.register(torch.ops.aten.addmm.default, "linear")
+
+    # --- Low arithmetic-intensity pointwise ops (fusion-absorbable) ---------
+    registry.register_many(
+        [
+            torch.ops.aten.relu.default,
+            torch.ops.aten.gelu.default,
+            torch.ops.aten.sigmoid.default,
+            torch.ops.aten.add.Tensor,
+            torch.ops.aten.mul.Tensor,
+        ],
+        category="elementwise",
+    )
 
     return registry
 
