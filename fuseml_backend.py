@@ -15,6 +15,7 @@ is preserved while the fusion infrastructure is built out.
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Set
 
 import torch
@@ -101,6 +102,155 @@ class SupportedOpsRegistry:
             f"{getattr(t, 'name', str(t))}({c})" for t, c in self._ops.items()
         )
         return f"SupportedOpsRegistry([{entries}])"
+
+
+# ---------------------------------------------------------------------------
+# FusionGroup — data structure for a single fused operator sequence
+# ---------------------------------------------------------------------------
+@dataclass
+class FusionGroup:
+    """A contiguous sequence of memory-bound FX nodes identified for fusion.
+
+    Represents a subgraph that will be replaced by a single Triton kernel.
+    All nodes between *base_node* and *output_node* are absorbed into the
+    group, and the generated kernel only reads from *inputs* and writes
+    the result of *output_node* — eliminating intermediate HBM round-trips.
+
+    Attributes
+    ----------
+    base_node : torch.fx.Node
+        The first compute node in the fusible sequence (e.g., ``aten.addmm``).
+    fused_nodes : list[torch.fx.Node]
+        All subsequently absorbed nodes, **excluding** *base_node* itself.
+    inputs : list[torch.fx.Node]
+        External dependencies — nodes consumed by the group but produced
+        outside of it.  These become the Triton kernel's input pointers.
+    output_node : torch.fx.Node
+        The final node in the sequence whose result is visible to the rest
+        of the graph.  The fused kernel's output replaces this node.
+    """
+
+    base_node: torch.fx.Node
+    fused_nodes: List[torch.fx.Node] = field(default_factory=list)
+    inputs: List[torch.fx.Node] = field(default_factory=list)
+    output_node: torch.fx.Node = None  # type: ignore[assignment]
+
+    def __post_init__(self) -> None:
+        # Default output_node to base_node when the group is a single op.
+        if self.output_node is None:
+            self.output_node = self.base_node
+
+    @property
+    def all_nodes(self) -> List[torch.fx.Node]:
+        """Return *base_node* followed by all *fused_nodes*."""
+        return [self.base_node] + self.fused_nodes
+
+    def __len__(self) -> int:
+        return 1 + len(self.fused_nodes)
+
+    def __repr__(self) -> str:
+        names = [n.name for n in self.all_nodes]
+        return f"FusionGroup({' -> '.join(names)}, inputs={len(self.inputs)})"
+
+
+# ---------------------------------------------------------------------------
+# FuseMLFusionPass — compiler pass that discovers and applies fusions
+# ---------------------------------------------------------------------------
+class FuseMLFusionPass:
+    """Graph-rewriting pass that fuses memory-bound operator sequences.
+
+    The pass operates in two phases:
+
+    1. **Discovery** (``_find_fusion_groups``): walk the FX graph and
+       identify contiguous runs of registry-matched, memory-bound nodes
+       that can be collapsed into single Triton kernels.
+    2. **Surgery** (``_apply_surgery``): rewrite the graph by replacing
+       each :class:`FusionGroup` with a call to the corresponding
+       generated Triton kernel.
+
+    Parameters
+    ----------
+    graph_module : torch.fx.GraphModule
+        The traced graph to optimize.  Modified **in-place** during surgery.
+    registry : SupportedOpsRegistry | None
+        Op registry used to decide which nodes are fusion-eligible.
+        Defaults to :func:`build_default_registry`.
+    """
+
+    def __init__(
+        self,
+        graph_module: torch.fx.GraphModule,
+        registry: SupportedOpsRegistry | None = None,
+    ) -> None:
+        self.graph_module = graph_module
+        self.registry = registry or build_default_registry()
+
+    # ------------------------------------------------------------------
+    # Phase 1 — Discover fusible groups
+    # ------------------------------------------------------------------
+    def _find_fusion_groups(self) -> List[FusionGroup]:
+        """Identify contiguous sequences of fusible memory-bound nodes.
+
+        Walks ``self.graph_module.graph`` in topological order and groups
+        consecutive nodes whose targets are present in ``self.registry``
+        into :class:`FusionGroup` instances.
+
+        Returns
+        -------
+        list[FusionGroup]
+            Ordered list of fusion candidates.  Empty when no fusible
+            sequences are found.
+        """
+        # TODO: implement pattern-matching traversal
+        return []
+
+    # ------------------------------------------------------------------
+    # Phase 2 — Rewrite the graph
+    # ------------------------------------------------------------------
+    def _apply_surgery(self, groups: List[FusionGroup]) -> None:
+        """Replace each *FusionGroup* in the graph with a fused kernel call.
+
+        For every group, this method will:
+        1. Generate the corresponding Triton kernel source.
+        2. Insert a new ``call_function`` node targeting the compiled kernel.
+        3. Rewire downstream consumers to read from the new node.
+        4. Erase the original fused nodes from the graph.
+
+        Parameters
+        ----------
+        groups : list[FusionGroup]
+            Fusion groups produced by :meth:`_find_fusion_groups`.
+        """
+        # TODO: implement graph surgery + Triton codegen integration
+        pass
+
+    # ------------------------------------------------------------------
+    # Public entry point
+    # ------------------------------------------------------------------
+    def run(self) -> torch.fx.GraphModule:
+        """Execute the full fusion pass and return the optimized graph module.
+
+        Calls :meth:`_find_fusion_groups` to discover candidates, then
+        :meth:`_apply_surgery` to rewrite the graph.  The modified
+        ``GraphModule`` is recompiled before being returned so that its
+        ``forward`` method reflects the new graph topology.
+
+        Returns
+        -------
+        torch.fx.GraphModule
+            The same ``graph_module`` passed at construction, modified
+            in-place with fused subgraphs replaced by Triton kernel calls.
+        """
+        groups = self._find_fusion_groups()
+
+        if groups:
+            logger.info("Found %d fusion group(s) — applying graph surgery.", len(groups))
+            self._apply_surgery(groups)
+            self.graph_module.recompile()
+        else:
+            logger.info("No fusible sequences detected — graph unchanged.")
+
+        return self.graph_module
 
 
 def build_default_registry() -> SupportedOpsRegistry:
