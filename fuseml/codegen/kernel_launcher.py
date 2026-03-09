@@ -77,12 +77,13 @@ _BYTES_PER_ELEMENT: dict[torch.dtype, int] = {
 
 # Threshold (in bytes) above which we increase num_stages to exploit
 # deeper software pipelining.  ~512 KB is roughly where L2 pressure
-# starts dominating on Ampere/Ada GPUs.
+# starts dominating on Ada Lovelace (sm_89) GPUs.
 _LARGE_WORKING_SET_BYTES: int = 512 * 1024
 
-# Default SRAM capacity budget (bytes).  48 KB is the safe minimum
-# across SM70 (Volta), SM80 (Ampere), and SM89 (Ada Lovelace).
-_DEFAULT_SRAM_BUDGET_BYTES: int = 48 * 1024
+# Ada Lovelace (sm_89) SRAM capacity budget (bytes).  Ada supports up to
+# 100 KB configurable shared memory per SM.  This is used by SRAM capacity
+# enforcement to prevent "Out of Shared Memory" PTX failures at runtime.
+_DEFAULT_SRAM_BUDGET_BYTES: int = 100 * 1024
 
 # Minimum block dimension after SRAM downscaling.  Below 16 the
 # Triton tile is so small that launch overhead dominates compute.
@@ -305,16 +306,23 @@ class KernelLauncher:
     ) -> int:
         """Choose ``num_stages`` (software pipelining depth) for the K-loop.
 
-        Heuristic rationale:
+        Ada Lovelace (sm_89) uses ``cp.async`` for asynchronous global→shared
+        memory copies.  Higher stage counts overlap more ``cp.async`` prefetch
+        operations with Tensor Core compute, but each extra stage consumes
+        additional registers for the prefetch buffers.
 
-        * **Deep K dimension** (large working set) benefits from more stages
-          so that the next tile's global loads overlap with the current tile's
-          compute.  3–4 stages suit K > ~128 on Ampere/Ada.
-        * **Shallow K** or **small problems** should use fewer stages (2) to
+        Heuristic rationale for sm_89:
+
+        * **Deep K dimension** (large working set) benefits from 4–5 stages
+          so that the next tile's ``cp.async`` load overlaps with the current
+          tile's ``tl.dot``.  Ada's 64K register file per SM can sustain up
+          to 5 stages without spilling for typical bf16 tile sizes.
+        * **Shallow K** or **small problems** should use 2–3 stages to
           avoid wasting registers on prefetch buffers that never overlap
           enough compute.
-        * **Half-precision** data is half the bytes, so for the same K the
-          working set is smaller — we can afford one extra stage.
+        * **Half-precision** (bf16/fp16) data is half the bytes, so for the
+          same K the shared-memory footprint per stage is smaller — we can
+          afford deeper pipelining without exceeding the 100 KB SRAM budget.
         """
         bpe = _BYTES_PER_ELEMENT.get(dtype, 4)
         # Approximate bytes touched per K-tile iteration:
@@ -324,11 +332,14 @@ class KernelLauncher:
         working_bytes = (M + N) * K * bpe
         is_half = dtype in (torch.float16, torch.bfloat16)
         if working_bytes < _LARGE_WORKING_SET_BYTES:
-            # Small working set — 2 stages is enough.
+            # Small working set — 2 stages for shallow K.
             return 2
         if is_half:
-            # Half-precision, large K — 4 stages for deep pipelining.
-            return 4
+            # Half-precision, large K — 5 stages for deep cp.async
+            # pipelining on Ada.  bf16 tiles are half the size of fp32,
+            # so 5 stages fit comfortably within the 100 KB SRAM budget
+            # without overflowing the register file.
+            return 5
         # FP32, large K — 3 stages balances register use vs. latency hiding.
         return 3
 
