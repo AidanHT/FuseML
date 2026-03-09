@@ -343,7 +343,14 @@ class TritonKernelGenerator:
             if node.op != "call_function":
                 continue
 
-            if node.target == torch.ops.aten.relu.default:
+            # Both the functional (relu) and in-place (relu_) variants produce
+            # identical register semantics — tl.where(acc > 0, acc, 0.0) —
+            # because the Triton accumulator is a register tile, not a
+            # memory-backed tensor.  No separate in-place path is needed.
+            if node.target in (
+                torch.ops.aten.relu.default,
+                torch.ops.aten.relu_.default,
+            ):
                 lines.append(self._emit_relu())
             elif node.target == torch.ops.aten.gelu.default:
                 lines.append(self._emit_gelu())
@@ -568,11 +575,19 @@ class TritonKernelGenerator:
 
     @staticmethod
     def _section_accumulator() -> str:
-        """Accumulator initialisation — fp32 to preserve numerical precision."""
+        """Accumulator initialisation — fp32 to preserve numerical precision.
+
+        The dtype is intentionally hard-coded to tl.float32 regardless of the
+        input or output dtype.  Accumulating in a lower-precision type risks
+        catastrophic cancellation over long K dimensions.  The output cast is
+        applied once, unconditionally, in _section_store before tl.store.
+        """
         return "\n".join([
             "",
             "    # -----------------------------------------------------------",
-            "    # Accumulator — stays in SRAM across the entire K-loop",
+            "    # Accumulator — strictly tl.float32 to prevent precision loss",
+            "    # across the K-loop.  Cast to output dtype happens in the store",
+            "    # section below; do NOT change this dtype to a narrower type.",
             "    # -----------------------------------------------------------",
             "    acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)",
         ])
@@ -582,7 +597,15 @@ class TritonKernelGenerator:
         left: TensorDescriptor,
         right: TensorDescriptor,
     ) -> str:
-        """Blocked GEMM loop — tiles left and right from HBM, accumulates in SRAM."""
+        """Blocked GEMM loop — tiles left and right from HBM, accumulates in SRAM.
+
+        No contiguity assumption is made anywhere in this loop.  Both the
+        initial pointer tiles and the per-iteration pointer advances rely
+        exclusively on the dynamically passed stride arguments (stride_*m,
+        stride_*k, stride_*n).  A layout of stride=1 along any axis is
+        handled identically to any other stride value — the caller is
+        responsible for passing the correct runtime stride.
+        """
         ln = left.name
         rn = right.name
         s_lk = _stride_param(ln, "k")
@@ -610,7 +633,9 @@ class TritonKernelGenerator:
             "        # Tile-level matrix multiply — accumulated entirely in SRAM",
             f"        acc += tl.dot({ln}, {rn})",
             "",
-            "        # Advance to the next K-block (stride along the reduction axis)",
+            "        # Advance to the next K-block using the dynamically passed stride",
+            "        # argument — no assumption is made that the tensor is contiguous",
+            "        # along the K axis (stride=1 is handled identically to any other).",
             f"        {ln}_ptrs += BLOCK_SIZE_K * {s_lk}",
             f"        {rn}_ptrs += BLOCK_SIZE_K * {s_rk}",
         ])
@@ -633,11 +658,13 @@ class TritonKernelGenerator:
             "    # Store — write the (BLOCK_SIZE_M, BLOCK_SIZE_N) result tile",
             "    # from SRAM back to HBM exactly once per program instance",
             "    # -----------------------------------------------------------",
+            # Unconditional cast: the accumulator is always tl.float32.
+            # For fp32 outputs this is an identity cast (zero runtime cost);
+            # for fp16/bf16 outputs it narrows the result to the target dtype.
+            # Keeping the cast unconditional makes the dtype contract explicit
+            # and ensures correctness survives future dtype changes.
+            f"    acc = acc.to({triton_dtype})",
         ]
-
-        # Cast accumulator from fp32 to output dtype if needed
-        if output.dtype != torch.float32:
-            lines.append(f"    acc = acc.to({triton_dtype})")
 
         lines.append(
             f"    tl.store({n}_ptrs, acc, "
@@ -675,14 +702,29 @@ class TritonKernelGenerator:
         node: torch.fx.Node,
         node_ids: set[int],
     ) -> str:
-        """Residual add: load an external tensor tile from HBM, fuse into acc.
+        """Residual / bias add: load an external tensor tile from HBM, fuse into acc.
 
         Identifies the *external* argument (the one not produced by a prior
         node inside the fusion group) as the residual tensor.  Also handles
         scalar arguments (e.g. ``add(acc, 1.0)``) without emitting a load.
+
+        Bias broadcasting
+        -----------------
+        When the external argument is a 1-D tensor (e.g. a per-column bias
+        from ``aten.addmm``), the load must use a 1-D mask over ``offs_n``
+        and the loaded tile must be broadcast across the M dimension using
+        ``[None, :]`` before being added to ``acc``.  Using the 2-D residual
+        load path for a 1-D pointer would produce incorrect pointer arithmetic
+        and an out-of-bounds access.
+
+        Shape detection uses the FX node's ``meta["val"]`` (a ``FakeTensor``
+        produced by ``torch.compile``'s abstract interpretation pass) or
+        ``meta["tensor_meta"]`` as a fallback.  If neither is present the
+        method conservatively falls back to the 2-D residual path.
         """
         # Scan args for a scalar or an external tensor node.
         residual_name: str | None = None
+        residual_arg_node: torch.fx.Node | None = None
         scalar_value: int | float | None = None
 
         for arg in node.args:
@@ -691,19 +733,45 @@ class TritonKernelGenerator:
                 break
             if hasattr(arg, "name") and id(arg) not in node_ids:
                 residual_name = arg.name
+                residual_arg_node = arg  # type: ignore[assignment]
                 break
 
         # Case 1: scalar add — no HBM traffic, register-only.
         if scalar_value is not None:
             return "\n".join([
-                f"    # Scalar add — register-only (no HBM traffic)",
+                "    # Scalar add — register-only (no HBM traffic)",
                 f"    acc = acc + {scalar_value}",
             ])
 
-        # Case 2: external tensor (residual connection) — one HBM load.
+        # Case 2: external tensor — detect rank to choose the correct load path.
         if residual_name is not None:
+            # Probe FX metadata for the abstract tensor shape.  torch.compile's
+            # abstract interpretation pass stores a FakeTensor in meta["val"];
+            # older paths may use meta["tensor_meta"] instead.
+            is_1d_bias = False
+            if residual_arg_node is not None:
+                fake = residual_arg_node.meta.get("val") or residual_arg_node.meta.get("tensor_meta")
+                if fake is not None and len(fake.shape) == 1:
+                    # 1-D bias: its pointer block was initialised as a flat
+                    # vector (offs_n * stride_bias_n).  Load with a 1-D mask,
+                    # then broadcast to (BLOCK_SIZE_M, BLOCK_SIZE_N) via
+                    # [None, :] before adding to the 2-D accumulator.
+                    is_1d_bias = True
+
+            if is_1d_bias:
+                return "\n".join([
+                    f"    # Bias broadcast add — load 1-D bias tile along N with offs_n",
+                    f"    # mask, then broadcast across M via [None, :] before fusing",
+                    f"    # into acc.  Using a 2-D mask here would be incorrect because",
+                    f"    # {residual_name}_ptrs is a 1-D pointer block (no M stride).",
+                    f"    {residual_name} = tl.load({residual_name}_ptrs, mask=offs_n < N, other=0.0)",
+                    f"    acc = acc + {residual_name}[None, :]",
+                ])
+
+            # 2-D residual (e.g. skip connection with matching M x N shape):
+            # load the full tile with a 2-D boundary mask.
             return "\n".join([
-                f"    # Residual add — load {residual_name} tile from HBM into SRAM",
+                f"    # Residual add — load 2-D {residual_name} tile from HBM into SRAM",
                 (
                     f"    {residual_name} = tl.load({residual_name}_ptrs, "
                     f"mask=(offs_m[:, None] < M) & (offs_n[None, :] < N), other=0.0)"
