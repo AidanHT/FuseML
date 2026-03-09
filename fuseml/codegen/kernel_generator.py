@@ -386,6 +386,8 @@ class TritonKernelGenerator:
                 lines.append(self._emit_gelu())
             elif node.target == torch.ops.aten.add.Tensor:
                 lines.append(self._emit_add(node, node_ids))
+            elif node.target == torch.ops.aten.mul.Tensor:
+                lines.append(self._emit_mul(node, node_ids))
             else:
                 logger.warning(
                     "Unsupported epilogue target: %s — skipped", node.target,
@@ -754,6 +756,46 @@ class TritonKernelGenerator:
         ])
 
     @staticmethod
+    def _classify_binary_args(
+        node: torch.fx.Node,
+        node_ids: set[int],
+    ) -> tuple[int | float | None, str | None, torch.fx.Node | None]:
+        """Classify arguments of a binary FX node as scalar or external tensor.
+
+        Returns ``(scalar_value, ext_name, ext_node)`` where exactly one of
+        *scalar_value* or *ext_name* is non-``None`` when an external operand
+        is found.  If both args are internal to the fusion group, all three
+        values are ``None``.
+        """
+        scalar_value: int | float | None = None
+        ext_name: str | None = None
+        ext_node: torch.fx.Node | None = None
+
+        for arg in node.args:
+            if isinstance(arg, (int, float)):
+                scalar_value = arg
+                break
+            if hasattr(arg, "name") and id(arg) not in node_ids:
+                ext_name = arg.name
+                ext_node = arg  # type: ignore[assignment]
+                break
+
+        return scalar_value, ext_name, ext_node
+
+    @staticmethod
+    def _is_1d_tensor(ext_node: torch.fx.Node | None) -> bool:
+        """Return ``True`` if *ext_node* represents a 1-D tensor (e.g. bias).
+
+        Probes the FX node's ``meta["val"]`` (a ``FakeTensor`` from
+        ``torch.compile``'s abstract interpretation) or ``meta["tensor_meta"]``
+        as a fallback.
+        """
+        if ext_node is None:
+            return False
+        fake = ext_node.meta.get("val") or ext_node.meta.get("tensor_meta")
+        return fake is not None and len(fake.shape) == 1
+
+    @staticmethod
     def _emit_add(
         node: torch.fx.Node,
         node_ids: set[int],
@@ -778,41 +820,18 @@ class TritonKernelGenerator:
         ``meta["tensor_meta"]`` as a fallback.  If neither is present the
         method conservatively falls back to the 2-D residual path.
         """
-        # Scan args for a scalar or an external tensor node.
-        residual_name: str | None = None
-        residual_arg_node: torch.fx.Node | None = None
-        scalar_value: int | float | None = None
+        scalar_value, residual_name, residual_arg_node = (
+            TritonKernelGenerator._classify_binary_args(node, node_ids)
+        )
 
-        for arg in node.args:
-            if isinstance(arg, (int, float)):
-                scalar_value = arg
-                break
-            if hasattr(arg, "name") and id(arg) not in node_ids:
-                residual_name = arg.name
-                residual_arg_node = arg  # type: ignore[assignment]
-                break
-
-        # Case 1: scalar add — no HBM traffic, register-only.
         if scalar_value is not None:
             return "\n".join([
                 "    # Scalar add — register-only (no HBM traffic)",
                 f"    acc = acc + {scalar_value}",
             ])
 
-        # Case 2: external tensor — detect rank to choose the correct load path.
         if residual_name is not None:
-            # Probe FX metadata for the abstract tensor shape.  torch.compile's
-            # abstract interpretation pass stores a FakeTensor in meta["val"];
-            # older paths may use meta["tensor_meta"] instead.
-            is_1d_bias = False
-            if residual_arg_node is not None:
-                fake = residual_arg_node.meta.get("val") or residual_arg_node.meta.get("tensor_meta")
-                if fake is not None and len(fake.shape) == 1:
-                    # 1-D bias: its pointer block was initialised as a flat
-                    # vector (offs_n * stride_bias_n).  Load with a 1-D mask,
-                    # then broadcast to (BLOCK_SIZE_M, BLOCK_SIZE_N) via
-                    # [None, :] before adding to the 2-D accumulator.
-                    is_1d_bias = True
+            is_1d_bias = TritonKernelGenerator._is_1d_tensor(residual_arg_node)
 
             if is_1d_bias:
                 return "\n".join([
@@ -824,8 +843,6 @@ class TritonKernelGenerator:
                     f"    acc = acc + {residual_name}[None, :]",
                 ])
 
-            # 2-D residual (e.g. skip connection with matching M x N shape):
-            # load the full tile with a 2-D boundary mask.
             return "\n".join([
                 f"    # Residual add — load 2-D {residual_name} tile from HBM into SRAM",
                 (
@@ -835,10 +852,63 @@ class TritonKernelGenerator:
                 f"    acc = acc + {residual_name}",
             ])
 
-        # Case 3: both args are internal — just emit a plain add.
         return "\n".join([
             "    # Element-wise add (both operands already in SRAM)",
             "    acc = acc + acc",
+        ])
+
+    @staticmethod
+    def _emit_mul(
+        node: torch.fx.Node,
+        node_ids: set[int],
+    ) -> str:
+        """Element-wise multiply: scalar, external tensor, or internal operands.
+
+        Mirrors :meth:`_emit_add` but emits ``*`` instead of ``+``.  The same
+        three cases apply:
+
+        1. **Scalar** (``int`` / ``float``) — pure register multiply, no HBM
+           traffic (e.g. ``x * 0.5``).
+        2. **External 1-D tensor** — ``tl.load`` with a 1-D ``offs_n`` mask,
+           broadcast via ``[None, :]``, then multiply into ``acc``.
+        3. **External 2-D tensor** — ``tl.load`` with a full 2-D boundary mask,
+           then element-wise multiply.
+        4. **Both internal** — ``acc = acc * acc`` (square).
+        """
+        scalar_value, ext_name, ext_node = (
+            TritonKernelGenerator._classify_binary_args(node, node_ids)
+        )
+
+        if scalar_value is not None:
+            return "\n".join([
+                "    # Scalar mul — register-only (no HBM traffic)",
+                f"    acc = acc * {scalar_value}",
+            ])
+
+        if ext_name is not None:
+            is_1d = TritonKernelGenerator._is_1d_tensor(ext_node)
+
+            if is_1d:
+                return "\n".join([
+                    f"    # Broadcast mul — load 1-D tile along N with offs_n mask,",
+                    f"    # then broadcast across M via [None, :] before multiplying",
+                    f"    # into acc.  {ext_name}_ptrs is a 1-D pointer block (no M stride).",
+                    f"    {ext_name} = tl.load({ext_name}_ptrs, mask=offs_n < N, other=0.0)",
+                    f"    acc = acc * {ext_name}[None, :]",
+                ])
+
+            return "\n".join([
+                f"    # Tensor mul — load 2-D {ext_name} tile from HBM into SRAM",
+                (
+                    f"    {ext_name} = tl.load({ext_name}_ptrs, "
+                    f"mask=(offs_m[:, None] < M) & (offs_n[None, :] < N), other=0.0)"
+                ),
+                f"    acc = acc * {ext_name}",
+            ])
+
+        return "\n".join([
+            "    # Element-wise mul (both operands already in SRAM)",
+            "    acc = acc * acc",
         ])
 
     @staticmethod
