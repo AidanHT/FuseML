@@ -7,7 +7,7 @@ that will be replaced by a single Triton kernel during graph surgery.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Union
 
 import torch
 
@@ -45,6 +45,14 @@ class FusionGroup:
         additional output pointer in the ``@triton.jit`` signature and an
         intermediate ``tl.store`` in the epilogue to write the activation
         back to HBM, preserving it for PyTorch Autograd's backward pass.
+    param_bindings : dict[str, torch.nn.Parameter | torch.Tensor]
+        Mapping from ``get_attr`` node targets (dot-separated attribute
+        paths such as ``"0.weight"`` or ``"linear.bias"``) to the resolved
+        ``nn.Parameter`` or buffer tensor extracted from the root
+        ``fx.GraphModule``.  Populated by
+        :meth:`~fuseml.passes.fusion_pass.FuseMLFusionPass._resolve_get_attr_bindings`
+        so that downstream codegen and the compiler can access live parameter
+        data without relying on potentially incomplete FX node metadata.
     """
 
     base_node: torch.fx.Node
@@ -53,6 +61,9 @@ class FusionGroup:
     output_node: torch.fx.Node = None  # type: ignore[assignment]
     output_metadata: Dict[str, Any] = field(default_factory=dict)
     intermediate_outputs: List[torch.fx.Node] = field(default_factory=list)
+    param_bindings: Dict[str, Union[torch.nn.Parameter, torch.Tensor]] = field(
+        default_factory=dict,
+    )
 
     def __post_init__(self) -> None:
         # Default output_node to base_node when the group is a single op.

@@ -227,6 +227,16 @@ class FuseMLCompiler:
                 )
                 continue
 
+            # ── Enrich tensor_map with resolved parameters ────────────
+            # param_bindings carries live nn.Parameter / buffer tensors
+            # resolved from get_attr nodes.  Adding them to tensor_map
+            # allows build_cache_key() to compute accurate fingerprints
+            # for parameter tensors that may lack FX node metadata.
+            if group.param_bindings:
+                for attr_name, param_tensor in group.param_bindings.items():
+                    if isinstance(param_tensor, torch.Tensor):
+                        tensor_map[attr_name] = param_tensor
+
             # ── Cache lookup ───────────────────────────────────────────
             cache_key = build_cache_key(group, tensor_map)
             launcher: KernelLauncher | None = None
@@ -288,6 +298,22 @@ class FuseMLCompiler:
         input_descs: list[TensorDescriptor] = []
         for n in group.inputs:
             desc = _node_to_descriptor(n)
+            # Fallback: if the node is a get_attr with no FX metadata,
+            # build the descriptor directly from the resolved parameter
+            # tensor in param_bindings.
+            if (
+                desc is None
+                and hasattr(n, "op")
+                and n.op == "get_attr"
+                and n.target in group.param_bindings
+            ):
+                param = group.param_bindings[n.target]
+                desc = TensorDescriptor(
+                    name=n.name,
+                    shape=_materialize_ints(param.shape),
+                    stride=_materialize_ints(param.stride()),
+                    dtype=param.dtype,
+                )
             if desc is None:
                 logger.warning(
                     "Cannot build descriptor for input node %s — "

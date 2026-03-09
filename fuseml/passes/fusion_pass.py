@@ -210,6 +210,9 @@ class FuseMLFusionPass:
                         group.intermediate_outputs.append(n)
                         break
 
+            # --- Resolve get_attr parameter bindings ----------------------
+            self._resolve_get_attr_bindings(group)
+
             # Only keep groups that actually fuse something (len > 1).
             if len(group) > 1:
                 group.output_metadata = self._extract_tensor_metadata(
@@ -266,6 +269,66 @@ class FuseMLFusionPass:
                     group.inputs.append(arg)
 
     # ------------------------------------------------------------------
+    # get_attr resolution — bind nn.Parameters to the FusionGroup
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _fetch_attr(
+        gm: torch.fx.GraphModule,
+        target: str,
+    ) -> torch.nn.Parameter | torch.Tensor:
+        """Resolve a ``get_attr`` *target* string to the live tensor on *gm*.
+
+        The *target* is a dot-separated attribute path (e.g. ``"0.weight"``,
+        ``"linear.bias"``) walked on the root :class:`GraphModule`.
+        """
+        attr: Any = gm
+        for atom in target.split("."):
+            attr = getattr(attr, atom)
+        return attr
+
+    def _resolve_get_attr_bindings(self, group: FusionGroup) -> None:
+        """Populate ``group.param_bindings`` with resolved parameters.
+
+        Scans ``group.inputs`` and their transitive args for ``get_attr``
+        nodes, fetches the underlying ``nn.Parameter`` or buffer from
+        ``self.graph_module``, and stores the mapping in
+        ``group.param_bindings``.
+
+        This makes parameter dependencies explicit so that downstream
+        codegen and the compiler can access live tensor data without
+        relying on potentially incomplete FX node metadata.
+        """
+        seen: Set[str] = set()
+
+        def _resolve_node(node: torch.fx.Node) -> None:
+            if not hasattr(node, "op"):
+                return
+            if node.op == "get_attr" and node.target not in seen:
+                seen.add(node.target)
+                try:
+                    group.param_bindings[node.target] = self._fetch_attr(
+                        self.graph_module, node.target,
+                    )
+                except AttributeError:
+                    logger.warning(
+                        "Could not resolve get_attr target %r on graph module.",
+                        node.target,
+                    )
+
+        # Direct get_attr inputs.
+        for inp in group.inputs:
+            _resolve_node(inp)
+
+        # Transitive: walk one level of args for each input to catch
+        # patterns like  get_attr(weight) → t() → addmm  where t() is
+        # the direct input but weight get_attr is one hop away.
+        for inp in group.inputs:
+            if hasattr(inp, "args"):
+                for arg in inp.args:
+                    if isinstance(arg, torch.fx.Node):
+                        _resolve_node(arg)
+
+    # ------------------------------------------------------------------
     # Phase 2 — Rewrite the graph
     # ------------------------------------------------------------------
     def _apply_surgery(self, groups: List[FusionGroup]) -> None:
@@ -308,6 +371,7 @@ class FuseMLFusionPass:
             new_fused_node.meta["fused_op_names"] = [
                 n.name for n in group.all_nodes
             ]
+            new_fused_node.meta["param_bindings"] = group.param_bindings
 
             logger.debug(
                 "Inserted fused placeholder %s for group %s",
@@ -324,8 +388,35 @@ class FuseMLFusionPass:
                 propagate_meta=False,
             )
 
-        # --- Cleanup: remove dead original nodes & recompile ---------------
+        # --- Cleanup: rigorous dead code elimination -----------------------
+        # Phase 1: Standard DCE removes nodes with zero users.
         graph.eliminate_dead_code()
+
+        # Phase 2: Sweep orphaned get_attr nodes that may persist after
+        # standard DCE (e.g. a weight get_attr whose sole consumer was a
+        # now-dead transpose node).
+        for n in list(graph.nodes):
+            if n.op == "get_attr" and len(n.users) == 0:
+                logger.debug("Removing orphaned get_attr node: %s", n.name)
+                graph.erase_node(n)
+
+        # Phase 3: Sweep orphaned call_function intermediates (e.g. aten.t
+        # that only fed fused nodes).  Skip placeholder nodes — they are
+        # the newly inserted targets.
+        for n in list(graph.nodes):
+            if (
+                n.op == "call_function"
+                and len(n.users) == 0
+                and n.target is not fuseml_fused_kernel_placeholder
+            ):
+                logger.debug("Removing orphaned call_function: %s", n.name)
+                graph.erase_node(n)
+
+        # Phase 4: Final DCE to catch cascading orphans from phases 2-3.
+        graph.eliminate_dead_code()
+
+        # --- Validation: catch topological invariant violations early ------
+        graph.lint()
         self.graph_module.recompile()
 
         logger.info(

@@ -286,9 +286,11 @@ class TestFuseMLCompilerBuildLauncher:
         assert len(groups) >= 1
 
         group = groups[0]
-        # Strip metadata from one of the input nodes.
+        # Strip metadata from one of the input nodes AND clear
+        # param_bindings so the get_attr fallback cannot rescue it.
         group.inputs[0].meta.pop("tensor_meta", None)
         group.inputs[0].meta.pop("val", None)
+        group.param_bindings.clear()
 
         compiler = FuseMLCompiler()
         launcher = compiler._build_launcher(group)

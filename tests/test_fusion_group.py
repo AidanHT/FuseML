@@ -50,3 +50,11 @@ class TestFusionGroupDataclass:
             r = repr(groups[0])
             assert "FusionGroup(" in r
             assert "->" in r
+
+    def test_param_bindings_default_empty(self):
+        """param_bindings should default to an empty dict."""
+        model = nn.Linear(4, 4)
+        gm = trace_no_grad(model, torch.randn(1, 4))
+        node = next(n for n in gm.graph.nodes if n.op == "call_function")
+        group = FusionGroup(base_node=node)
+        assert group.param_bindings == {}

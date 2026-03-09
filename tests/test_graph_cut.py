@@ -336,6 +336,42 @@ class TestSplitFusionGroup:
         assert len(segments) == 1
         assert segments[0].kind == "fused"
 
+    def test_split_preserves_param_bindings(self):
+        """Kernel A from a split should inherit relevant param_bindings."""
+        bias_node = _make_node(op="get_attr", target="bias", name="bias_attr")
+        weight_node = _make_node(op="get_attr", target="weight", name="weight_attr")
+
+        base = _make_node(
+            target=torch.ops.aten.addmm.default,
+            name="addmm",
+            args=(bias_node, weight_node),
+        )
+        relu = _make_node(
+            target=torch.ops.aten.relu.default,
+            name="relu",
+            args=(base,),
+        )
+        bad = _make_node(target=_FAKE_UNSUPPORTED, name="bad_op", args=(relu,))
+
+        base.users = {relu: None}
+        relu.users = {bad: None}
+        bad.users = {}
+
+        group = FusionGroup(base_node=base)
+        group.fused_nodes = [relu, bad]
+        group.output_node = bad
+        group.inputs = [bias_node, weight_node]
+        group.param_bindings = {
+            "bias": torch.randn(64),
+            "weight": torch.randn(64, 64),
+        }
+
+        segments = split_fusion_group(group)
+        kernel_a = segments[0].group
+        assert kernel_a is not None
+        assert "bias" in kernel_a.param_bindings
+        assert "weight" in kernel_a.param_bindings
+
 
 # ---------------------------------------------------------------------------
 # GraphSegment dataclass

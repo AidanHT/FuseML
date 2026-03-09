@@ -180,6 +180,22 @@ def _build_sub_group(
     # Rebuild output metadata from the new output node.
     sub.output_metadata = _extract_tensor_metadata(sub.output_node)
 
+    # Propagate param_bindings from the original group — keep only entries
+    # whose get_attr targets are reachable from the sub-group's inputs.
+    if original.param_bindings:
+        relevant: Set[str] = set()
+        for inp in sub.inputs:
+            if hasattr(inp, "op") and inp.op == "get_attr":
+                relevant.add(inp.target)
+            # Also check one hop deeper (e.g. t() wrapping a get_attr).
+            if hasattr(inp, "args"):
+                for arg in inp.args:
+                    if hasattr(arg, "op") and arg.op == "get_attr":
+                        relevant.add(arg.target)
+        sub.param_bindings = {
+            k: v for k, v in original.param_bindings.items() if k in relevant
+        }
+
     return sub
 
 
@@ -324,6 +340,22 @@ def split_fusion_group(group: FusionGroup) -> List[GraphSegment]:
                         break
 
             group_b.output_metadata = _extract_tensor_metadata(group_b.output_node)
+
+            # Propagate param_bindings for Kernel B.
+            if group.param_bindings:
+                kb_relevant: Set[str] = set()
+                for inp in group_b.inputs:
+                    if isinstance(inp, torch.fx.Node) and inp.op == "get_attr":
+                        kb_relevant.add(inp.target)
+                    if isinstance(inp, torch.fx.Node):
+                        for arg in inp.args:
+                            if isinstance(arg, torch.fx.Node) and arg.op == "get_attr":
+                                kb_relevant.add(arg.target)
+                group_b.param_bindings = {
+                    k: v for k, v in group.param_bindings.items()
+                    if k in kb_relevant
+                }
+
             segments.append(
                 GraphSegment(kind="fused", group=group_b, nodes=list(group_b.all_nodes))
             )
