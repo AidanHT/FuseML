@@ -107,8 +107,10 @@ def is_safe_inplace(
 
     mutated_arg = node.args[0]
 
-    # The mutated arg must be an FX node to inspect its users.
-    if not isinstance(mutated_arg, torch.fx.Node):
+    # The mutated arg must be an FX node (or node-like object) to inspect
+    # its users.  Use duck-typing (hasattr "users") rather than isinstance
+    # so the logic also works with lightweight node stand-ins in tests.
+    if not hasattr(mutated_arg, "users"):
         return True  # Scalar or non-node arg — no aliasing concern.
 
     # --- Direct aliasing check -------------------------------------------
@@ -132,7 +134,7 @@ def is_safe_inplace(
         hasattr(ancestor, "target")
         and ancestor.target in TRANSPARENT_OPS
         and ancestor.args
-        and isinstance(ancestor.args[0], torch.fx.Node)
+        and hasattr(ancestor.args[0], "users")
     ):
         ancestor = ancestor.args[0]
         if _has_external_users(ancestor, group_node_set, exclude={node}):
