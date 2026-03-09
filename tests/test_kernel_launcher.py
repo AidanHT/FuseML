@@ -169,16 +169,16 @@ class TestKernelLauncherCall:
         assert result.device == a.device
 
     def test_correct_number_of_pointer_args(self, mock_kernel_fn, input_descs, output_desc):
-        """2 inputs + 1 output = 3 pointer args before M, N, K."""
+        """2 inputs + 1 output = 3 tensor args before M, N, K."""
         launcher = KernelLauncher(mock_kernel_fn, input_descs, output_desc, [], "a", "b")
         a = torch.randn(128, 64)
         b = torch.randn(64, 256)
         launcher(a, b)
         call = mock_kernel_fn.calls[0]
-        # args[0], args[1] = input ptrs; args[2] = output ptr; args[3..5] = M,N,K
-        # All pointers are ints (from data_ptr())
+        # args[0], args[1] = input tensors; args[2] = output tensor; args[3..5] = M,N,K
+        # Triton 3.x expects actual torch.Tensor objects as pointer parameters.
         for i in range(3):
-            assert isinstance(call["args"][i], int)
+            assert isinstance(call["args"][i], torch.Tensor)
 
     def test_passes_strides_for_each_input(self, mock_kernel_fn, input_descs, output_desc):
         launcher = KernelLauncher(mock_kernel_fn, input_descs, output_desc, [], "a", "b")
@@ -852,9 +852,8 @@ class TestCUDAStreamSync:
         cpu_device = torch.device("cpu")
         assert KernelLauncher._get_launch_stream(cpu_device) is None
 
-    def test_stream_kwarg_on_cuda(self, mock_kernel_fn, input_descs, output_desc, monkeypatch):
-        """When device is CUDA, stream= should be passed to kernel launch."""
-        # Monkeypatch _get_launch_stream to return a known handle
+    def test_stream_kwarg_not_passed_triton3(self, mock_kernel_fn, input_descs, output_desc, monkeypatch):
+        """Triton 3.x deprecated stream= kwarg — it should NOT be in kwargs."""
         monkeypatch.setattr(
             KernelLauncher, "_get_launch_stream", staticmethod(lambda device: 42)
         )
@@ -863,4 +862,6 @@ class TestCUDAStreamSync:
         b = torch.randn(64, 256)
         launcher(a, b)
         call = mock_kernel_fn.calls[0]
-        assert call["kwargs"]["stream"] == 42
+        # Triton 3.x automatically uses the current CUDA stream;
+        # the launcher no longer passes stream= explicitly.
+        assert "stream" not in call["kwargs"]

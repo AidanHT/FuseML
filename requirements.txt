@@ -6,8 +6,8 @@ torch>=2.0.0           # PyTorch with torch.fx for graph capture
 torchvision            # Vision utilities (optional, for example models)
 torchaudio             # Audio utilities (optional)
 
-# Kernel Development (note: triton requires special handling on Windows)
-# triton>=2.0.0        # Triton for CUDA kernel generation (see SETUP.md)
+# Kernel Development (Windows-compatible build)
+triton-windows        # Triton for CUDA kernel generation (Windows port)
 
 # Development & Testing
 numpy                  # Numerical computing

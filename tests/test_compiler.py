@@ -228,7 +228,8 @@ class TestFuseMLCompilerCallNoFusion:
         """Graph of just a ReLU (no addmm trigger) returns the forward callable."""
         gm = trace_no_grad(nn.ReLU(), torch.randn(2, 64))
         compiler = FuseMLCompiler()
-        result = compiler(gm, [torch.randn(2, 64)])
+        # Use _compile_aten_graph directly — make_fx already produces aten ops.
+        result = compiler._compile_aten_graph(gm, [torch.randn(2, 64)])
         assert callable(result)
 
     def test_empty_registry_returns_forward(self):
@@ -237,7 +238,8 @@ class TestFuseMLCompilerCallNoFusion:
         gm = trace_no_grad(model, torch.randn(2, 64))
         empty_reg = SupportedOpsRegistry()
         compiler = FuseMLCompiler(registry=empty_reg)
-        result = compiler(gm, [torch.randn(2, 64)])
+        # Use _compile_aten_graph directly — make_fx already produces aten ops.
+        result = compiler._compile_aten_graph(gm, [torch.randn(2, 64)])
         assert callable(result)
 
 

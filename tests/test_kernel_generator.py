@@ -478,15 +478,17 @@ class TestKLoopEdgeCases:
         code = gen.generate_k_loop(matmul_inputs, output_tensor)
         assert "HBM" in code
 
-    def test_with_bias_ignored(self, gen, output_tensor):
-        """K-loop only involves matmul operands — bias is not loaded."""
+    def test_with_bias_loaded_after_loop(self, gen, output_tensor):
+        """Bias is loaded and added to acc after the GEMM loop."""
         bias = TensorDescriptor("bias", (256,), (1,), torch.float32)
         a = TensorDescriptor("a", (128, 64), (64, 1), torch.float32)
         b = TensorDescriptor("b", (64, 256), (256, 1), torch.float32)
         code = gen.generate_k_loop([bias, a, b], output_tensor)
         assert "a = tl.load(a_ptrs," in code
         assert "b = tl.load(b_ptrs," in code
-        assert "tl.load(bias" not in code
+        # Bias is loaded after the K-loop and broadcast-added to acc
+        assert "tl.load(bias" in code
+        assert "acc = acc + bias" in code
 
     def test_multichar_tensor_names(self, gen, output_tensor):
         """Multi-char names use underscore-separated stride params."""
@@ -536,7 +538,7 @@ class TestEpilogueGelu:
     def test_gelu_emits_tanh(self, gen):
         node = _make_node(target=torch.ops.aten.gelu.default)
         code = gen.generate_epilogue([node])
-        assert "tl.math.tanh" in code
+        assert "libdevice.tanh" in code
 
     def test_gelu_sqrt_2_over_pi(self, gen):
         """Must use sqrt(2/pi) ≈ 0.7978845608 constant."""
@@ -560,7 +562,7 @@ class TestEpilogueGelu:
         """Result must be assigned back to acc."""
         node = _make_node(target=torch.ops.aten.gelu.default)
         code = gen.generate_epilogue([node])
-        assert "acc = 0.5 * acc * (1.0 + tl.math.tanh(" in code
+        assert "acc = 0.5 * acc * (1.0 + tl.extra.cuda.libdevice.tanh(" in code
 
     def test_gelu_no_hbm_load(self, gen):
         """GeLU is register-only — must not emit tl.load."""
@@ -724,7 +726,7 @@ class TestEpilogueChained:
             args=(gelu_node, residual),
         )
         code = gen.generate_epilogue([gelu_node, add_node])
-        assert code.index("tl.math.tanh") < code.index("tl.load")
+        assert code.index("libdevice.tanh") < code.index("tl.load")
 
     def test_add_then_relu(self, gen):
         """Residual add followed by ReLU."""
@@ -809,7 +811,7 @@ class TestEpilogueTransparentOps:
         code = gen.generate_epilogue([relu_node, view_node, gelu_node])
         assert "tl.where" in code        # relu
         assert "no-op" in code            # view
-        assert "tl.math.tanh" in code     # gelu
+        assert "libdevice.tanh" in code     # gelu
 
     def test_unsqueeze_emits_noop(self, gen):
         node = _make_node(target=torch.ops.aten.unsqueeze.default)

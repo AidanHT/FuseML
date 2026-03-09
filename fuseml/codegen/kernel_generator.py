@@ -777,10 +777,21 @@ class TritonKernelGenerator:
     def _section_program_ids() -> str:
         return "\n".join([
             "    # -----------------------------------------------------------",
-            "    # Block index — each program instance owns one (M, N) tile",
+            "    # L2 cache swizzling — reorder thread blocks so that adjacent",
+            "    # programs share L2-resident rows/columns.  A 1-D program id",
+            "    # is mapped to 2-D (pid_m, pid_n) in a GROUP_SIZE_M-wide",
+            "    # column-major stripe, maximising L2 data reuse between",
+            "    # neighbouring blocks that read the same A-tile rows.",
             "    # -----------------------------------------------------------",
-            "    pid_m = tl.program_id(0)",
-            "    pid_n = tl.program_id(1)",
+            "    pid = tl.program_id(0)",
+            "    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)",
+            "    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)",
+            "    num_pid_in_group = GROUP_SIZE_M * num_pid_n",
+            "    group_id = pid // num_pid_in_group",
+            "    first_pid_m = group_id * GROUP_SIZE_M",
+            "    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)",
+            "    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)",
+            "    pid_n = (pid % num_pid_in_group) // group_size_m",
         ])
 
     @staticmethod

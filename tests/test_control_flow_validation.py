@@ -363,7 +363,8 @@ class TestCompilerFallback:
         model = CleanLinearReLU()
         gm = trace_no_grad(model, torch.randn(2, 64))
         compiler = FuseMLCompiler()
-        result = compiler(gm, [torch.randn(2, 64)])
+        # Use _compile_aten_graph directly — make_fx already produces aten ops.
+        result = compiler._compile_aten_graph(gm, [torch.randn(2, 64)])
         assert callable(result)
 
     def test_item_graph_falls_back_to_forward(self):
@@ -381,7 +382,8 @@ class TestCompilerFallback:
         gm.recompile()
 
         compiler = FuseMLCompiler()
-        result = compiler(gm, [torch.randn(2, 64)])
+        # Use _compile_aten_graph directly — make_fx already produces aten ops.
+        result = compiler._compile_aten_graph(gm, [torch.randn(2, 64)])
         assert callable(result), "Compiler should return a callable on fallback"
         # gm.forward is a bound method — each access creates a new object,
         # so we compare the underlying __func__ and __self__ instead.
