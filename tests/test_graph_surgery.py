@@ -247,6 +247,90 @@ class TestSurgeryGraphValid:
         assert len(list(gm.graph.nodes)) == node_count_before
 
 
+class TestSurgeryDanglingOutputGuard:
+    """Verify fusion groups at the end of the graph are correctly wired."""
+    pytestmark = pytest.mark.surgery
+
+    def test_final_fusion_wired_to_output(self):
+        """When the fused group is the last op before output, the output
+        node's args must reference the placeholder, not the dead original."""
+        model = nn.Sequential(nn.Linear(64, 64), nn.ReLU())
+        gm = trace_no_grad(model, torch.randn(2, 64))
+        gm, groups = run_surgery(gm)
+
+        if groups:
+            output_nodes = [n for n in gm.graph.nodes if n.op == "output"]
+            assert len(output_nodes) == 1
+
+            # Collect all node references from the output node's args.
+            def _collect_refs(args):
+                refs = []
+                for a in args:
+                    if isinstance(a, torch.fx.Node):
+                        refs.append(a)
+                    elif isinstance(a, (tuple, list)):
+                        refs.extend(_collect_refs(a))
+                return refs
+
+            output_refs = _collect_refs(output_nodes[0].args)
+
+            # None of the output refs should be dead fused nodes.
+            for ref in output_refs:
+                assert ref.op != "call_function" or (
+                    ref.target is fuseml_fused_kernel_placeholder
+                    or ref.target not in {
+                        torch.ops.aten.addmm.default,
+                        torch.ops.aten.relu.default,
+                        torch.ops.aten.sigmoid.default,
+                    }
+                ), f"Output references dead node: {ref.name} ({ref.target})"
+
+    def test_two_heads_both_wired_to_output(self):
+        """Two parallel fusions that both feed into the output tuple."""
+
+        class TwoHeads(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.a = nn.Linear(64, 64)
+                self.b = nn.Linear(64, 64)
+
+            def forward(self, x):
+                return torch.relu(self.a(x)), torch.sigmoid(self.b(x))
+
+        gm = trace_no_grad(TwoHeads(), torch.randn(2, 64))
+        gm, groups = run_surgery(gm)
+
+        if len(groups) == 2:
+            placeholder_nodes = {
+                n for n in gm.graph.nodes
+                if n.op == "call_function"
+                and n.target is fuseml_fused_kernel_placeholder
+            }
+
+            output_nodes = [n for n in gm.graph.nodes if n.op == "output"]
+            assert len(output_nodes) == 1
+
+            def _collect_refs(args):
+                refs = set()
+                for a in args:
+                    if isinstance(a, torch.fx.Node):
+                        refs.add(a)
+                    elif isinstance(a, (tuple, list)):
+                        refs.update(_collect_refs(a))
+                return refs
+
+            output_refs = _collect_refs(output_nodes[0].args)
+            # Both placeholders should be referenced by the output.
+            assert placeholder_nodes.issubset(output_refs)
+
+    def test_graph_lint_after_dangling_guard(self):
+        """Graph must pass lint after surgery with dangling output guard."""
+        model = nn.Sequential(nn.Linear(64, 64), nn.ReLU())
+        gm = trace_no_grad(model, torch.randn(2, 64))
+        gm, groups = run_surgery(gm)
+        gm.graph.lint()
+
+
 class TestSurgeryPlaceholderRaises:
     """The placeholder should raise if actually called."""
     pytestmark = pytest.mark.surgery

@@ -49,6 +49,24 @@ SUPPORTED_TRITON_OPS: Dict[Any, str] = {
 
 
 # ---------------------------------------------------------------------------
+# Transparent view/metadata ops — absorbed during pattern matching but
+# require no Triton codegen (the epilogue silently skips them)
+# ---------------------------------------------------------------------------
+
+TRANSPARENT_OPS: Set[Any] = {
+    torch.ops.aten.view.default,
+    torch.ops.aten._unsafe_view.default,
+    torch.ops.aten.reshape.default,
+    torch.ops.aten.unsqueeze.default,
+    torch.ops.aten.squeeze.dim,
+    torch.ops.aten.expand.default,
+    torch.ops.aten.permute.default,
+    torch.ops.aten.slice.Tensor,
+    torch.ops.aten.select.int,
+}
+
+
+# ---------------------------------------------------------------------------
 # GraphSegment — represents one piece of a split FusionGroup
 # ---------------------------------------------------------------------------
 
@@ -89,6 +107,8 @@ def validate_fusion_group(group: FusionGroup) -> List[torch.fx.Node]:
 
     Only ``call_function`` nodes are checked — other node types
     (``placeholder``, ``output``, ``get_attr``) are inherently safe.
+    Transparent view/metadata ops (in :data:`TRANSPARENT_OPS`) are also
+    safe — the epilogue silently skips them.
 
     Parameters
     ----------
@@ -105,6 +125,8 @@ def validate_fusion_group(group: FusionGroup) -> List[torch.fx.Node]:
         if node.op != "call_function":
             continue
         if node.target not in SUPPORTED_TRITON_OPS:
+            if node.target in TRANSPARENT_OPS:
+                continue  # harmlessly skipped by the epilogue
             unsupported.append(node)
     return unsupported
 

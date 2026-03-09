@@ -9,12 +9,15 @@ Run with:
 
 from __future__ import annotations
 
+import pytest
 import torch
 import torch.nn as nn
 
 from fuseml import FuseMLFusionPass
 
-from conftest import find_groups, trace_no_grad
+from fuseml.passes.graph_cut import TRANSPARENT_OPS
+
+from conftest import find_groups, find_groups_with_shapes, trace_no_grad
 
 
 # ---------------------------------------------------------------------------
@@ -436,3 +439,132 @@ class TestMultipleGroups:
             if any(n.target is torch.ops.aten.sigmoid.default for n in g.fused_nodes)
         ]
         assert len(sigmoid_groups) >= 1
+
+
+# ---------------------------------------------------------------------------
+# Tests — view/metadata penetration
+# ---------------------------------------------------------------------------
+
+class TestViewPenetrationShapePreserving:
+    """Transparent view ops that preserve 2-D shape should be absorbed."""
+    pytestmark = pytest.mark.view_penetration
+
+    def test_addmm_view_relu_fuses(self):
+        """addmm → view (same shape) → relu should fuse into a single group."""
+
+        class ViewBetween(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear = nn.Linear(64, 64)
+
+            def forward(self, x):
+                h = self.linear(x)
+                # view that preserves the [M, N] shape
+                h = h.view(h.shape[0], h.shape[1])
+                return torch.relu(h)
+
+        x = torch.randn(2, 64)
+        gm = trace_no_grad(ViewBetween(), x)
+
+        # Check if a view node exists between addmm and relu.
+        view_nodes = [
+            n for n in gm.graph.nodes
+            if n.op == "call_function" and n.target in TRANSPARENT_OPS
+        ]
+
+        if view_nodes:
+            # Run with shapes so _is_shape_preserving_2d can check metadata.
+            from torch.fx.passes.shape_prop import ShapeProp
+            ShapeProp(gm).propagate(x)
+            groups = FuseMLFusionPass(gm)._find_fusion_groups()
+
+            if groups:
+                # The view should be inside the group's fused_nodes.
+                group = groups[0]
+                fused_targets = [n.target for n in group.fused_nodes]
+                # relu must be in the group (view penetration worked).
+                assert torch.ops.aten.relu.default in fused_targets
+                # The group should have more than 1 node (base + at least relu).
+                assert len(group) >= 2
+
+    def test_addmm_reshape_gelu_fuses(self):
+        """addmm → reshape (same shape) → gelu should fuse."""
+
+        class ReshapeBetween(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear = nn.Linear(64, 64)
+
+            def forward(self, x):
+                h = self.linear(x)
+                h = h.reshape(h.shape[0], h.shape[1])
+                return torch.nn.functional.gelu(h)
+
+        x = torch.randn(4, 64)
+        gm = trace_no_grad(ReshapeBetween(), x)
+
+        reshape_nodes = [
+            n for n in gm.graph.nodes
+            if n.op == "call_function"
+            and n.target in {torch.ops.aten.reshape.default, torch.ops.aten.view.default}
+        ]
+
+        if reshape_nodes:
+            from torch.fx.passes.shape_prop import ShapeProp
+            ShapeProp(gm).propagate(x)
+            groups = FuseMLFusionPass(gm)._find_fusion_groups()
+
+            if groups:
+                group = groups[0]
+                assert len(group) >= 2
+
+
+class TestViewPenetrationShapeChanging:
+    """View ops that change shape should NOT be absorbed."""
+    pytestmark = pytest.mark.view_penetration
+
+    def test_shape_changing_view_halts_absorption(self):
+        """addmm → view (3-D) → relu: view changes rank, should stop."""
+
+        class RankChangingView(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear = nn.Linear(64, 64)
+
+            def forward(self, x):
+                h = self.linear(x)
+                # Reshape to 3-D: [2, 64] → [2, 8, 8]
+                h = h.view(x.shape[0], 8, 8)
+                # relu after rank change
+                return torch.relu(h)
+
+        x = torch.randn(2, 64)
+        gm = trace_no_grad(RankChangingView(), x)
+
+        from torch.fx.passes.shape_prop import ShapeProp
+        ShapeProp(gm).propagate(x)
+        groups = FuseMLFusionPass(gm)._find_fusion_groups()
+
+        # The relu should NOT be absorbed because the view changed rank.
+        for g in groups:
+            relu_in_fused = any(
+                n.target is torch.ops.aten.relu.default for n in g.fused_nodes
+            )
+            assert not relu_in_fused, (
+                "relu should not be absorbed after a rank-changing view"
+            )
+
+
+class TestViewPenetrationTransparentOpsSet:
+    """Verify TRANSPARENT_OPS contains the expected view/metadata ops."""
+    pytestmark = pytest.mark.view_penetration
+
+    @pytest.mark.parametrize("op", [
+        torch.ops.aten.view.default,
+        torch.ops.aten.reshape.default,
+        torch.ops.aten.unsqueeze.default,
+        torch.ops.aten.expand.default,
+        torch.ops.aten.permute.default,
+    ])
+    def test_op_in_transparent_set(self, op):
+        assert op in TRANSPARENT_OPS

@@ -14,7 +14,11 @@ from torch.fx.passes.shape_prop import ShapeProp
 from fuseml._logging import logger
 from fuseml.codegen.kernel_cache import _materialize_ints
 from fuseml.fusion_group import FusionGroup
-from fuseml.passes.graph_cut import split_fusion_group, validate_fusion_group
+from fuseml.passes.graph_cut import (
+    TRANSPARENT_OPS,
+    split_fusion_group,
+    validate_fusion_group,
+)
 from fuseml.registry import SupportedOpsRegistry, build_default_registry
 
 
@@ -179,6 +183,26 @@ class FuseMLFusionPass:
                     )
                     break  # nothing further after a reduction
 
+                # --- Transparent view/metadata penetration --------------------
+                # If the successor is a view/reshape/unsqueeze that does not
+                # change the 2-D tile shape, absorb it silently and keep
+                # looking for the next compute op.  This lets chains like
+                # addmm → view → relu fuse correctly.
+                if successor.target in TRANSPARENT_OPS:
+                    if self._is_shape_preserving_2d(successor):
+                        group.fused_nodes.append(successor)
+                        consumed.add(successor)
+                        group_node_set.add(successor)
+                        self._collect_external_inputs(
+                            successor, group_node_set, group,
+                        )
+                        # Do NOT update output_node — a transparent op is
+                        # never the "real" output; the next compute op is.
+                        current = successor
+                        continue
+                    # Shape-changing view → stop absorption.
+                    break
+
                 # Only absorb low-intensity pointwise ops.
                 if successor.target not in self._ABSORBABLE_OPS:
                     break
@@ -267,6 +291,40 @@ class FuseMLFusionPass:
             if isinstance(arg, torch.fx.Node) and arg not in group_node_set:
                 if arg not in group.inputs:
                     group.inputs.append(arg)
+
+    @staticmethod
+    def _is_shape_preserving_2d(node: torch.fx.Node) -> bool:
+        """Return ``True`` if *node* is a view op that preserves 2-D shape.
+
+        The Triton kernel stores its GEMM accumulator to a 2-D ``[M, N]``
+        output.  A view op can only be absorbed transparently if its output
+        shape matches the GEMM output dimensions.  Shape-changing views
+        (different rank or different M/N) would cause a store mismatch and
+        are conservatively rejected.
+
+        Returns ``False`` when ``tensor_meta`` is missing (e.g. ShapeProp
+        was not run), ensuring the conservative fallback: views are NOT
+        absorbed and existing behavior is preserved.
+        """
+        node_meta = node.meta.get("tensor_meta")
+        if node_meta is None or not hasattr(node_meta, "shape"):
+            return False
+
+        # The predecessor is the first arg (the tensor being viewed).
+        if not node.args or not isinstance(node.args[0], torch.fx.Node):
+            return False
+        pred = node.args[0]
+        pred_meta = pred.meta.get("tensor_meta")
+        if pred_meta is None or not hasattr(pred_meta, "shape"):
+            return False
+
+        # Both must be 2-D with identical dimensions.
+        if len(node_meta.shape) != 2 or len(pred_meta.shape) != 2:
+            return False
+        return (
+            node_meta.shape[0] == pred_meta.shape[0]
+            and node_meta.shape[1] == pred_meta.shape[1]
+        )
 
     # ------------------------------------------------------------------
     # get_attr resolution — bind nn.Parameters to the FusionGroup
@@ -382,11 +440,32 @@ class FuseMLFusionPass:
             # --- Rewire downstream consumers to the new node ---------------
             group.output_node.replace_all_uses_with(
                 new_fused_node,
-                # Don't replace the use *inside* the new node itself — its
-                # args are the group's external inputs, not the output node,
-                # but guard against edge cases.
                 propagate_meta=False,
             )
+
+            # --- Dangling output guard ------------------------------------
+            # If the fusion group is the final computation before the
+            # graph's output node, verify the output node's args now
+            # reference our new placeholder (not the dead original).
+            for graph_node in graph.nodes:
+                if graph_node.op == "output":
+                    def _patch_arg(arg):
+                        if arg is group.output_node:
+                            logger.warning(
+                                "Dangling output guard: output node still "
+                                "references dead node %s — patching.",
+                                group.output_node.name,
+                            )
+                            return new_fused_node
+                        if isinstance(arg, (tuple, list)):
+                            patched = [_patch_arg(a) for a in arg]
+                            return type(arg)(patched)
+                        return arg
+
+                    new_args = tuple(_patch_arg(a) for a in graph_node.args)
+                    if new_args != graph_node.args:
+                        graph_node.args = new_args
+                    break
 
         # --- Cleanup: rigorous dead code elimination -----------------------
         # Phase 1: Standard DCE removes nodes with zero users.
