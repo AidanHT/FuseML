@@ -407,6 +407,7 @@ class TritonKernelGenerator:
         escape_stores: dict[int, TensorDescriptor] | None = None,
         output_descriptor: TensorDescriptor | None = None,
         all_group_node_ids: set[int] | None = None,
+        node_args_snapshot: dict[str, tuple] | None = None,
     ) -> str:
         """Return Triton source for fused post-GEMM operations on ``acc``.
 
@@ -486,6 +487,7 @@ class TritonKernelGenerator:
         """
         escape_stores = escape_stores or {}
         node_ids = all_group_node_ids or {id(n) for n in fusion_group_nodes}
+        node_args_snapshot = node_args_snapshot or {}
         self._last_reduction = None  # reset for this epilogue
 
         out_name = output_descriptor.name if output_descriptor else "out"
@@ -502,6 +504,10 @@ class TritonKernelGenerator:
         for node in fusion_group_nodes:
             if node.op != "call_function":
                 continue
+
+            # After graph surgery + DCE, erased nodes have args set to None.
+            # Use the pre-surgery snapshot when available.
+            saved_args = node_args_snapshot.get(node.name)
 
             # Both the functional (relu) and in-place (relu_) variants produce
             # identical register semantics — tl.where(acc > 0, acc, 0.0) —
@@ -525,12 +531,12 @@ class TritonKernelGenerator:
                 torch.ops.aten.add.Tensor,
                 torch.ops.aten.add_.Tensor,
             ):
-                lines.append(self._emit_add(node, node_ids))
+                lines.append(self._emit_add(node, node_ids, saved_args))
             elif node.target in (
                 torch.ops.aten.mul.Tensor,
                 torch.ops.aten.mul_.Tensor,
             ):
-                lines.append(self._emit_mul(node, node_ids))
+                lines.append(self._emit_mul(node, node_ids, saved_args))
             # ----- Reduction operators — cross-thread synchronization -----
             elif node.target == torch.ops.aten.sum.dim_IntList:
                 axis, keepdim = self._determine_reduction_axis(node)

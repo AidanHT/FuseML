@@ -64,6 +64,7 @@ class FusionGroup:
     param_bindings: Dict[str, Union[torch.nn.Parameter, torch.Tensor]] = field(
         default_factory=dict,
     )
+    node_args_snapshot: Dict[str, tuple] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         # Default output_node to base_node when the group is a single op.

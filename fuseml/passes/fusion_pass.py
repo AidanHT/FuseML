@@ -290,6 +290,11 @@ class FuseMLFusionPass:
                 group.output_metadata = self._extract_tensor_metadata(
                     group.output_node
                 )
+                # Snapshot node args so the epilogue can inspect them
+                # after graph surgery / DCE has erased the original nodes
+                # (FX nullifies node.args on erase_node).
+                for n in group.all_nodes:
+                    group.node_args_snapshot[n.name] = tuple(n.args)
                 logger.debug("Fusion group found: %s", group)
                 groups.append(group)
 
