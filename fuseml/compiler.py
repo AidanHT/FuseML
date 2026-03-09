@@ -34,6 +34,10 @@ from fuseml.codegen.kernel_generator import (
 )
 from fuseml.codegen.kernel_launcher import KernelLauncher
 from fuseml.fusion_group import FusionGroup
+from fuseml.passes.control_flow_validation import (
+    ControlFlowError,
+    validate_graph_control_flow,
+)
 from fuseml.passes.fusion_pass import FuseMLFusionPass, fuseml_fused_kernel_placeholder
 from fuseml.registry import SupportedOpsRegistry, build_default_registry
 
@@ -164,6 +168,17 @@ class FuseMLCompiler:
             "Captured FX graph with %d nodes — scanning for fusion candidates …",
             len(list(gm.graph.nodes)),
         )
+
+        # ── Step 0: validate for data-dependent control flow ──────────
+        try:
+            validate_graph_control_flow(gm)
+        except ControlFlowError as exc:
+            logger.warning(
+                "Data-dependent control flow detected — skipping fusion "
+                "and falling back to eager execution for this subgraph: %s",
+                exc,
+            )
+            return gm.forward
 
         # ── Step 1: tag candidates for observability ──────────────────
         self.capture_and_print_graph(gm)
