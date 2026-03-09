@@ -61,6 +61,12 @@ _DEFAULT_BLOCK_SIZE_M: int = 64
 _DEFAULT_BLOCK_SIZE_N: int = 64
 _DEFAULT_BLOCK_SIZE_K: int = 32
 
+# Default L2 swizzle group width — controls how many M-blocks are grouped
+# together in the 1-D → 2-D block-index mapping.  Adjacent programs in a
+# group share the same A-tile rows, maximising L2 cache reuse.  8 is the
+# standard value from the Triton GEMM tutorial and works well on Ampere/Ada.
+_DEFAULT_GROUP_SIZE_M: int = 8
+
 # Bytes-per-element lookup for heuristic tuning.
 _BYTES_PER_ELEMENT: dict[torch.dtype, int] = {
     torch.float32: 4,
@@ -93,9 +99,8 @@ class KernelLauncher:
     - Enforce SRAM capacity limits by downscaling block dimensions.
     - Launch the kernel on ``torch.cuda.current_stream()``.
     - Allocate the output tensor (zero-initialised when atomic ops are used).
-    - Compute the 2-D CUDA launch grid:
-      ``Grid_x = ceil(M / BLOCK_SIZE_M)``,
-      ``Grid_y = ceil(N / BLOCK_SIZE_N)``.
+    - Compute the 1-D CUDA launch grid with L2-swizzled block indexing:
+      ``total_programs = ceil(M / BLOCK_SIZE_M) * ceil(N / BLOCK_SIZE_N)``.
     - Dynamically select ``num_warps`` and ``num_stages`` based on precision
       and working-set size.
     - Assemble the flat argument list required by the generated kernel
@@ -125,6 +130,11 @@ class KernelLauncher:
     block_size_m, block_size_n, block_size_k :
         ``tl.constexpr`` tile sizes forwarded to the kernel at launch.
         Defaults to 64/64/32.
+    group_size_m :
+        L2 swizzle group width — controls how many M-blocks are grouped
+        together in the 1-D → 2-D block-index mapping.  Adjacent programs
+        in a group share the same A-tile rows, maximising L2 cache reuse.
+        Defaults to 8.
     reduction_op :
         Optional reduction kind (``"sum"``, ``"max"``, ``"mean"``).
     eager_fn :
@@ -148,6 +158,7 @@ class KernelLauncher:
         block_size_m: int = _DEFAULT_BLOCK_SIZE_M,
         block_size_n: int = _DEFAULT_BLOCK_SIZE_N,
         block_size_k: int = _DEFAULT_BLOCK_SIZE_K,
+        group_size_m: int = _DEFAULT_GROUP_SIZE_M,
         reduction_op: str | None = None,
         eager_fn: Callable[..., torch.Tensor] | None = None,
     ) -> None:
@@ -163,6 +174,7 @@ class KernelLauncher:
         self._block_size_m = next_power_of_2(block_size_m)
         self._block_size_n = next_power_of_2(block_size_n)
         self._block_size_k = next_power_of_2(block_size_k)
+        self._group_size_m = group_size_m
         self._reduction_op = reduction_op
 
         # Pre-compute indices so __call__ does not re-scan the list every time.
@@ -486,14 +498,14 @@ class KernelLauncher:
         ]
 
         # ── Launch grid ───────────────────────────────────────────────
-        # Grid_x = ceil(M / BLOCK_SIZE_M)
-        # Grid_y = ceil(N / BLOCK_SIZE_N)
-        # The grid closure reads BLOCK_SIZE_* from Triton's META dict so
-        # it stays consistent with the constexpr values passed below.
-        def grid(META: dict) -> tuple[int, int]:
+        # 1-D grid: total_programs = ceil(M / BLOCK_SIZE_M) * ceil(N / BLOCK_SIZE_N)
+        # The kernel's L2 swizzling logic maps this 1-D program index to
+        # 2-D (pid_m, pid_n) using GROUP_SIZE_M-wide column-major stripes,
+        # maximising L2 data reuse across adjacent thread blocks.
+        def grid(META: dict) -> tuple[int]:
             return (
-                triton.cdiv(M, META["BLOCK_SIZE_M"]),
-                triton.cdiv(N, META["BLOCK_SIZE_N"]),
+                triton.cdiv(M, META["BLOCK_SIZE_M"])
+                * triton.cdiv(N, META["BLOCK_SIZE_N"]),
             )
 
         # ── Argument assembly ─────────────────────────────────────────
@@ -541,6 +553,7 @@ class KernelLauncher:
             "BLOCK_SIZE_M": block_m,
             "BLOCK_SIZE_N": block_n,
             "BLOCK_SIZE_K": block_k,
+            "GROUP_SIZE_M": self._group_size_m,
             "num_warps": num_warps,
             "num_stages": num_stages,
         }

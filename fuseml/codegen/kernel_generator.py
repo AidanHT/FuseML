@@ -760,11 +760,12 @@ class TritonKernelGenerator:
             params.append(f"    # Strides for intermediate output {t.name} (M x N)")
             params.append(f"    {s_im}, {s_in},")
 
-        # -- Constexpr block sizes --
-        params.append("    # Block sizes (compile-time constants)")
+        # -- Constexpr block sizes and L2 swizzle group width --
+        params.append("    # Block sizes and L2 swizzle group width (compile-time constants)")
         params.append("    BLOCK_SIZE_M: tl.constexpr,")
         params.append("    BLOCK_SIZE_N: tl.constexpr,")
         params.append("    BLOCK_SIZE_K: tl.constexpr,")
+        params.append("    GROUP_SIZE_M: tl.constexpr,")
 
         body = "\n".join(params)
         return f"def fused_kernel(\n{body}\n):"
@@ -935,6 +936,12 @@ class TritonKernelGenerator:
             f"    # and one (BLOCK_SIZE_K, BLOCK_SIZE_N) tile of {rn} from HBM into SRAM,",
             "    # accumulates the partial dot-product, then advances pointers.",
             "    # Total HBM reads: 2 * ceil(K / BLOCK_SIZE_K) tile loads per program.",
+            "    #",
+            "    # eviction_policy='evict_last' — K-loop tiles are streamed once and",
+            "    # not reused within the same warp schedule.  Marking them as 'evict_last'",
+            "    # tells the L2 cache controller to deprioritise these lines, preserving",
+            "    # SRAM residency for epilogue intermediate buffers and the A-tile rows",
+            "    # that are reused across the L2-swizzled block group.",
             "    # -----------------------------------------------------------",
             "    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):",
             "        # K-boundary mask — changes each iteration as k advances",
@@ -942,10 +949,18 @@ class TritonKernelGenerator:
             "",
             f"        # Load (BLOCK_SIZE_M x BLOCK_SIZE_K) tile of {ln} from HBM → SRAM",
             f"        # Full 2-D mask guards both the M boundary and the K boundary",
-            f"        {ln} = tl.load({ln}_ptrs, mask=(offs_m[:, None] < M) & (k_mask[None, :]), other=0.0)",
+            (
+                f"        {ln} = tl.load({ln}_ptrs, "
+                f"mask=(offs_m[:, None] < M) & (k_mask[None, :]), "
+                f"other=0.0, eviction_policy='evict_last')"
+            ),
             f"        # Load (BLOCK_SIZE_K x BLOCK_SIZE_N) tile of {rn} from HBM → SRAM",
             f"        # Full 2-D mask guards both the K boundary and the N boundary",
-            f"        {rn} = tl.load({rn}_ptrs, mask=(k_mask[:, None]) & (offs_n[None, :] < N), other=0.0)",
+            (
+                f"        {rn} = tl.load({rn}_ptrs, "
+                f"mask=(k_mask[:, None]) & (offs_n[None, :] < N), "
+                f"other=0.0, eviction_policy='evict_last')"
+            ),
             "",
             "        # Tile-level matrix multiply — accumulated entirely in SRAM",
             f"        acc += tl.dot({ln}, {rn})",

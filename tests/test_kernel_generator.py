@@ -95,16 +95,58 @@ class TestSignatureGeneration:
         assert "BLOCK_SIZE_N: tl.constexpr" in code
         assert "BLOCK_SIZE_K: tl.constexpr" in code
 
-    def test_contains_program_ids(self, gen, matmul_inputs, output_tensor):
+    def test_contains_group_size_m_constexpr(self, gen, matmul_inputs, output_tensor):
+        code = gen.generate_signature_and_pointers(matmul_inputs, output_tensor)
+        assert "GROUP_SIZE_M: tl.constexpr" in code
+
+    def test_contains_program_id(self, gen, matmul_inputs, output_tensor):
+        """1-D program index for L2 swizzling — only tl.program_id(0) is used."""
         code = gen.generate_signature_and_pointers(matmul_inputs, output_tensor)
         assert "tl.program_id(0)" in code
-        assert "tl.program_id(1)" in code
 
     def test_contains_block_offsets(self, gen, matmul_inputs, output_tensor):
         code = gen.generate_signature_and_pointers(matmul_inputs, output_tensor)
         assert "tl.arange(0, BLOCK_SIZE_M)" in code
         assert "tl.arange(0, BLOCK_SIZE_N)" in code
         assert "tl.arange(0, BLOCK_SIZE_K)" in code
+
+
+# ---------------------------------------------------------------------------
+# L2 block swizzling
+# ---------------------------------------------------------------------------
+
+@pytest.mark.codegen
+class TestL2BlockSwizzling:
+    """Verify L2 cache swizzling logic in the generated kernel."""
+
+    def test_swizzle_computes_num_pid_m(self, gen, matmul_inputs, output_tensor):
+        code = gen.generate_signature_and_pointers(matmul_inputs, output_tensor)
+        assert "num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)" in code
+
+    def test_swizzle_computes_num_pid_n(self, gen, matmul_inputs, output_tensor):
+        code = gen.generate_signature_and_pointers(matmul_inputs, output_tensor)
+        assert "num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)" in code
+
+    def test_swizzle_computes_group_id(self, gen, matmul_inputs, output_tensor):
+        code = gen.generate_signature_and_pointers(matmul_inputs, output_tensor)
+        assert "group_id = pid // num_pid_in_group" in code
+
+    def test_swizzle_derives_pid_m(self, gen, matmul_inputs, output_tensor):
+        code = gen.generate_signature_and_pointers(matmul_inputs, output_tensor)
+        assert "pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)" in code
+
+    def test_swizzle_derives_pid_n(self, gen, matmul_inputs, output_tensor):
+        code = gen.generate_signature_and_pointers(matmul_inputs, output_tensor)
+        assert "pid_n = (pid % num_pid_in_group) // group_size_m" in code
+
+    def test_swizzle_uses_group_size_m(self, gen, matmul_inputs, output_tensor):
+        code = gen.generate_signature_and_pointers(matmul_inputs, output_tensor)
+        assert "GROUP_SIZE_M * num_pid_n" in code
+
+    def test_no_program_id_1(self, gen, matmul_inputs, output_tensor):
+        """With swizzling, only tl.program_id(0) is used — no 2-D grid."""
+        code = gen.generate_signature_and_pointers(matmul_inputs, output_tensor)
+        assert "tl.program_id(1)" not in code
 
 
 # ---------------------------------------------------------------------------
@@ -390,6 +432,48 @@ class TestKLoopMasking:
         """Masked-out elements must be zero to avoid corrupting the dot product."""
         code = gen.generate_k_loop(matmul_inputs, output_tensor)
         assert "other=0.0" in code
+
+
+# ---------------------------------------------------------------------------
+# K-loop: eviction policies
+# ---------------------------------------------------------------------------
+
+@pytest.mark.codegen
+class TestKLoopEvictionPolicies:
+    """Verify K-loop loads use eviction_policy='evict_last'.
+
+    K-loop tiles are streamed once and not reused within the same warp
+    schedule.  Marking them with 'evict_last' tells the L2 cache to
+    deprioritise these lines, preserving SRAM residency for epilogue
+    intermediate buffers and the A-tile rows reused across the L2-swizzled
+    block group.
+    """
+
+    def test_left_load_evict_last(self, gen, matmul_inputs, output_tensor):
+        code = gen.generate_k_loop(matmul_inputs, output_tensor)
+        assert "eviction_policy='evict_last'" in code
+        # Specifically on the left operand load line
+        for line in code.splitlines():
+            if "a = tl.load(a_ptrs," in line:
+                assert "eviction_policy='evict_last'" in line
+                break
+        else:
+            pytest.fail("Left operand load line not found")
+
+    def test_right_load_evict_last(self, gen, matmul_inputs, output_tensor):
+        code = gen.generate_k_loop(matmul_inputs, output_tensor)
+        for line in code.splitlines():
+            if "b = tl.load(b_ptrs," in line:
+                assert "eviction_policy='evict_last'" in line
+                break
+        else:
+            pytest.fail("Right operand load line not found")
+
+    def test_evict_last_comment_present(self, gen, matmul_inputs, output_tensor):
+        """Generated code must explain the eviction policy rationale."""
+        code = gen.generate_k_loop(matmul_inputs, output_tensor)
+        assert "evict_last" in code
+        assert "L2" in code or "SRAM" in code
 
 
 # ---------------------------------------------------------------------------

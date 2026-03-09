@@ -16,6 +16,7 @@ import torch
 from fuseml.codegen.kernel_generator import TensorDescriptor
 from fuseml.codegen.kernel_launcher import (
     KernelLauncher,
+    _DEFAULT_GROUP_SIZE_M,
     _DEFAULT_SRAM_BUDGET_BYTES,
     _LARGE_WORKING_SET_BYTES,
     _MIN_BLOCK_DIM,
@@ -567,6 +568,53 @@ class TestKernelLaunchHeuristics:
 
 
 # ---------------------------------------------------------------------------
+# __call__ — GROUP_SIZE_M (L2 swizzle width) passed to kernel
+# ---------------------------------------------------------------------------
+
+@pytest.mark.launcher
+class TestGroupSizeMKwarg:
+    """Verify GROUP_SIZE_M is passed as a constexpr kwarg."""
+
+    @pytest.fixture(autouse=True)
+    def _inject_mock_triton(self, monkeypatch):
+        mock_triton = types.ModuleType("triton")
+        mock_triton.cdiv = lambda a, b: (a + b - 1) // b
+        monkeypatch.setitem(sys.modules, "triton", mock_triton)
+
+    def test_default_group_size_m(self, mock_kernel_fn, input_descs, output_desc):
+        launcher = KernelLauncher(mock_kernel_fn, input_descs, output_desc, [], "a", "b")
+        a = torch.randn(128, 64)
+        b = torch.randn(64, 256)
+        launcher(a, b)
+        call = mock_kernel_fn.calls[0]
+        assert call["kwargs"]["GROUP_SIZE_M"] == _DEFAULT_GROUP_SIZE_M
+
+    def test_custom_group_size_m(self, mock_kernel_fn, input_descs, output_desc):
+        launcher = KernelLauncher(
+            mock_kernel_fn, input_descs, output_desc, [], "a", "b",
+            group_size_m=16,
+        )
+        a = torch.randn(128, 64)
+        b = torch.randn(64, 256)
+        launcher(a, b)
+        call = mock_kernel_fn.calls[0]
+        assert call["kwargs"]["GROUP_SIZE_M"] == 16
+
+    def test_grid_is_1d(self, mock_kernel_fn, input_descs, output_desc):
+        """Grid is 1-D (single integer tuple) for L2 swizzled block indexing."""
+        launcher = KernelLauncher(mock_kernel_fn, input_descs, output_desc, [], "a", "b")
+        a = torch.randn(128, 64)
+        b = torch.randn(64, 256)
+        launcher(a, b)
+        call = mock_kernel_fn.calls[0]
+        grid = call["grid"]
+        assert isinstance(grid, tuple)
+        assert len(grid) == 1
+        # total_programs = ceil(128/64) * ceil(256/64) = 2 * 4 = 8
+        assert grid[0] == 8
+
+
+# ---------------------------------------------------------------------------
 # __call__ with native stride handling — no unnecessary copies
 # ---------------------------------------------------------------------------
 
@@ -637,7 +685,8 @@ class TestGridBoundaryMasking:
     The kernel generator emits boundary masks like
     ``mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)``
     which rely on M, N being passed as positional args.  These tests
-    verify the launcher computes the correct grid and passes M, N.
+    verify the launcher computes the correct 1-D grid (with L2 swizzling)
+    and passes M, N.
     """
 
     @pytest.fixture(autouse=True)
@@ -647,7 +696,7 @@ class TestGridBoundaryMasking:
         monkeypatch.setitem(sys.modules, "triton", mock_triton)
 
     def test_non_divisible_m(self, mock_kernel_fn, output_desc):
-        """M=100 with BLOCK_SIZE_M=64 → grid_x = ceil(100/64) = 2."""
+        """M=100 with BLOCK_SIZE_M=64 → grid = ceil(100/64) * ceil(256/64) = 2 * 4 = 8."""
         a_desc = TensorDescriptor("a", (100, 64), (64, 1), torch.float32)
         b_desc = TensorDescriptor("b", (64, 256), (256, 1), torch.float32)
         out_desc = TensorDescriptor("out", (100, 256), (256, 1), torch.float32)
@@ -658,15 +707,16 @@ class TestGridBoundaryMasking:
         b = torch.randn(64, 256)
         launcher(a, b)
         call = mock_kernel_fn.calls[0]
-        grid_x, grid_y = call["grid"]
-        assert grid_x == 2   # ceil(100/64)
-        assert grid_y == 4   # ceil(256/64)
+        (total_programs,) = call["grid"]
+        grid_m = (100 + 64 - 1) // 64   # 2
+        grid_n = (256 + 64 - 1) // 64   # 4
+        assert total_programs == grid_m * grid_n
         # M=100, N=256 passed for boundary mask
         assert call["args"][3] == 100
         assert call["args"][4] == 256
 
     def test_non_divisible_n(self, mock_kernel_fn):
-        """N=200 with BLOCK_SIZE_N=64 → grid_y = ceil(200/64) = 4."""
+        """N=200 with BLOCK_SIZE_N=64 → grid = 2 * 4 = 8."""
         a_desc = TensorDescriptor("a", (128, 64), (64, 1), torch.float32)
         b_desc = TensorDescriptor("b", (64, 200), (200, 1), torch.float32)
         out_desc = TensorDescriptor("out", (128, 200), (200, 1), torch.float32)
@@ -677,9 +727,10 @@ class TestGridBoundaryMasking:
         b = torch.randn(64, 200)
         launcher(a, b)
         call = mock_kernel_fn.calls[0]
-        grid_x, grid_y = call["grid"]
-        assert grid_x == 2   # ceil(128/64)
-        assert grid_y == 4   # ceil(200/64) = 3.125 → 4
+        (total_programs,) = call["grid"]
+        grid_m = (128 + 64 - 1) // 64   # 2
+        grid_n = (200 + 64 - 1) // 64   # 4
+        assert total_programs == grid_m * grid_n
         assert call["args"][4] == 200  # N passed for mask
 
     def test_both_non_divisible(self, mock_kernel_fn):
@@ -694,9 +745,10 @@ class TestGridBoundaryMasking:
         b = torch.randn(64, 127)
         launcher(a, b)
         call = mock_kernel_fn.calls[0]
-        grid_x, grid_y = call["grid"]
-        assert grid_x == 501  # ceil(32001/64)
-        assert grid_y == 2    # ceil(127/64)
+        (total_programs,) = call["grid"]
+        grid_m = (32001 + 64 - 1) // 64  # 501
+        grid_n = (127 + 64 - 1) // 64    # 2
+        assert total_programs == grid_m * grid_n
         assert call["args"][3] == 32001
         assert call["args"][4] == 127
 
