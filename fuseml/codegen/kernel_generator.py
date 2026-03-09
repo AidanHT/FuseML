@@ -1763,61 +1763,88 @@ class TritonKernelGenerator:
 
     @staticmethod
     def _emit_sum(axis: int, output_name: str, triton_dtype: str) -> str:
-        """Sum reduction with cross-thread synchronization via ``tl.atomic_add``.
+        """Sum reduction with two-stage block-local then atomic accumulation.
 
-        ``tl.sum`` collapses the tile-local accumulator along *axis*,
-        producing a partial sum per program instance.  ``tl.atomic_add``
-        accumulates the partials across all programs that share the
-        surviving dimension so that the final result is correct even when
-        the reduced dimension spans multiple tile blocks.
+        **Stage 1 (register-local)**: ``tl.sum`` collapses the tile-local
+        accumulator along *axis*, performing ``BLOCK_{dim}`` independent
+        additions entirely in SRAM registers — zero HBM traffic.
+
+        **Stage 2 (atomic to HBM)**: ``tl.atomic_add`` writes the partial
+        sums to global memory.  Because the block-local reduction already
+        collapsed one full tile dimension, the number of atomic operations
+        per program is reduced from ``BLOCK_M × BLOCK_N`` to just
+        ``BLOCK_{surviving}`` — minimizing atomic serialization penalties
+        on the memory bus.
         """
         dim_name = "N" if axis == 1 else "M"
+        surviving = "M" if axis == 1 else "N"
         offs = "offs_m" if axis == 1 else "offs_n"
         bound = "M" if axis == 1 else "N"
         return "\n".join([
-            f"    # Reduction: sum along {dim_name} — cross-thread synchronization",
-            f"    # tl.sum collapses axis={axis} within this program's tile.",
-            f"    # tl.atomic_add accumulates partial sums across programs that",
-            f"    # share the same {bound}-tile, producing the complete result.",
+            f"    # ── Reduction: sum along {dim_name} (two-stage) ──────────────────",
+            f"    # Stage 1: block-local tl.sum collapses axis={axis}, producing one",
+            f"    # partial sum per surviving-dimension lane — entirely in registers.",
+            f"    # Stage 2: tl.atomic_add coalesces partials across programs that",
+            f"    # share the same {bound}-tile.  Block-local reduction cuts atomics",
+            f"    # from BLOCK_{dim_name}×BLOCK_{surviving} down to BLOCK_{surviving}.",
             f"    partial_sum = tl.sum(acc, axis={axis}).to({triton_dtype})",
             f"    tl.atomic_add({output_name}_ptrs, partial_sum, mask={offs} < {bound})",
         ])
 
     @staticmethod
     def _emit_max(axis: int, output_name: str, triton_dtype: str) -> str:
-        """Max reduction with cross-thread synchronization via ``tl.atomic_max``.
+        """Max reduction with two-stage block-local then atomic accumulation.
 
-        Same partial-result strategy as :meth:`_emit_sum` but uses
-        ``tl.max`` / ``tl.atomic_max`` instead.
+        Same two-stage strategy as :meth:`_emit_sum`:
+
+        **Stage 1**: ``tl.max`` collapses the tile in registers (zero HBM).
+        **Stage 2**: ``tl.atomic_max`` writes block-local maxima to global
+        memory, cutting atomic operations from ``BLOCK_M × BLOCK_N`` to
+        ``BLOCK_{surviving}``.
         """
         dim_name = "N" if axis == 1 else "M"
+        surviving = "M" if axis == 1 else "N"
         offs = "offs_m" if axis == 1 else "offs_n"
         bound = "M" if axis == 1 else "N"
         return "\n".join([
-            f"    # Reduction: max along {dim_name} — cross-thread synchronization",
-            f"    # tl.max collapses axis={axis}, tl.atomic_max accumulates partials.",
+            f"    # ── Reduction: max along {dim_name} (two-stage) ──────────────────",
+            f"    # Stage 1: block-local tl.max collapses axis={axis} in registers.",
+            f"    # Stage 2: tl.atomic_max coalesces block-local maxima to HBM,",
+            f"    # cutting atomics from BLOCK_{dim_name}×BLOCK_{surviving} to BLOCK_{surviving}.",
             f"    partial_max = tl.max(acc, axis={axis}).to({triton_dtype})",
             f"    tl.atomic_max({output_name}_ptrs, partial_max, mask={offs} < {bound})",
         ])
 
     @staticmethod
     def _emit_mean(axis: int, output_name: str, triton_dtype: str) -> str:
-        """Mean reduction — partial sums via ``tl.atomic_add``, division deferred.
+        """Mean reduction — FP32 atomic accumulation, division deferred.
 
-        Each program contributes its partial ``tl.sum`` via
-        ``tl.atomic_add``.  The division by the full dimension size is
-        deferred to :class:`~fuseml.codegen.kernel_launcher.KernelLauncher`
-        for better numerical precision (avoids many small floating-point
-        divisions inside the kernel).
+        Each program contributes its block-local ``tl.sum`` via
+        ``tl.atomic_add``.
+
+        **Numerical stability**: partial sums are kept in FP32 regardless
+        of the output dtype.  When the output is bfloat16 or float16,
+        accumulating in the narrow dtype would compound rounding errors
+        across the ``ceil(dim / BLOCK)`` atomic additions per element.
+        FP32 accumulation preserves ~7 decimal digits of precision.
+
+        The :class:`~fuseml.codegen.kernel_launcher.KernelLauncher`
+        performs the final ``result = (fp32_accum / dim).to(out_dtype)``,
+        ensuring the mean is numerically stable even for large reduction
+        dimensions combined with bfloat16 outputs.
         """
         dim_name = "N" if axis == 1 else "M"
+        surviving = "M" if axis == 1 else "N"
         offs = "offs_m" if axis == 1 else "offs_n"
         bound = "M" if axis == 1 else "N"
         return "\n".join([
-            f"    # Reduction: mean along {dim_name} — cross-thread synchronization",
-            f"    # Partial sum accumulated via tl.atomic_add; division by {dim_name}",
-            f"    # is deferred to the kernel launcher for numerical precision.",
-            f"    partial_sum = tl.sum(acc, axis={axis}).to({triton_dtype})",
+            f"    # ── Reduction: mean along {dim_name} (two-stage, FP32 accumulation) ─",
+            f"    # Stage 1: block-local tl.sum collapses axis={axis} in registers.",
+            f"    # Stage 2: tl.atomic_add accumulates partials in FP32 to avoid",
+            f"    # bf16/fp16 rounding during cross-program synchronization.",
+            f"    # Division by {dim_name} is deferred to the KernelLauncher which",
+            f"    # performs: result = (fp32_accum / {dim_name}).to(output_dtype).",
+            f"    partial_sum = tl.sum(acc, axis={axis})  # keep FP32 — acc is always FP32",
             f"    tl.atomic_add({output_name}_ptrs, partial_sum, mask={offs} < {bound})",
         ])
 
