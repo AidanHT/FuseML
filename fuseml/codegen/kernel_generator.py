@@ -32,6 +32,26 @@ _TRITON_DTYPE_MAP: dict[torch.dtype, str] = {
 
 
 # ---------------------------------------------------------------------------
+# Reduction info — tracks what happened to acc during the epilogue
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class ReductionInfo:
+    """Metadata describing a reduction emitted during the epilogue.
+
+    Attributes
+    ----------
+    axis : Triton tile axis that was collapsed (0 = M, 1 = N).
+    op   : Reduction kind — ``"sum"``, ``"max"``, or ``"mean"``.
+    keepdim : Whether the reduced dimension is kept as size-1.
+    """
+
+    axis: int
+    op: str
+    keepdim: bool = False
+
+
+# ---------------------------------------------------------------------------
 # Tensor descriptor
 # ---------------------------------------------------------------------------
 
@@ -103,6 +123,19 @@ def _vector_dim(tensor: TensorDescriptor, M: int, N: int) -> str:
     return "n"
 
 
+def _surviving_dim(output: TensorDescriptor, M: int, N: int) -> str:
+    """For a 1-D reduced output, determine which dimension label survived.
+
+    Compares the output's single dimension against the matmul M and N to
+    decide whether the result aligns with ``"m"`` (rows) or ``"n"`` (columns).
+    Defaults to ``"m"`` (the common case for ``dim=-1`` reductions on an
+    (M, N) matmul result).
+    """
+    if output.shape[0] == N and N != M:
+        return "n"
+    return "m"
+
+
 def _identify_matmul_operands(
     matrices: list[TensorDescriptor],
 ) -> tuple[TensorDescriptor, TensorDescriptor]:
@@ -149,6 +182,7 @@ class TritonKernelGenerator:
 
     def __init__(self) -> None:
         self._kernel_cache: dict[str, object] = {}
+        self._last_reduction: ReductionInfo | None = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -245,7 +279,12 @@ class TritonKernelGenerator:
                 sections.append(self._section_matrix_ptrs(t, labels))
             else:
                 sections.append(self._section_vector_ptrs(t, labels[0]))
-        sections.append(self._section_output_ptrs(output_tensor))
+        # Output pointer arithmetic — 1-D for reduced output, 2-D otherwise.
+        if len(output_tensor.shape) == 1:
+            surviving = _surviving_dim(output_tensor, M, N)
+            sections.append(self._section_output_ptrs_reduced(output_tensor, surviving))
+        else:
+            sections.append(self._section_output_ptrs(output_tensor))
         # Pointer arithmetic for each intermediate output (all M x N tiles).
         for t in intermediate_tensors:
             sections.append(self._section_output_ptrs(t))
@@ -312,6 +351,7 @@ class TritonKernelGenerator:
         self,
         fusion_group_nodes: list[torch.fx.Node],
         escape_stores: dict[int, TensorDescriptor] | None = None,
+        output_descriptor: TensorDescriptor | None = None,
     ) -> str:
         """Return Triton source for fused post-GEMM operations on ``acc``.
 
@@ -334,18 +374,37 @@ class TritonKernelGenerator:
         continues to be used (and may be overwritten) by subsequent fused
         ops in the same kernel.
 
+        **Reduction support** — when a reduction operator (``aten.sum``,
+        ``aten.amax``, ``aten.mean``) is encountered, the generator emits
+        cross-thread synchronization commands:
+
+        1. ``tl.sum(acc, axis=…)`` / ``tl.max(acc, axis=…)`` collapses the
+           tile within a single program instance.
+        2. ``tl.atomic_add`` / ``tl.atomic_max`` accumulates partial results
+           across program instances that share the surviving dimension, so
+           the complete reduction is correct even when the reduced dimension
+           spans multiple tile blocks.
+
+        The output tensor dimensions are updated accordingly (the reduced
+        axis is collapsed), and the subsequent ``tl.store`` is replaced by
+        the atomic store to prevent memory segmentation faults.
+
         Supported targets
         -----------------
         * ``torch.ops.aten.relu.default`` — ``tl.where(acc > 0, acc, 0.0)``
         * ``torch.ops.aten.gelu.default`` — fast tanh approximation
         * ``torch.ops.aten.add.Tensor`` — load a residual tensor tile from
           HBM into SRAM, then ``acc = acc + residual``
+        * ``torch.ops.aten.mul.Tensor`` — element-wise multiply
+        * ``torch.ops.aten.sum.dim_IntList`` — cross-thread sum reduction
+        * ``torch.ops.aten.amax.default`` — cross-thread max reduction
+        * ``torch.ops.aten.mean.dim`` — cross-thread mean reduction
 
         Parameters
         ----------
         fusion_group_nodes :
             Topologically sorted FX nodes representing the fused
-            elementwise operations to apply after the GEMM K-loop.
+            operations to apply after the GEMM K-loop.
         escape_stores :
             Mapping of ``id(node)`` → :class:`TensorDescriptor` for every
             node inside the group whose output is consumed by a user
@@ -353,6 +412,11 @@ class TritonKernelGenerator:
             such node is emitted, a ``tl.store`` is appended to write
             ``acc`` to the corresponding HBM pointer.  Pass ``None`` or
             an empty dict when no intermediate stores are needed.
+        output_descriptor :
+            Descriptor for the final output tensor.  Required when the
+            epilogue contains a reduction so that the atomic store can
+            reference the correct output pointer name and dtype.  When
+            ``None``, the output pointer name defaults to ``"out"``.
 
         Returns
         -------
@@ -361,6 +425,11 @@ class TritonKernelGenerator:
         """
         escape_stores = escape_stores or {}
         node_ids = {id(n) for n in fusion_group_nodes}
+        self._last_reduction = None  # reset for this epilogue
+
+        out_name = output_descriptor.name if output_descriptor else "out"
+        out_dtype = output_descriptor.dtype if output_descriptor else torch.float32
+        triton_dtype = _TRITON_DTYPE_MAP.get(out_dtype, "tl.float32")
 
         lines: list[str] = [
             "",
@@ -388,6 +457,19 @@ class TritonKernelGenerator:
                 lines.append(self._emit_add(node, node_ids))
             elif node.target == torch.ops.aten.mul.Tensor:
                 lines.append(self._emit_mul(node, node_ids))
+            # ----- Reduction operators — cross-thread synchronization -----
+            elif node.target == torch.ops.aten.sum.dim_IntList:
+                axis, keepdim = self._determine_reduction_axis(node)
+                self._last_reduction = ReductionInfo(axis=axis, op="sum", keepdim=keepdim)
+                lines.append(self._emit_sum(axis, out_name, triton_dtype))
+            elif node.target == torch.ops.aten.amax.default:
+                axis, keepdim = self._determine_reduction_axis(node)
+                self._last_reduction = ReductionInfo(axis=axis, op="max", keepdim=keepdim)
+                lines.append(self._emit_max(axis, out_name, triton_dtype))
+            elif node.target == torch.ops.aten.mean.dim:
+                axis, keepdim = self._determine_reduction_axis(node)
+                self._last_reduction = ReductionInfo(axis=axis, op="mean", keepdim=keepdim)
+                lines.append(self._emit_mean(axis, out_name, triton_dtype))
             else:
                 logger.warning(
                     "Unsupported epilogue target: %s — skipped", node.target,
@@ -395,7 +477,9 @@ class TritonKernelGenerator:
 
             # If this node's result is consumed outside the fused block,
             # flush acc to HBM immediately so Autograd can access it.
-            if id(node) in escape_stores:
+            # (Only for pre-reduction nodes; reductions emit their own
+            # atomic store.)
+            if id(node) in escape_stores and self._last_reduction is None:
                 lines.append(self._section_intermediate_store(escape_stores[id(node)]))
 
         return "\n".join(lines)
@@ -440,9 +524,20 @@ class TritonKernelGenerator:
         import triton                   # noqa: F811 — runtime import
         import triton.language as tl    # noqa: F811
 
-        # 1. Append the store section to write results back to HBM
-        store_section = self._section_store(output_tensor)
-        full_kernel = kernel_string + "\n" + store_section
+        # 1. Append the store section — or skip when a reduction already
+        #    emitted an atomic store in the epilogue.
+        if self._last_reduction is not None:
+            # The epilogue's atomic store (tl.atomic_add / tl.atomic_max)
+            # replaces the normal tl.store.  No additional store needed.
+            full_kernel = kernel_string
+            logger.debug(
+                "Reduction detected (op=%s, axis=%d) — skipping normal tl.store.",
+                self._last_reduction.op,
+                self._last_reduction.axis,
+            )
+        else:
+            store_section = self._section_store(output_tensor)
+            full_kernel = kernel_string + "\n" + store_section
 
         # 2. Check the compilation cache (keyed by SHA-256 of full source)
         cache_key = hashlib.sha256(full_kernel.encode()).hexdigest()
@@ -521,11 +616,23 @@ class TritonKernelGenerator:
             params.append(f"    # {comment} for {t.name} ({dim_desc})")
             params.append(f"    {stride_names},")
 
-        # -- Strides: output (M x N) --
-        s_om = _stride_param(output.name, "m")
-        s_on = _stride_param(output.name, "n")
-        params.append(f"    # Strides for {output.name} (M x N)")
-        params.append(f"    {s_om}, {s_on},")
+        # -- Strides: output --
+        if len(output.shape) == 1:
+            # Reduced output — single stride for the surviving dimension.
+            matrices_tmp, _ = _classify(inputs)
+            try:
+                left_d, right_d = _identify_matmul_operands(matrices_tmp)
+                dim_label = _surviving_dim(output, left_d.shape[0], right_d.shape[1])
+            except (ValueError, IndexError):
+                dim_label = "m"
+            s_o = _stride_param(output.name, dim_label)
+            params.append(f"    # Stride for reduced output {output.name} ({dim_label.upper()} dimension)")
+            params.append(f"    {s_o},")
+        else:
+            s_om = _stride_param(output.name, "m")
+            s_on = _stride_param(output.name, "n")
+            params.append(f"    # Strides for {output.name} (M x N)")
+            params.append(f"    {s_om}, {s_on},")
 
         # -- Strides: intermediate outputs (each M x N), one block each --
         for t in intermediates:
@@ -629,6 +736,28 @@ class TritonKernelGenerator:
                 f"    {n}_ptrs = {n}_ptr + "
                 f"(offs_m[:, None] * {sm} + offs_n[None, :] * {sn})"
             ),
+        ])
+
+    @staticmethod
+    def _section_output_ptrs_reduced(
+        tensor: TensorDescriptor,
+        surviving_dim: str,
+    ) -> str:
+        """Pointer arithmetic for a 1-D reduced output.
+
+        After a reduction collapses one tile dimension, the output is a
+        vector along the surviving dimension.  Only ``offs_{surviving_dim}``
+        and the corresponding single stride are used.
+        """
+        n = tensor.name
+        s = _stride_param(n, surviving_dim)
+        return "\n".join([
+            "",
+            "    # -----------------------------------------------------------",
+            f"    # Pointer arithmetic for reduced output {n} ({surviving_dim.upper()} — after reduction)",
+            f"    # {n}_ptrs[i] = {n}_ptr + offs_{surviving_dim}[i]*{s}",
+            "    # -----------------------------------------------------------",
+            f"    {n}_ptrs = {n}_ptr + offs_{surviving_dim} * {s}",
         ])
 
     @staticmethod
@@ -909,6 +1038,94 @@ class TritonKernelGenerator:
         return "\n".join([
             "    # Element-wise mul (both operands already in SRAM)",
             "    acc = acc * acc",
+        ])
+
+    # ------------------------------------------------------------------
+    # Reduction emitters — cross-thread synchronization
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _determine_reduction_axis(
+        node: torch.fx.Node,
+    ) -> tuple[int, bool]:
+        """Extract the Triton tile axis and ``keepdim`` flag from a reduction FX node.
+
+        The FX node's ``args[1]`` is the list of PyTorch dimensions to
+        reduce.  For a 2-D (M, N) matmul output:
+
+        * dim 0 / -2  →  Triton axis 0 (M rows)
+        * dim 1 / -1  →  Triton axis 1 (N columns)
+
+        Returns ``(axis, keepdim)``.
+        """
+        dims = node.args[1] if len(node.args) > 1 else [-1]
+        keepdim = node.args[2] if len(node.args) > 2 else False
+        # Normalise negative dims for a 2-D tensor (ndim = 2).
+        normalised = [d % 2 for d in dims]
+        if 1 in normalised:
+            return 1, keepdim
+        if 0 in normalised:
+            return 0, keepdim
+        return 1, keepdim  # default: reduce columns
+
+    @staticmethod
+    def _emit_sum(axis: int, output_name: str, triton_dtype: str) -> str:
+        """Sum reduction with cross-thread synchronization via ``tl.atomic_add``.
+
+        ``tl.sum`` collapses the tile-local accumulator along *axis*,
+        producing a partial sum per program instance.  ``tl.atomic_add``
+        accumulates the partials across all programs that share the
+        surviving dimension so that the final result is correct even when
+        the reduced dimension spans multiple tile blocks.
+        """
+        dim_name = "N" if axis == 1 else "M"
+        offs = "offs_m" if axis == 1 else "offs_n"
+        bound = "M" if axis == 1 else "N"
+        return "\n".join([
+            f"    # Reduction: sum along {dim_name} — cross-thread synchronization",
+            f"    # tl.sum collapses axis={axis} within this program's tile.",
+            f"    # tl.atomic_add accumulates partial sums across programs that",
+            f"    # share the same {bound}-tile, producing the complete result.",
+            f"    partial_sum = tl.sum(acc, axis={axis}).to({triton_dtype})",
+            f"    tl.atomic_add({output_name}_ptrs, partial_sum, mask={offs} < {bound})",
+        ])
+
+    @staticmethod
+    def _emit_max(axis: int, output_name: str, triton_dtype: str) -> str:
+        """Max reduction with cross-thread synchronization via ``tl.atomic_max``.
+
+        Same partial-result strategy as :meth:`_emit_sum` but uses
+        ``tl.max`` / ``tl.atomic_max`` instead.
+        """
+        dim_name = "N" if axis == 1 else "M"
+        offs = "offs_m" if axis == 1 else "offs_n"
+        bound = "M" if axis == 1 else "N"
+        return "\n".join([
+            f"    # Reduction: max along {dim_name} — cross-thread synchronization",
+            f"    # tl.max collapses axis={axis}, tl.atomic_max accumulates partials.",
+            f"    partial_max = tl.max(acc, axis={axis}).to({triton_dtype})",
+            f"    tl.atomic_max({output_name}_ptrs, partial_max, mask={offs} < {bound})",
+        ])
+
+    @staticmethod
+    def _emit_mean(axis: int, output_name: str, triton_dtype: str) -> str:
+        """Mean reduction — partial sums via ``tl.atomic_add``, division deferred.
+
+        Each program contributes its partial ``tl.sum`` via
+        ``tl.atomic_add``.  The division by the full dimension size is
+        deferred to :class:`~fuseml.codegen.kernel_launcher.KernelLauncher`
+        for better numerical precision (avoids many small floating-point
+        divisions inside the kernel).
+        """
+        dim_name = "N" if axis == 1 else "M"
+        offs = "offs_m" if axis == 1 else "offs_n"
+        bound = "M" if axis == 1 else "N"
+        return "\n".join([
+            f"    # Reduction: mean along {dim_name} — cross-thread synchronization",
+            f"    # Partial sum accumulated via tl.atomic_add; division by {dim_name}",
+            f"    # is deferred to the kernel launcher for numerical precision.",
+            f"    partial_sum = tl.sum(acc, axis={axis}).to({triton_dtype})",
+            f"    tl.atomic_add({output_name}_ptrs, partial_sum, mask={offs} < {bound})",
         ])
 
     @staticmethod
