@@ -85,6 +85,18 @@ class FuseMLFusionPass:
         torch.ops.aten.mul.Tensor,
     }
 
+    # Reduction ops that can be absorbed as the *final* operation in a
+    # fusion group.  They require cross-thread synchronization (tl.atomic_*)
+    # and collapse one tile dimension, so nothing further is absorbed after
+    # a reduction.  Only keepdim=False reductions are absorbed; keepdim=True
+    # is left as a barrier because the output remains 2-D while ``acc`` is
+    # collapsed to 1-D, which the current store path does not handle.
+    _REDUCTION_OPS: Set[Callable] = {
+        torch.ops.aten.sum.dim_IntList,
+        torch.ops.aten.amax.default,
+        torch.ops.aten.mean.dim,
+    }
+
     def _find_fusion_groups(self) -> List[FusionGroup]:
         """Identify contiguous sequences of fusible memory-bound nodes.
 
@@ -143,6 +155,27 @@ class FuseMLFusionPass:
                 # Halt on barrier / heavy-compute ops.
                 if successor.target in self._BARRIER_OPS:
                     break
+
+                # --- Reduction absorption (terminates the group) ----------
+                if successor.target in self._REDUCTION_OPS:
+                    # Only absorb keepdim=False; keepdim=True produces a
+                    # 2-D output while the accumulator is collapsed to 1-D,
+                    # which the store path cannot handle yet.
+                    keepdim = (
+                        successor.args[2]
+                        if len(successor.args) > 2
+                        else False
+                    )
+                    if keepdim:
+                        break
+                    group.fused_nodes.append(successor)
+                    group.output_node = successor
+                    consumed.add(successor)
+                    group_node_set.add(successor)
+                    self._collect_external_inputs(
+                        successor, group_node_set, group,
+                    )
+                    break  # nothing further after a reduction
 
                 # Only absorb low-intensity pointwise ops.
                 if successor.target not in self._ABSORBABLE_OPS:

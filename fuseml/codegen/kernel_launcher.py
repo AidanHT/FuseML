@@ -77,6 +77,7 @@ class KernelLauncher:
         block_size_m: int = _DEFAULT_BLOCK_SIZE_M,
         block_size_n: int = _DEFAULT_BLOCK_SIZE_N,
         block_size_k: int = _DEFAULT_BLOCK_SIZE_K,
+        reduction_op: str | None = None,
     ) -> None:
         self._kernel_fn = kernel_fn
         self._input_descriptors = input_descriptors
@@ -85,6 +86,7 @@ class KernelLauncher:
         self._block_size_m = block_size_m
         self._block_size_n = block_size_n
         self._block_size_k = block_size_k
+        self._reduction_op = reduction_op
 
         # Pre-compute indices so __call__ does not re-scan the list every time.
         input_names = [d.name for d in input_descriptors]
@@ -164,7 +166,16 @@ class KernelLauncher:
         )
 
         # ── Output allocation ─────────────────────────────────────────
-        output = torch.empty(M, N, dtype=out_dtype, device=device)
+        is_reduced = len(self._output_descriptor.shape) == 1
+        if is_reduced:
+            # Reduced output — must be zero-initialised for tl.atomic_add,
+            # or -inf for tl.atomic_max.
+            if self._reduction_op == "max":
+                output = torch.full((M,), float("-inf"), dtype=out_dtype, device=device)
+            else:
+                output = torch.zeros(M, dtype=out_dtype, device=device)
+        else:
+            output = torch.empty(M, N, dtype=out_dtype, device=device)
 
         # Intermediate escape buffers (one per escape node).
         intermediate_outputs: list[torch.Tensor] = [
@@ -207,8 +218,11 @@ class KernelLauncher:
         for t in input_tensors:
             stride_args.extend(int(s) for s in t.stride())
 
-        # Output strides (always M×N — row-major from torch.empty)
-        stride_args.extend([int(output.stride(0)), int(output.stride(1))])
+        # Output strides — 1-D for reduced output, 2-D otherwise.
+        if is_reduced:
+            stride_args.append(int(output.stride(0)))
+        else:
+            stride_args.extend([int(output.stride(0)), int(output.stride(1))])
 
         # Intermediate escape tensor strides (each M×N — row-major)
         for t in intermediate_outputs:
@@ -224,6 +238,13 @@ class KernelLauncher:
             BLOCK_SIZE_K=self._block_size_k,
         )
 
+        # ── Post-kernel fixup for mean reduction ─────────────────────
+        # The kernel accumulates partial sums via tl.atomic_add; the
+        # division by the full dimension size is applied here for better
+        # numerical precision than dividing inside each program.
+        if self._reduction_op == "mean":
+            output /= N
+
         return output
 
     # ------------------------------------------------------------------
@@ -233,10 +254,12 @@ class KernelLauncher:
     def __repr__(self) -> str:
         in_names = [d.name for d in self._input_descriptors]
         intm_names = [d.name for d in self._intermediate_descriptors]
+        reduction = f", reduction={self._reduction_op!r}" if self._reduction_op else ""
         return (
             f"KernelLauncher("
             f"inputs={in_names}, "
             f"output={self._output_descriptor.name!r}, "
             f"intermediates={intm_names}, "
-            f"block=({self._block_size_m},{self._block_size_n},{self._block_size_k}))"
+            f"block=({self._block_size_m},{self._block_size_n},{self._block_size_k})"
+            f"{reduction})"
         )
