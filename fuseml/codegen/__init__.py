@@ -1,5 +1,6 @@
 """Triton code generation package."""
 
+from fuseml.codegen.eager_fallback import EagerFallbackGuard
 from fuseml.codegen.kernel_cache import (
     KernelCache,
     KernelCacheKey,
@@ -16,6 +17,7 @@ from fuseml.codegen.kernel_generator import (
 from fuseml.codegen.kernel_launcher import KernelLauncher
 
 __all__ = [
+    "EagerFallbackGuard",
     "KernelCache",
     "KernelCacheKey",
     "KernelLauncher",

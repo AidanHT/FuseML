@@ -5,6 +5,7 @@ Public API re-exports for convenient access::
     from fuseml import FuseMLFusionPass, FusionGroup, SupportedOpsRegistry
 """
 
+from fuseml.codegen.eager_fallback import EagerFallbackGuard
 from fuseml.codegen.kernel_cache import (
     KernelCache,
     KernelCacheKey,
@@ -39,6 +40,7 @@ from fuseml.passes.mutation_safety import (
 from fuseml.registry import SupportedOpsRegistry, build_default_registry
 
 __all__ = [
+    "EagerFallbackGuard",
     "ControlFlowError",
     "FuseMLCompiler",
     "FuseMLFusionPass",
