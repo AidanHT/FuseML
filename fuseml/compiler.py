@@ -26,6 +26,11 @@ import torch
 import torch.nn as nn
 
 from fuseml._logging import logger
+from fuseml.codegen.kernel_cache import (
+    KernelCache,
+    KernelCacheKey,
+    build_cache_key,
+)
 from fuseml.codegen.kernel_generator import (
     TensorDescriptor,
     TritonKernelGenerator,
@@ -136,6 +141,7 @@ class FuseMLCompiler:
         self.registry: SupportedOpsRegistry = registry or build_default_registry()
         self.fusion_candidates: List[torch.fx.Node] = []
         self._generator = TritonKernelGenerator()
+        self._cache = KernelCache()
 
     # ------------------------------------------------------------------
     # Entry point called by torch.compile for each captured sub-graph
@@ -198,6 +204,19 @@ class FuseMLCompiler:
             logger.info("No placeholder nodes found — returning unmodified forward.")
             return gm.forward
 
+        # ── Build tensor map for cache key construction ────────────────
+        # Map graph-level placeholder node names to the corresponding
+        # example_inputs tensors so that build_cache_key() can extract
+        # true storage offsets and pointer alignment from live tensors
+        # (which may be views or slices with non-trivial ATen layout).
+        graph_placeholders = [
+            n for n in gm.graph.nodes if n.op == "placeholder"
+        ]
+        tensor_map: dict[str, torch.Tensor] = {}
+        for node, inp in zip(graph_placeholders, example_inputs):
+            if isinstance(inp, torch.Tensor):
+                tensor_map[node.name] = inp
+
         for placeholder_node in nodes_to_process:
             group: FusionGroup | None = placeholder_node.meta.get("fusion_group")
             if group is None:
@@ -207,7 +226,17 @@ class FuseMLCompiler:
                 )
                 continue
 
-            launcher = self._build_launcher(group)
+            # ── Cache lookup ───────────────────────────────────────────
+            cache_key = build_cache_key(group, tensor_map)
+            launcher: KernelLauncher | None = None
+            if cache_key is not None:
+                launcher = self._cache.lookup(cache_key)
+
+            if launcher is None:
+                launcher = self._build_launcher(group)
+                if launcher is not None and cache_key is not None:
+                    self._cache.store(cache_key, launcher)
+
             if launcher is None:
                 logger.warning(
                     "Could not build KernelLauncher for %s — keeping placeholder.",

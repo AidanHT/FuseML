@@ -5,6 +5,13 @@ Public API re-exports for convenient access::
     from fuseml import FuseMLFusionPass, FusionGroup, SupportedOpsRegistry
 """
 
+from fuseml.codegen.kernel_cache import (
+    KernelCache,
+    KernelCacheKey,
+    TensorFingerprint,
+    build_cache_key,
+    build_op_chain,
+)
 from fuseml.codegen.kernel_generator import (
     ReductionInfo,
     TensorDescriptor,
@@ -32,12 +39,17 @@ __all__ = [
     "FuseMLFusionPass",
     "FusionGroup",
     "GraphSegment",
+    "KernelCache",
+    "KernelCacheKey",
     "ReductionInfo",
     "SUPPORTED_TRITON_OPS",
     "SupportedOpsRegistry",
     "TensorDescriptor",
+    "TensorFingerprint",
     "TritonKernelGenerator",
+    "build_cache_key",
     "build_default_registry",
+    "build_op_chain",
     "fuseml_fused_kernel_placeholder",
     "next_power_of_2",
     "split_fusion_group",
