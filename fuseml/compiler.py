@@ -40,7 +40,10 @@ from fuseml.codegen.kernel_generator import (
     _classify,
     _identify_matmul_operands,
 )
-from fuseml.codegen.kernel_launcher import KernelLauncher
+from fuseml.codegen.kernel_launcher import (
+    KernelLauncher,
+    compute_launch_params,
+)
 from fuseml.fusion_group import FusionGroup
 from fuseml.passes.control_flow_validation import (
     ControlFlowError,
@@ -432,15 +435,19 @@ class FuseMLCompiler:
             return None
 
         # ── Detect reduction for launcher initialisation ─────────────
+        # The generator records ReductionInfo (op + axis) during the
+        # epilogue.  Use it directly instead of re-inspecting the FX nodes.
         reduction_op: str | None = None
-        if group.fused_nodes:
-            last_target = group.fused_nodes[-1].target
-            if last_target == torch.ops.aten.sum.dim_IntList:
-                reduction_op = "sum"
-            elif last_target == torch.ops.aten.amax.default:
-                reduction_op = "max"
-            elif last_target == torch.ops.aten.mean.dim:
-                reduction_op = "mean"
+        reduction_axis: int | None = None
+        if self._generator._last_reduction is not None:
+            reduction_op = self._generator._last_reduction.op
+            reduction_axis = self._generator._last_reduction.axis
+
+        # ── Pre-compute launch parameters (off the critical path) ────
+        M = int(left.shape[-2])
+        K = int(left.shape[-1])
+        N = int(right.shape[-1])
+        launch_params = compute_launch_params(M, N, K, out_desc.dtype)
 
         # ── Assemble launcher ─────────────────────────────────────────
         launcher = KernelLauncher(
@@ -450,7 +457,9 @@ class FuseMLCompiler:
             intermediate_descriptors=intermediate_descs,
             left_name=left.name,
             right_name=right.name,
+            launch_params=launch_params,
             reduction_op=reduction_op,
+            reduction_axis=reduction_axis,
         )
 
         logger.info("Built %r for group %s.", launcher, group)

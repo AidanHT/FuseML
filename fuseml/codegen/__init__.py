@@ -14,7 +14,11 @@ from fuseml.codegen.kernel_generator import (
     TritonKernelGenerator,
     next_power_of_2,
 )
-from fuseml.codegen.kernel_launcher import KernelLauncher
+from fuseml.codegen.kernel_launcher import (
+    KernelLauncher,
+    LaunchParams,
+    compute_launch_params,
+)
 from fuseml.codegen.sram_autotuner import (
     SRAMAutotuner,
     TuneConfig,
@@ -27,6 +31,7 @@ __all__ = [
     "KernelCache",
     "KernelCacheKey",
     "KernelLauncher",
+    "LaunchParams",
     "ReductionInfo",
     "SRAMAutotuner",
     "TensorDescriptor",
@@ -35,6 +40,7 @@ __all__ = [
     "TuneConfig",
     "build_cache_key",
     "build_op_chain",
+    "compute_launch_params",
     "compute_sram_bytes",
     "generate_sram_safe_configs",
     "next_power_of_2",
