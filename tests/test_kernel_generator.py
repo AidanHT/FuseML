@@ -664,6 +664,30 @@ class TestEpilogueAdd:
         code = gen.generate_epilogue([acc_node, add_node])
         assert "HBM" in code
 
+    def test_add_scalar_float(self, gen):
+        """Scalar add emits register-only arithmetic, no tl.load."""
+        acc_node = _make_node(target=torch.ops.aten.relu.default, name="prev")
+        add_node = _make_node(
+            target=torch.ops.aten.add.Tensor,
+            name="add_out",
+            args=(acc_node, 1.0),
+        )
+        code = gen.generate_epilogue([acc_node, add_node])
+        assert "acc = acc + 1.0" in code
+        assert "tl.load" not in code
+
+    def test_add_scalar_int(self, gen):
+        """Integer scalar add — same register-only path."""
+        acc_node = _make_node(target=torch.ops.aten.relu.default, name="prev")
+        add_node = _make_node(
+            target=torch.ops.aten.add.Tensor,
+            name="add_out",
+            args=(acc_node, 3),
+        )
+        code = gen.generate_epilogue([acc_node, add_node])
+        assert "acc = acc + 3" in code
+        assert "tl.load" not in code
+
 
 # ---------------------------------------------------------------------------
 # Epilogue: chained operations
@@ -753,3 +777,16 @@ class TestEpilogueEdgeCases:
         node = _make_node(target=torch.ops.aten.relu.default)
         code = gen.generate_epilogue([node])
         assert "SRAM" in code
+
+    def test_unsupported_target_skipped(self, gen):
+        """Unsupported call_function targets produce no code (only a log warning)."""
+        node = _make_node(
+            target=torch.ops.aten.sigmoid.default,
+            name="sig",
+        )
+        code = gen.generate_epilogue([node])
+        # Only the epilogue header should be emitted, no op code
+        assert "Epilogue" in code
+        assert "tl.where" not in code
+        assert "tl.math.tanh" not in code
+        assert "tl.load" not in code

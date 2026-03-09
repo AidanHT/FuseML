@@ -565,29 +565,43 @@ class TritonKernelGenerator:
         """Residual add: load an external tensor tile from HBM, fuse into acc.
 
         Identifies the *external* argument (the one not produced by a prior
-        node inside the fusion group) as the residual tensor.
+        node inside the fusion group) as the residual tensor.  Also handles
+        scalar arguments (e.g. ``add(acc, 1.0)``) without emitting a load.
         """
-        # Find the residual — the arg that lives outside the fusion group.
+        # Scan args for a scalar or an external tensor node.
         residual_name: str | None = None
+        scalar_value: int | float | None = None
+
         for arg in node.args:
+            if isinstance(arg, (int, float)):
+                scalar_value = arg
+                break
             if hasattr(arg, "name") and id(arg) not in node_ids:
                 residual_name = arg.name
                 break
 
-        if residual_name is None:
-            # Both args are internal — just emit a plain add.
+        # Case 1: scalar add — no HBM traffic, register-only.
+        if scalar_value is not None:
             return "\n".join([
-                "    # Element-wise add (both operands already in SRAM)",
-                "    acc = acc + acc",
+                f"    # Scalar add — register-only (no HBM traffic)",
+                f"    acc = acc + {scalar_value}",
             ])
 
+        # Case 2: external tensor (residual connection) — one HBM load.
+        if residual_name is not None:
+            return "\n".join([
+                f"    # Residual add — load {residual_name} tile from HBM into SRAM",
+                (
+                    f"    {residual_name} = tl.load({residual_name}_ptrs, "
+                    f"mask=(offs_m[:, None] < M) & (offs_n[None, :] < N), other=0.0)"
+                ),
+                f"    acc = acc + {residual_name}",
+            ])
+
+        # Case 3: both args are internal — just emit a plain add.
         return "\n".join([
-            f"    # Residual add — load {residual_name} tile from HBM into SRAM",
-            (
-                f"    {residual_name} = tl.load({residual_name}_ptrs, "
-                f"mask=(offs_m[:, None] < M) & (offs_n[None, :] < N), other=0.0)"
-            ),
-            f"    acc = acc + {residual_name}",
+            "    # Element-wise add (both operands already in SRAM)",
+            "    acc = acc + acc",
         ])
 
     @staticmethod
