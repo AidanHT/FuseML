@@ -1,5 +1,7 @@
-"""Tests for TritonKernelGenerator — signature, pointer arithmetic, K-loop, and epilogue."""
+"""Tests for TritonKernelGenerator — signature, pointers, K-loop, epilogue, store, and compilation."""
 
+import sys
+import types
 from types import SimpleNamespace
 
 import pytest
@@ -790,3 +792,283 @@ class TestEpilogueEdgeCases:
         assert "tl.where" not in code
         assert "tl.math.tanh" not in code
         assert "tl.load" not in code
+
+
+# ---------------------------------------------------------------------------
+# Store section
+# ---------------------------------------------------------------------------
+
+@pytest.mark.codegen
+class TestStoreSection:
+    """Verify the tl.store section that writes results back to HBM."""
+
+    def test_store_contains_tl_store(self, gen, output_tensor):
+        code = gen._section_store(output_tensor)
+        assert "tl.store(" in code
+
+    def test_store_uses_output_pointer_name(self, gen, output_tensor):
+        code = gen._section_store(output_tensor)
+        assert "tl.store(out_ptrs," in code
+
+    def test_store_2d_boundary_mask(self, gen, output_tensor):
+        """Store must guard both M and N boundaries to prevent OOB writes."""
+        code = gen._section_store(output_tensor)
+        assert "mask=(offs_m[:, None] < M) & (offs_n[None, :] < N)" in code
+
+    def test_store_no_cast_fp32(self, gen, output_tensor):
+        """fp32 accumulator → fp32 output needs no dtype cast."""
+        code = gen._section_store(output_tensor)
+        assert ".to(" not in code
+
+    def test_store_cast_fp16(self, gen):
+        """fp32 accumulator → fp16 output requires explicit cast."""
+        out = TensorDescriptor("out", (128, 256), (256, 1), torch.float16)
+        code = gen._section_store(out)
+        assert "acc = acc.to(tl.float16)" in code
+
+    def test_store_cast_bf16(self, gen):
+        """fp32 accumulator → bf16 output requires explicit cast."""
+        out = TensorDescriptor("out", (128, 256), (256, 1), torch.bfloat16)
+        code = gen._section_store(out)
+        assert "acc = acc.to(tl.bfloat16)" in code
+
+    def test_store_cast_before_store(self, gen):
+        """Dtype cast must appear before tl.store — can't store wrong type."""
+        out = TensorDescriptor("out", (128, 256), (256, 1), torch.float16)
+        code = gen._section_store(out)
+        assert code.index("acc.to(") < code.index("tl.store(")
+
+    def test_store_hbm_comment(self, gen, output_tensor):
+        """Hardware sympathy: comment must explain the HBM write."""
+        code = gen._section_store(output_tensor)
+        assert "HBM" in code
+
+    def test_store_sram_comment(self, gen, output_tensor):
+        """Hardware sympathy: comment must mention SRAM source."""
+        code = gen._section_store(output_tensor)
+        assert "SRAM" in code
+
+    def test_store_custom_output_name(self, gen):
+        """Store uses the output tensor's name, not a hardcoded 'out'."""
+        out = TensorDescriptor("result", (128, 256), (256, 1), torch.float32)
+        code = gen._section_store(out)
+        assert "tl.store(result_ptrs," in code
+
+    def test_store_exactly_once_comment(self, gen, output_tensor):
+        """Comment must emphasise single write — the whole point of fusion."""
+        code = gen._section_store(output_tensor)
+        assert "exactly once" in code
+
+
+# ---------------------------------------------------------------------------
+# compile_and_bind — runtime compilation
+# ---------------------------------------------------------------------------
+
+@pytest.mark.codegen
+class TestCompileAndBind:
+    """Verify runtime compilation via exec()."""
+
+    @pytest.fixture(autouse=True)
+    def _inject_mock_triton(self, monkeypatch):
+        """Inject a minimal mock triton so compile_and_bind can import it."""
+        mock_tl = types.ModuleType("triton.language")
+        mock_tl.constexpr = int  # Valid annotation type for kernel params
+
+        mock_triton = types.ModuleType("triton")
+        mock_triton.jit = lambda fn: fn  # Identity decorator
+        mock_triton.language = mock_tl
+
+        monkeypatch.setitem(sys.modules, "triton", mock_triton)
+        monkeypatch.setitem(sys.modules, "triton.language", mock_tl)
+
+    def test_returns_callable(self, gen, matmul_inputs, output_tensor):
+        sig = gen.generate_signature_and_pointers(matmul_inputs, output_tensor)
+        kloop = gen.generate_k_loop(matmul_inputs, output_tensor)
+        kernel_string = sig + "\n" + kloop
+        fn = gen.compile_and_bind(kernel_string, output_tensor)
+        assert callable(fn)
+
+    def test_function_name_is_fused_kernel(self, gen, matmul_inputs, output_tensor):
+        """The returned callable must be the 'fused_kernel' function."""
+        sig = gen.generate_signature_and_pointers(matmul_inputs, output_tensor)
+        kloop = gen.generate_k_loop(matmul_inputs, output_tensor)
+        kernel_string = sig + "\n" + kloop
+        fn = gen.compile_and_bind(kernel_string, output_tensor)
+        assert fn.__name__ == "fused_kernel"
+
+    def test_with_epilogue_relu(self, gen, matmul_inputs, output_tensor):
+        """Full pipeline: signature + K-loop + epilogue + store compiles OK."""
+        sig = gen.generate_signature_and_pointers(matmul_inputs, output_tensor)
+        kloop = gen.generate_k_loop(matmul_inputs, output_tensor)
+        relu = _make_node(target=torch.ops.aten.relu.default)
+        epilogue = gen.generate_epilogue([relu])
+        kernel_string = sig + "\n" + kloop + "\n" + epilogue
+        fn = gen.compile_and_bind(kernel_string, output_tensor)
+        assert callable(fn)
+
+    def test_with_epilogue_gelu(self, gen, matmul_inputs, output_tensor):
+        sig = gen.generate_signature_and_pointers(matmul_inputs, output_tensor)
+        kloop = gen.generate_k_loop(matmul_inputs, output_tensor)
+        gelu = _make_node(target=torch.ops.aten.gelu.default)
+        epilogue = gen.generate_epilogue([gelu])
+        kernel_string = sig + "\n" + kloop + "\n" + epilogue
+        fn = gen.compile_and_bind(kernel_string, output_tensor)
+        assert callable(fn)
+
+    def test_with_residual_add(self, gen, output_tensor):
+        """Pipeline with residual add compiles successfully."""
+        a = TensorDescriptor("a", (128, 64), (64, 1), torch.float32)
+        b = TensorDescriptor("b", (64, 256), (256, 1), torch.float32)
+        res = TensorDescriptor("res", (128, 256), (256, 1), torch.float32)
+        sig = gen.generate_signature_and_pointers([a, b, res], output_tensor)
+        kloop = gen.generate_k_loop([a, b, res], output_tensor)
+        residual = _make_node(op="placeholder", name="res")
+        prev = _make_node(target=torch.ops.aten.relu.default, name="prev")
+        add_node = _make_node(
+            target=torch.ops.aten.add.Tensor,
+            name="add_out",
+            args=(prev, residual),
+        )
+        epilogue = gen.generate_epilogue([prev, add_node])
+        kernel_string = sig + "\n" + kloop + "\n" + epilogue
+        fn = gen.compile_and_bind(kernel_string, output_tensor)
+        assert callable(fn)
+
+    def test_fp16_output_includes_cast(self, gen, matmul_inputs):
+        """fp16 output → store section includes dtype cast."""
+        out = TensorDescriptor("out", (128, 256), (256, 1), torch.float16)
+        sig = gen.generate_signature_and_pointers(matmul_inputs, out)
+        kloop = gen.generate_k_loop(matmul_inputs, out)
+        kernel_string = sig + "\n" + kloop
+        fn = gen.compile_and_bind(kernel_string, out)
+        assert callable(fn)
+
+    def test_with_bias_input(self, gen, output_tensor):
+        """addmm-style kernel with bias compiles OK."""
+        bias = TensorDescriptor("bias", (256,), (1,), torch.float32)
+        a = TensorDescriptor("a", (128, 64), (64, 1), torch.float32)
+        b = TensorDescriptor("b", (64, 256), (256, 1), torch.float32)
+        sig = gen.generate_signature_and_pointers([bias, a, b], output_tensor)
+        kloop = gen.generate_k_loop([bias, a, b], output_tensor)
+        kernel_string = sig + "\n" + kloop
+        fn = gen.compile_and_bind(kernel_string, output_tensor)
+        assert callable(fn)
+        assert fn.__name__ == "fused_kernel"
+
+    def test_chained_epilogue_compiles(self, gen, matmul_inputs, output_tensor):
+        """Multiple chained post-ops compile without errors."""
+        sig = gen.generate_signature_and_pointers(matmul_inputs, output_tensor)
+        kloop = gen.generate_k_loop(matmul_inputs, output_tensor)
+        relu = _make_node(target=torch.ops.aten.relu.default, name="relu_out")
+        scalar_add = _make_node(
+            target=torch.ops.aten.add.Tensor,
+            name="add_out",
+            args=(relu, 1.0),
+        )
+        epilogue = gen.generate_epilogue([relu, scalar_add])
+        kernel_string = sig + "\n" + kloop + "\n" + epilogue
+        fn = gen.compile_and_bind(kernel_string, output_tensor)
+        assert callable(fn)
+
+
+# ---------------------------------------------------------------------------
+# compile_and_bind — kernel compilation cache
+# ---------------------------------------------------------------------------
+
+@pytest.mark.codegen
+class TestCompileCache:
+    """Verify that identical kernels are cached and not recompiled."""
+
+    @pytest.fixture(autouse=True)
+    def _inject_mock_triton(self, monkeypatch):
+        """Inject a minimal mock triton so compile_and_bind can import it."""
+        mock_tl = types.ModuleType("triton.language")
+        mock_tl.constexpr = int
+
+        mock_triton = types.ModuleType("triton")
+        mock_triton.jit = lambda fn: fn
+        mock_triton.language = mock_tl
+
+        monkeypatch.setitem(sys.modules, "triton", mock_triton)
+        monkeypatch.setitem(sys.modules, "triton.language", mock_tl)
+
+    def test_cache_returns_same_object(self, gen, matmul_inputs, output_tensor):
+        """Second call with identical kernel must return the exact same object."""
+        sig = gen.generate_signature_and_pointers(matmul_inputs, output_tensor)
+        kloop = gen.generate_k_loop(matmul_inputs, output_tensor)
+        kernel_string = sig + "\n" + kloop
+        fn1 = gen.compile_and_bind(kernel_string, output_tensor)
+        fn2 = gen.compile_and_bind(kernel_string, output_tensor)
+        assert fn1 is fn2
+
+    def test_cache_size_after_one_compile(self, gen, matmul_inputs, output_tensor):
+        sig = gen.generate_signature_and_pointers(matmul_inputs, output_tensor)
+        kloop = gen.generate_k_loop(matmul_inputs, output_tensor)
+        kernel_string = sig + "\n" + kloop
+        gen.compile_and_bind(kernel_string, output_tensor)
+        assert len(gen._kernel_cache) == 1
+
+    def test_cache_no_growth_on_repeat(self, gen, matmul_inputs, output_tensor):
+        """Repeated calls must not grow the cache."""
+        sig = gen.generate_signature_and_pointers(matmul_inputs, output_tensor)
+        kloop = gen.generate_k_loop(matmul_inputs, output_tensor)
+        kernel_string = sig + "\n" + kloop
+        gen.compile_and_bind(kernel_string, output_tensor)
+        gen.compile_and_bind(kernel_string, output_tensor)
+        gen.compile_and_bind(kernel_string, output_tensor)
+        assert len(gen._kernel_cache) == 1
+
+    def test_different_kernels_cached_separately(self, gen, output_tensor):
+        """Two different kernel strings must produce two cache entries."""
+        a = TensorDescriptor("a", (128, 64), (64, 1), torch.float32)
+        b = TensorDescriptor("b", (64, 256), (256, 1), torch.float32)
+        sig1 = gen.generate_signature_and_pointers([a, b], output_tensor)
+        kloop1 = gen.generate_k_loop([a, b], output_tensor)
+        ks1 = sig1 + "\n" + kloop1
+
+        # Different tensor names → different generated variable names
+        x = TensorDescriptor("x", (128, 64), (64, 1), torch.float32)
+        y = TensorDescriptor("y", (64, 256), (256, 1), torch.float32)
+        sig2 = gen.generate_signature_and_pointers([x, y], output_tensor)
+        kloop2 = gen.generate_k_loop([x, y], output_tensor)
+        ks2 = sig2 + "\n" + kloop2
+
+        fn1 = gen.compile_and_bind(ks1, output_tensor)
+        fn2 = gen.compile_and_bind(ks2, output_tensor)
+
+        assert fn1 is not fn2
+        assert len(gen._kernel_cache) == 2
+
+    def test_same_kernel_different_output_dtype_cached_separately(self, gen, matmul_inputs):
+        """Same kernel_string but different output dtype → different store section → different cache entry."""
+        sig = gen.generate_signature_and_pointers(matmul_inputs,
+            TensorDescriptor("out", (128, 256), (256, 1), torch.float32))
+        kloop = gen.generate_k_loop(matmul_inputs,
+            TensorDescriptor("out", (128, 256), (256, 1), torch.float32))
+        kernel_string = sig + "\n" + kloop
+
+        out_fp32 = TensorDescriptor("out", (128, 256), (256, 1), torch.float32)
+        out_fp16 = TensorDescriptor("out", (128, 256), (256, 1), torch.float16)
+
+        gen.compile_and_bind(kernel_string, out_fp32)
+        gen.compile_and_bind(kernel_string, out_fp16)
+
+        # Store section differs (fp16 adds a cast) → two entries
+        assert len(gen._kernel_cache) == 2
+
+    def test_cache_is_per_instance(self, matmul_inputs, output_tensor):
+        """Each generator instance has its own independent cache."""
+        gen1 = TritonKernelGenerator()
+        gen2 = TritonKernelGenerator()
+        sig = gen1.generate_signature_and_pointers(matmul_inputs, output_tensor)
+        kloop = gen1.generate_k_loop(matmul_inputs, output_tensor)
+        kernel_string = sig + "\n" + kloop
+
+        gen1.compile_and_bind(kernel_string, output_tensor)
+        assert len(gen1._kernel_cache) == 1
+        assert len(gen2._kernel_cache) == 0
+
+    def test_cache_empty_on_init(self):
+        """Fresh generator starts with an empty cache."""
+        gen = TritonKernelGenerator()
+        assert len(gen._kernel_cache) == 0

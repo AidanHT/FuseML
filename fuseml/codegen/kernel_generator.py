@@ -1,22 +1,34 @@
-"""Triton kernel code generation — signature, pointer arithmetic, K-loop, and epilogue.
+"""Triton kernel code generation — signature, pointers, K-loop, epilogue, store, and compilation.
 
 Generates the ``@triton.jit`` function header, pointer parameters, stride
 parameters, ``tl.constexpr`` block sizes, ``tl.program_id`` block offsets,
 initial pointer arithmetic, the blocked GEMM loop over the K dimension,
-and the fused epilogue (elementwise post-ops) for matmul-based fused kernels.
+the fused epilogue (elementwise post-ops), and the final ``tl.store`` that
+writes the accumulated result from SRAM back to HBM exactly once.
 
-This module owns the signature/addressing stage, the tiled computation
-loop, and the dynamic AST translation of PyTorch FX nodes into Triton
-register operations.  Store logic is a separate concern added later.
+The ``compile_and_bind`` method appends the store section and compiles the
+complete kernel string via ``exec()`` into a live ``@triton.jit`` callable.
 """
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 
 import torch
 
 from fuseml._logging import logger
+
+
+# ---------------------------------------------------------------------------
+# Dtype mapping — PyTorch → Triton type strings for accumulator casts
+# ---------------------------------------------------------------------------
+
+_TRITON_DTYPE_MAP: dict[torch.dtype, str] = {
+    torch.float32: "tl.float32",
+    torch.float16: "tl.float16",
+    torch.bfloat16: "tl.bfloat16",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -128,10 +140,15 @@ class TritonKernelGenerator:
     """Generates Triton kernel source code from tensor descriptors.
 
     Current scope: matmul-based fusions (``addmm`` / ``mm`` as the base op)
-    with optional bias and elementwise post-ops.  This first stage produces
-    only the kernel *signature* and *pointer arithmetic*; the accumulation
-    loop and store logic are separate concerns.
+    with optional bias and elementwise post-ops.
+
+    Compiled kernels are cached by a SHA-256 hash of their full source so
+    that repeated ``compile_and_bind`` calls with the same kernel string
+    skip ``exec()`` entirely and return the previously compiled callable.
     """
+
+    def __init__(self) -> None:
+        self._kernel_cache: dict[str, object] = {}
 
     # ------------------------------------------------------------------
     # Public API
@@ -339,6 +356,72 @@ class TritonKernelGenerator:
 
         return "\n".join(lines)
 
+    def compile_and_bind(
+        self,
+        kernel_string: str,
+        output_tensor: TensorDescriptor,
+    ) -> object:
+        """Append store logic and compile the kernel into a callable.
+
+        This is the final stage of the codegen pipeline:
+
+        1. Generate the ``tl.store`` section that writes the accumulated
+           result from SRAM back to HBM exactly once, with a 2-D boundary
+           mask to prevent out-of-bounds writes.  If the output dtype
+           differs from the fp32 accumulator, an explicit cast is emitted.
+        2. Hash the full kernel source (SHA-256) and check the
+           instance-level cache.  On a hit the previously compiled
+           callable is returned immediately — no ``exec()`` overhead.
+        3. On a miss, compile the kernel string via ``exec()`` in an
+           isolated namespace pre-populated with ``triton`` and
+           ``triton.language as tl``, cache the result, and return the
+           ``@triton.jit``-decorated ``fused_kernel`` function so the
+           PyTorch frontend can invoke it immediately.
+
+        Parameters
+        ----------
+        kernel_string :
+            Concatenated output of :meth:`generate_signature_and_pointers`,
+            :meth:`generate_k_loop`, and optionally
+            :meth:`generate_epilogue`.
+        output_tensor :
+            Descriptor for the output tensor (needed for the store
+            pointer name and potential dtype cast).
+
+        Returns
+        -------
+        callable
+            The compiled ``@triton.jit`` kernel function.
+        """
+        import triton                   # noqa: F811 — runtime import
+        import triton.language as tl    # noqa: F811
+
+        # 1. Append the store section to write results back to HBM
+        store_section = self._section_store(output_tensor)
+        full_kernel = kernel_string + "\n" + store_section
+
+        # 2. Check the compilation cache (keyed by SHA-256 of full source)
+        cache_key = hashlib.sha256(full_kernel.encode()).hexdigest()
+
+        cached = self._kernel_cache.get(cache_key)
+        if cached is not None:
+            logger.debug("Kernel cache hit (%s…)", cache_key[:12])
+            return cached
+
+        logger.debug(
+            "Kernel cache miss — compiling (%d chars, %s…)",
+            len(full_kernel),
+            cache_key[:12],
+        )
+
+        # 3. Compile in an isolated namespace with Triton available
+        namespace: dict[str, object] = {"triton": triton, "tl": tl}
+        exec(full_kernel, namespace)  # noqa: S102
+
+        fn = namespace["fused_kernel"]
+        self._kernel_cache[cache_key] = fn
+        return fn
+
     # ------------------------------------------------------------------
     # Code-section builders (each returns a ready-to-join string)
     # ------------------------------------------------------------------
@@ -531,6 +614,36 @@ class TritonKernelGenerator:
             f"        {ln}_ptrs += BLOCK_SIZE_K * {s_lk}",
             f"        {rn}_ptrs += BLOCK_SIZE_K * {s_rk}",
         ])
+
+    @staticmethod
+    def _section_store(output: TensorDescriptor) -> str:
+        """Store the accumulated result from SRAM back to HBM exactly once.
+
+        Emits a ``tl.store`` guarded by a 2-D boundary mask so that
+        out-of-bounds threads do not corrupt memory.  When the output
+        dtype differs from the fp32 accumulator, an explicit cast is
+        emitted first to match the target precision.
+        """
+        n = output.name
+        triton_dtype = _TRITON_DTYPE_MAP.get(output.dtype, "tl.float32")
+
+        lines = [
+            "",
+            "    # -----------------------------------------------------------",
+            "    # Store — write the (BLOCK_SIZE_M, BLOCK_SIZE_N) result tile",
+            "    # from SRAM back to HBM exactly once per program instance",
+            "    # -----------------------------------------------------------",
+        ]
+
+        # Cast accumulator from fp32 to output dtype if needed
+        if output.dtype != torch.float32:
+            lines.append(f"    acc = acc.to({triton_dtype})")
+
+        lines.append(
+            f"    tl.store({n}_ptrs, acc, "
+            f"mask=(offs_m[:, None] < M) & (offs_n[None, :] < N))"
+        )
+        return "\n".join(lines)
 
     # ------------------------------------------------------------------
     # Epilogue emitters (each returns a ready-to-join code snippet)
