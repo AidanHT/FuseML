@@ -250,7 +250,7 @@ class TestEpilogueMax:
 
 @pytest.mark.reduction
 class TestEpiloqueMean:
-    """Mean reduction: tl.sum + tl.atomic_add (division deferred to launcher)."""
+    """Mean reduction: tl.sum + fused reciprocal multiply + tl.atomic_add."""
 
     def test_mean_emits_tl_sum(self, gen, output_reduced_m):
         mean_node = _make_node(
@@ -264,6 +264,20 @@ class TestEpiloqueMean:
         # Mean uses tl.sum internally, NOT tl.mean (which doesn't exist in Triton)
         assert "tl.sum(acc, axis=1)" in code
 
+    def test_mean_emits_fused_reciprocal(self, gen, output_reduced_m):
+        """Mean epilogue must multiply by 1/dim before atomic_add."""
+        mean_node = _make_node(
+            target=torch.ops.aten.mean.dim,
+            name="mean_out",
+            args=(_make_node(name="prev"), [-1], False),
+        )
+        code = gen.generate_epilogue(
+            [mean_node], output_descriptor=output_reduced_m,
+        )
+        # Reciprocal multiply is fused into the epilogue
+        assert "1.0 / N" in code or "1.0 / M" in code
+        assert "partial_mean" in code
+
     def test_mean_emits_atomic_add(self, gen, output_reduced_m):
         mean_node = _make_node(
             target=torch.ops.aten.mean.dim,
@@ -273,10 +287,11 @@ class TestEpiloqueMean:
         code = gen.generate_epilogue(
             [mean_node], output_descriptor=output_reduced_m,
         )
-        assert "tl.atomic_add(out_ptrs," in code
+        # atomic_add now receives partial_mean (not partial_sum)
+        assert "tl.atomic_add(out_ptrs, partial_mean" in code
 
-    def test_mean_comment_mentions_deferred_division(self, gen, output_reduced_m):
-        """Division by N is deferred to the launcher — comment must state this."""
+    def test_mean_comment_mentions_fused_division(self, gen, output_reduced_m):
+        """Reciprocal multiply is fused into epilogue for CUDA Graph safety."""
         mean_node = _make_node(
             target=torch.ops.aten.mean.dim,
             name="mean_out",
@@ -285,7 +300,7 @@ class TestEpiloqueMean:
         code = gen.generate_epilogue(
             [mean_node], output_descriptor=output_reduced_m,
         )
-        assert "deferred" in code.lower() or "launcher" in code.lower()
+        assert "fused" in code.lower() or "reciprocal" in code.lower()
 
     def test_mean_sets_last_reduction(self, gen, output_reduced_m):
         mean_node = _make_node(
@@ -328,7 +343,7 @@ class TestEpiloqueMean:
         # No cast to bf16 before atomic — stays FP32
         assert ".to(tl.bfloat16)" not in code
         assert "tl.sum(acc, axis=1)" in code
-        assert "tl.atomic_add(out_ptrs," in code
+        assert "tl.atomic_add(out_ptrs, partial_mean" in code
 
     def test_mean_comment_mentions_two_stage(self, gen, output_reduced_m):
         """Mean comment must describe the two-stage strategy."""

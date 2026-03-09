@@ -1817,35 +1817,35 @@ class TritonKernelGenerator:
 
     @staticmethod
     def _emit_mean(axis: int, output_name: str, triton_dtype: str) -> str:
-        """Mean reduction — FP32 atomic accumulation, division deferred.
+        """Mean reduction — division fused into epilogue for CUDA Graph safety.
 
-        Each program contributes its block-local ``tl.sum`` via
-        ``tl.atomic_add``.
+        Each program contributes its block-local ``tl.sum`` **multiplied
+        by the reciprocal** ``1.0 / dim_size`` via ``tl.atomic_add``.
+        Fusing the reciprocal multiply into the epilogue eliminates the
+        secondary PyTorch scalar-tensor kernel that would otherwise be
+        launched during dispatch, making the entire dispatch sequence
+        capturable by ``torch.cuda.CUDAGraph`` with zero host-side fixups.
 
-        **Numerical stability**: partial sums are kept in FP32 regardless
-        of the output dtype.  When the output is bfloat16 or float16,
-        accumulating in the narrow dtype would compound rounding errors
-        across the ``ceil(dim / BLOCK)`` atomic additions per element.
-        FP32 accumulation preserves ~7 decimal digits of precision.
-
-        The :class:`~fuseml.codegen.kernel_launcher.KernelLauncher`
-        performs the final ``result = (fp32_accum / dim).to(out_dtype)``,
-        ensuring the mean is numerically stable even for large reduction
-        dimensions combined with bfloat16 outputs.
+        **Numerical precision**: partial sums and the reciprocal multiply
+        are all in FP32 regardless of output dtype.  The
+        :class:`~fuseml.codegen.kernel_launcher.KernelLauncher` only
+        needs to cast the final FP32 result to the target dtype — no
+        division is performed on the host.
         """
         dim_name = "N" if axis == 1 else "M"
         surviving = "M" if axis == 1 else "N"
         offs = "offs_m" if axis == 1 else "offs_n"
         bound = "M" if axis == 1 else "N"
         return "\n".join([
-            f"    # ── Reduction: mean along {dim_name} (two-stage, FP32 accumulation) ─",
+            f"    # ── Reduction: mean along {dim_name} (two-stage, division fused) ────",
             f"    # Stage 1: block-local tl.sum collapses axis={axis} in registers.",
-            f"    # Stage 2: tl.atomic_add accumulates partials in FP32 to avoid",
-            f"    # bf16/fp16 rounding during cross-program synchronization.",
-            f"    # Division by {dim_name} is deferred to the KernelLauncher which",
-            f"    # performs: result = (fp32_accum / {dim_name}).to(output_dtype).",
+            f"    # Stage 2: multiply by 1/{dim_name} then tl.atomic_add in FP32.",
+            f"    # Division is fused here (not deferred to KernelLauncher) so that",
+            f"    # no secondary PyTorch kernel is launched during dispatch — this is",
+            f"    # required for CUDA Graph capture/replay safety.",
             f"    partial_sum = tl.sum(acc, axis={axis})  # keep FP32 — acc is always FP32",
-            f"    tl.atomic_add({output_name}_ptrs, partial_sum, mask={offs} < {bound})",
+            f"    partial_mean = partial_sum * (1.0 / {dim_name})  # fused reciprocal",
+            f"    tl.atomic_add({output_name}_ptrs, partial_mean, mask={offs} < {bound})",
         ])
 
     @staticmethod

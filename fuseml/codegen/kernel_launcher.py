@@ -377,7 +377,22 @@ class KernelLauncher:
         Optional :class:`~fuseml.codegen.sram_autotuner.SRAMAutotuner`
         used **only** when *launch_params* is ``None`` (backward
         compatibility fallback for auto-computation at init time).
+    mean_epilogue_fused :
+        When ``True`` (the default), the Triton epilogue already contains
+        the reciprocal multiply (``partial_sum * (1.0 / dim)``), so no
+        post-kernel division is needed — only an FP32→output dtype cast.
+        Set to ``False`` for backward compatibility with kernels whose
+        epilogues accumulate raw sums and rely on the launcher for the
+        ``result / dim`` fixup.
     """
+
+    # ── Post-kernel strategy constants ─────────────────────────────
+    # Pre-computed at __init__ and stored in ``_post_kernel_strategy``
+    # so that ``__call__`` dispatches via integer comparison — zero
+    # data-dependent branching on the hot-path.
+    _POST_KERNEL_NOOP: int = 0        # Return output directly
+    _POST_KERNEL_CAST_ONLY: int = 1   # Fused mean: just cast FP32 → out_dtype
+    _POST_KERNEL_MEAN_DIV: int = 2    # Legacy mean: mul_(reciprocal) then cast
 
     def __init__(
         self,
@@ -397,6 +412,7 @@ class KernelLauncher:
         eager_fn: Callable[..., torch.Tensor] | None = None,
         is_autotuned: bool = False,
         sram_autotuner: SRAMAutotuner | None = None,
+        mean_epilogue_fused: bool = True,
     ) -> None:
         # FX graph.call_function() uses target.__name__ to generate node names.
         self.__name__ = "fuseml_fused_kernel"
@@ -447,6 +463,58 @@ class KernelLauncher:
         else:
             # Autotuned — Triton's @triton.autotune manages everything.
             self._launch_params = None
+
+        # ── Pre-frozen launch kwargs ──────────────────────────────────
+        # Built once at init; reused every dispatch — avoids dict literal
+        # construction on the hot-path.  ``__call__`` passes these via
+        # ``**self._frozen_launch_kwargs`` which is O(6) pointer copy.
+        if not is_autotuned and self._launch_params is not None:
+            lp = self._launch_params
+            self._frozen_launch_kwargs: dict[str, int] = {
+                "BLOCK_SIZE_M": lp.block_m,
+                "BLOCK_SIZE_N": lp.block_n,
+                "BLOCK_SIZE_K": lp.block_k,
+                "GROUP_SIZE_M": lp.group_size_m,
+                "num_warps": lp.num_warps,
+                "num_stages": lp.num_stages,
+            }
+        else:
+            self._frozen_launch_kwargs = {}
+
+        # ── Pre-computed output allocation parameters ─────────────────
+        # Eliminates per-dispatch branching on reduction_op for output
+        # tensor initialization.  All factory calls use explicit device=
+        # and dtype= to avoid implicit host synchronization.
+        self._is_reduced: bool = len(output_descriptor.shape) == 1
+        if self._is_reduced:
+            if reduction_op == "max":
+                self._alloc_fill_value: float = float("-inf")
+            else:
+                # sum and mean both need zero-initialized accumulators
+                self._alloc_fill_value = 0.0
+            # Mean accumulates in FP32 for numerical stability across atomics
+            self._alloc_dtype: torch.dtype = (
+                torch.float32 if reduction_op == "mean" else output_descriptor.dtype
+            )
+        else:
+            self._alloc_fill_value = 0.0  # unused for 2-D path
+            self._alloc_dtype = output_descriptor.dtype
+
+        # ── Pre-computed post-kernel strategy ─────────────────────────
+        # Determines what (if anything) happens after the Triton kernel
+        # returns, encoded as an integer for branchless dispatch.
+        #
+        # _POST_KERNEL_NOOP     : non-mean ops → return output directly
+        # _POST_KERNEL_CAST_ONLY: fused mean   → cast FP32 → out_dtype
+        # _POST_KERNEL_MEAN_DIV : legacy mean  → mul_(1/dim), then cast
+        self._mean_epilogue_fused: bool = mean_epilogue_fused
+        if reduction_op == "mean":
+            if mean_epilogue_fused:
+                self._post_kernel_strategy: int = self._POST_KERNEL_CAST_ONLY
+            else:
+                self._post_kernel_strategy = self._POST_KERNEL_MEAN_DIV
+        else:
+            self._post_kernel_strategy = self._POST_KERNEL_NOOP
 
         # ── Eager fallback guard ──────────────────────────────────────
         # When an eager_fn is provided, wrap every kernel dispatch in a
@@ -547,16 +615,40 @@ class KernelLauncher:
         return None
 
     # ------------------------------------------------------------------
-    # Runtime dispatch — O(1) constant-time, zero conditional branching
+    # Runtime dispatch — CUDA-graph-safe, zero host-side data-dependent
+    # branching.  All per-instance decisions were resolved at __init__.
     # ------------------------------------------------------------------
 
     def __call__(self, *input_tensors: torch.Tensor) -> torch.Tensor:
         """Launch the fused Triton kernel and return the output tensor.
 
-        All block sizes, warp counts, and pipeline stages were pre-
-        computed at construction time (stored in ``self._launch_params``)
-        so this method performs **zero** SRAM budgeting or heuristic
-        selection — just constant-time kwarg injection.
+        **CUDA Graph safety guarantees**:
+
+        1. **No host-side data-dependent control flow.**  Every branch in
+           this method is resolved by instance-level constants that were
+           pre-computed at ``__init__`` time (``_is_reduced``,
+           ``_post_kernel_strategy``, ``_frozen_launch_kwargs``).  No
+           branch inspects runtime tensor *values* or dynamically-
+           computed tensor *shapes*.
+
+        2. **Allocation safeness.**  All ``torch.empty_strided`` /
+           ``torch.full`` calls specify ``device=`` and ``dtype=``
+           explicitly to avoid implicit host synchronisation or
+           uncaptured memory-pool expansion.
+
+        3. **Flat argument passing.**  Dynamic shapes (``M``, ``N``,
+           ``K``) and strides are passed as explicit Python ``int``
+           positional arguments.  Launch kwargs (block sizes, warps,
+           stages) are unpacked from ``self._frozen_launch_kwargs``
+           which was built once at ``__init__`` — no per-dispatch dict
+           literal construction.
+
+        4. **No post-kernel fixup kernels.**  Mean division is fused
+           into the Triton epilogue (reciprocal multiply before
+           ``tl.atomic_add``).  The only post-kernel op is an optional
+           FP32 → output-dtype cast via ``Tensor.to()`` which is a
+           single capturable CUDA kernel (and a no-op when dtypes
+           already match).
 
         Parameters
         ----------
@@ -579,78 +671,59 @@ class KernelLauncher:
             )
 
         # ── Negative-stride fast-path ─────────────────────────────────
+        # CPU-side metadata check only — no GPU synchronisation.
         input_tensors = tuple(self._materialize_if_needed(t) for t in input_tensors)
 
         left_t = input_tensors[self._left_idx]
         right_t = input_tensors[self._right_idx]
 
-        # ── Metadata extraction fast-path ────────────────────────────
-        M = int(left_t.shape[-2])
-        K = int(left_t.shape[-1])
-        N = int(right_t.shape[-1])
+        # ── Dimension extraction (CPU metadata, no host-GPU sync) ────
+        M: int = int(left_t.shape[-2])
+        K: int = int(left_t.shape[-1])
+        N: int = int(right_t.shape[-1])
 
-        device = left_t.device
-        out_dtype = self._output_descriptor.dtype
-
-        # ── Launch kwargs — O(1) constant-time injection ─────────────
-        # Pre-computed LaunchParams are read directly; no SRAM
-        # enforcement, no heuristic selection, no conditional branching.
-        if self._is_autotuned:
-            launch_kwargs: dict = {}
-        else:
-            lp = self._launch_params
-            launch_kwargs = {
-                "BLOCK_SIZE_M": lp.block_m,
-                "BLOCK_SIZE_N": lp.block_n,
-                "BLOCK_SIZE_K": lp.block_k,
-                "GROUP_SIZE_M": lp.group_size_m,
-                "num_warps": lp.num_warps,
-                "num_stages": lp.num_stages,
-            }
-
-        # ── CUDA stream synchronization ───────────────────────────────
-        stream_handle = self._get_launch_stream(device)
+        device: torch.device = left_t.device
+        out_dtype: torch.dtype = self._output_descriptor.dtype
 
         logger.debug(
             "KernelLauncher dispatch — M=%d, N=%d, K=%d, device=%s, "
             "dtype=%s, kwargs=%s",
-            M, N, K, device, out_dtype, launch_kwargs,
+            M, N, K, device, out_dtype, self._frozen_launch_kwargs,
         )
 
-        # ── Smart output allocation ───────────────────────────────────
-        is_reduced = len(self._output_descriptor.shape) == 1
-        if is_reduced:
-            surviving_size = M if self._reduction_axis == 1 else N
-            if self._reduction_op == "max":
-                output = torch.empty_strided(
-                    (surviving_size,), (1,), dtype=out_dtype, device=device,
-                ).fill_(float('-inf'))
-            elif self._reduction_op == "mean":
-                output = torch.empty_strided(
-                    (surviving_size,), (1,), dtype=torch.float32, device=device,
-                ).zero_()
-            else:
-                output = torch.empty_strided(
-                    (surviving_size,), (1,), dtype=out_dtype, device=device,
-                ).zero_()
+        # ── Output allocation — explicit device/dtype, pre-computed ───
+        # The allocation kind (_is_reduced, _alloc_fill_value,
+        # _alloc_dtype) was resolved at __init__; only M, N are dynamic.
+        if self._is_reduced:
+            surviving_size: int = M if self._reduction_axis == 1 else N
+            output = torch.full(
+                (surviving_size,),
+                self._alloc_fill_value,
+                dtype=self._alloc_dtype,
+                device=device,
+            )
         else:
             output = torch.empty_strided(
                 (M, N), (N, 1), dtype=out_dtype, device=device,
             )
 
-        # Intermediate escape buffers (one per escape node).
+        # Intermediate escape buffers — explicit device/dtype.
         intermediate_outputs: list[torch.Tensor] = [
-            torch.empty_strided((M, N), (N, 1), dtype=d.dtype, device=device)
+            torch.empty_strided(
+                (M, N), (N, 1), dtype=d.dtype, device=device,
+            )
             for d in self._intermediate_descriptors
         ]
 
-        # ── Launch grid ───────────────────────────────────────────────
+        # ── Launch grid — deferred lambda for Triton constexpr ────────
         grid = lambda META: (  # noqa: E731
             ((M + META['BLOCK_SIZE_M'] - 1) // META['BLOCK_SIZE_M'])
             * ((N + META['BLOCK_SIZE_N'] - 1) // META['BLOCK_SIZE_N']),
         )
 
-        # ── Argument assembly ─────────────────────────────────────────
+        # ── Flat argument assembly ────────────────────────────────────
+        # All dynamic shapes and strides are passed as explicit Python
+        # ints — no dict construction, no runtime type coercion.
         tensor_args: list[torch.Tensor] = list(input_tensors)
         tensor_args.append(output)
         tensor_args.extend(intermediate_outputs)
@@ -659,7 +732,7 @@ class KernelLauncher:
         for t in input_tensors:
             stride_args.extend(int(s) for s in t.stride())
 
-        if is_reduced:
+        if self._is_reduced:
             stride_args.append(int(output.stride(0)))
         else:
             stride_args.extend([int(output.stride(0)), int(output.stride(1))])
@@ -667,21 +740,33 @@ class KernelLauncher:
         for t in intermediate_outputs:
             stride_args.extend([int(t.stride(0)), int(t.stride(1))])
 
-        # ── Kernel launch ─────────────────────────────────────────────
+        # ── Kernel launch + post-kernel fixup ─────────────────────────
+        # The closure is kept for EagerFallbackGuard compatibility but
+        # contains zero data-dependent branching — the post-kernel
+        # strategy integer was resolved at __init__.
+        post_strategy = self._post_kernel_strategy
+
         def _triton_launch() -> torch.Tensor:
             """Closure capturing all launch state for the fallback guard."""
             self._kernel_fn[grid](
                 *tensor_args,
                 M, N, K,
                 *stride_args,
-                **launch_kwargs,
+                **self._frozen_launch_kwargs,
             )
 
-            result = output
-            if self._reduction_op == "mean":
+            # Post-kernel: integer dispatch, no data-dependent branching.
+            if post_strategy == KernelLauncher._POST_KERNEL_CAST_ONLY:
+                # Fused mean: epilogue already divided — just cast.
+                # Tensor.to() is a no-op when dtypes already match.
+                return output.to(out_dtype)
+            if post_strategy == KernelLauncher._POST_KERNEL_MEAN_DIV:
+                # Legacy mean: in-place scalar multiply (single CUDA op)
+                # instead of tensor / scalar (which constructs a scalar
+                # tensor on the fly).
                 reduced_dim_size = N if self._reduction_axis == 1 else M
-                result = (result / reduced_dim_size).to(out_dtype)
-            return result
+                return output.mul_(1.0 / reduced_dim_size).to(out_dtype)
+            return output
 
         # ── Guarded execution ────────────────────────────────────────
         if self._fallback_guard is not None:
