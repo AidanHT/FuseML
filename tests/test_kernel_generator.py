@@ -1,9 +1,20 @@
-"""Tests for TritonKernelGenerator — signature and pointer arithmetic."""
+"""Tests for TritonKernelGenerator — signature, pointer arithmetic, K-loop, and epilogue."""
+
+from types import SimpleNamespace
 
 import pytest
 import torch
 
 from fuseml.codegen.kernel_generator import TensorDescriptor, TritonKernelGenerator
+
+
+# ---------------------------------------------------------------------------
+# Helpers — lightweight FX node stand-ins for epilogue tests
+# ---------------------------------------------------------------------------
+
+def _make_node(*, op="call_function", target=None, name="node", args=()):
+    """Create a minimal object that quacks like ``torch.fx.Node``."""
+    return SimpleNamespace(op=op, target=target, name=name, args=args)
 
 
 # ---------------------------------------------------------------------------
@@ -483,3 +494,262 @@ class TestKLoopEdgeCases:
         assert "input_ptrs += BLOCK_SIZE_K * stride_input_k" in code
         assert "weight_ptrs += BLOCK_SIZE_K * stride_weight_k" in code
         assert "acc += tl.dot(input, weight)" in code
+
+
+# ---------------------------------------------------------------------------
+# Epilogue: ReLU
+# ---------------------------------------------------------------------------
+
+@pytest.mark.codegen
+class TestEpilogueRelu:
+    """ReLU post-op: acc = tl.where(acc > 0, acc, 0.0)."""
+
+    def test_relu_emits_tl_where(self, gen):
+        node = _make_node(target=torch.ops.aten.relu.default)
+        code = gen.generate_epilogue([node])
+        assert "acc = tl.where(acc > 0, acc, 0.0)" in code
+
+    def test_relu_comment(self, gen):
+        node = _make_node(target=torch.ops.aten.relu.default)
+        code = gen.generate_epilogue([node])
+        assert "ReLU" in code
+
+    def test_relu_no_hbm_load(self, gen):
+        """ReLU is register-only — must not emit tl.load."""
+        node = _make_node(target=torch.ops.aten.relu.default)
+        code = gen.generate_epilogue([node])
+        assert "tl.load" not in code
+
+
+# ---------------------------------------------------------------------------
+# Epilogue: GeLU
+# ---------------------------------------------------------------------------
+
+@pytest.mark.codegen
+class TestEpilogueGelu:
+    """GeLU post-op: fast tanh approximation."""
+
+    def test_gelu_emits_tanh(self, gen):
+        node = _make_node(target=torch.ops.aten.gelu.default)
+        code = gen.generate_epilogue([node])
+        assert "tl.math.tanh" in code
+
+    def test_gelu_sqrt_2_over_pi(self, gen):
+        """Must use sqrt(2/pi) ≈ 0.7978845608 constant."""
+        node = _make_node(target=torch.ops.aten.gelu.default)
+        code = gen.generate_epilogue([node])
+        assert "0.7978845608" in code
+
+    def test_gelu_cubic_coefficient(self, gen):
+        """Must use the 0.044715 coefficient for the x^3 term."""
+        node = _make_node(target=torch.ops.aten.gelu.default)
+        code = gen.generate_epilogue([node])
+        assert "0.044715" in code
+
+    def test_gelu_half_factor(self, gen):
+        """GeLU formula multiplies by 0.5."""
+        node = _make_node(target=torch.ops.aten.gelu.default)
+        code = gen.generate_epilogue([node])
+        assert "0.5 * acc" in code
+
+    def test_gelu_modifies_acc(self, gen):
+        """Result must be assigned back to acc."""
+        node = _make_node(target=torch.ops.aten.gelu.default)
+        code = gen.generate_epilogue([node])
+        assert "acc = 0.5 * acc * (1.0 + tl.math.tanh(" in code
+
+    def test_gelu_no_hbm_load(self, gen):
+        """GeLU is register-only — must not emit tl.load."""
+        node = _make_node(target=torch.ops.aten.gelu.default)
+        code = gen.generate_epilogue([node])
+        assert "tl.load" not in code
+
+    def test_gelu_comment(self, gen):
+        node = _make_node(target=torch.ops.aten.gelu.default)
+        code = gen.generate_epilogue([node])
+        assert "GeLU" in code
+
+
+# ---------------------------------------------------------------------------
+# Epilogue: add.Tensor (residual connection)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.codegen
+class TestEpilogueAdd:
+    """Residual add: load external tensor from HBM, fuse into acc."""
+
+    def test_add_loads_residual(self, gen):
+        residual = _make_node(op="placeholder", name="res")
+        acc_node = _make_node(target=torch.ops.aten.relu.default, name="relu_out")
+        add_node = _make_node(
+            target=torch.ops.aten.add.Tensor,
+            name="add_out",
+            args=(acc_node, residual),
+        )
+        # acc_node is internal (in the group), residual is external
+        code = gen.generate_epilogue([acc_node, add_node])
+        assert "tl.load(res_ptrs," in code
+
+    def test_add_mask(self, gen):
+        """Residual load must use a 2-D boundary mask."""
+        residual = _make_node(op="placeholder", name="res")
+        acc_node = _make_node(target=torch.ops.aten.relu.default, name="relu_out")
+        add_node = _make_node(
+            target=torch.ops.aten.add.Tensor,
+            name="add_out",
+            args=(acc_node, residual),
+        )
+        code = gen.generate_epilogue([acc_node, add_node])
+        assert "mask=(offs_m[:, None] < M) & (offs_n[None, :] < N)" in code
+
+    def test_add_other_zero(self, gen):
+        """Masked-out elements default to 0.0."""
+        residual = _make_node(op="placeholder", name="res")
+        acc_node = _make_node(target=torch.ops.aten.relu.default, name="relu_out")
+        add_node = _make_node(
+            target=torch.ops.aten.add.Tensor,
+            name="add_out",
+            args=(acc_node, residual),
+        )
+        code = gen.generate_epilogue([acc_node, add_node])
+        assert "other=0.0" in code
+
+    def test_add_acc_plus_residual(self, gen):
+        residual = _make_node(op="placeholder", name="res")
+        acc_node = _make_node(target=torch.ops.aten.relu.default, name="relu_out")
+        add_node = _make_node(
+            target=torch.ops.aten.add.Tensor,
+            name="add_out",
+            args=(acc_node, residual),
+        )
+        code = gen.generate_epilogue([acc_node, add_node])
+        assert "acc = acc + res" in code
+
+    def test_add_uses_residual_name(self, gen):
+        """Variable names derive from the residual node's name attribute."""
+        residual = _make_node(op="placeholder", name="skip_conn")
+        acc_node = _make_node(target=torch.ops.aten.relu.default, name="prev")
+        add_node = _make_node(
+            target=torch.ops.aten.add.Tensor,
+            name="add_out",
+            args=(acc_node, residual),
+        )
+        code = gen.generate_epilogue([acc_node, add_node])
+        assert "skip_conn = tl.load(skip_conn_ptrs," in code
+        assert "acc = acc + skip_conn" in code
+
+    def test_add_residual_as_first_arg(self, gen):
+        """Residual may appear as first arg — still correctly identified."""
+        residual = _make_node(op="placeholder", name="res")
+        acc_node = _make_node(target=torch.ops.aten.relu.default, name="prev")
+        add_node = _make_node(
+            target=torch.ops.aten.add.Tensor,
+            name="add_out",
+            args=(residual, acc_node),
+        )
+        # acc_node IS in the fusion group, residual is NOT
+        code = gen.generate_epilogue([acc_node, add_node])
+        assert "tl.load(res_ptrs," in code
+        assert "acc = acc + res" in code
+
+    def test_add_comment_mentions_hbm(self, gen):
+        """Hardware-sympathy: comment must mention HBM load."""
+        residual = _make_node(op="placeholder", name="res")
+        acc_node = _make_node(target=torch.ops.aten.relu.default, name="prev")
+        add_node = _make_node(
+            target=torch.ops.aten.add.Tensor,
+            name="add_out",
+            args=(acc_node, residual),
+        )
+        code = gen.generate_epilogue([acc_node, add_node])
+        assert "HBM" in code
+
+
+# ---------------------------------------------------------------------------
+# Epilogue: chained operations
+# ---------------------------------------------------------------------------
+
+@pytest.mark.codegen
+class TestEpilogueChained:
+    """Multiple fused post-ops in sequence."""
+
+    def test_relu_then_add(self, gen):
+        """ReLU followed by a residual add."""
+        residual = _make_node(op="placeholder", name="res")
+        relu_node = _make_node(target=torch.ops.aten.relu.default, name="relu_out")
+        add_node = _make_node(
+            target=torch.ops.aten.add.Tensor,
+            name="add_out",
+            args=(relu_node, residual),
+        )
+        code = gen.generate_epilogue([relu_node, add_node])
+        assert code.index("tl.where") < code.index("tl.load")
+        assert code.index("tl.load") < code.index("acc = acc + res")
+
+    def test_gelu_then_add(self, gen):
+        """GeLU followed by a residual add."""
+        residual = _make_node(op="placeholder", name="res")
+        gelu_node = _make_node(target=torch.ops.aten.gelu.default, name="gelu_out")
+        add_node = _make_node(
+            target=torch.ops.aten.add.Tensor,
+            name="add_out",
+            args=(gelu_node, residual),
+        )
+        code = gen.generate_epilogue([gelu_node, add_node])
+        assert code.index("tl.math.tanh") < code.index("tl.load")
+
+    def test_add_then_relu(self, gen):
+        """Residual add followed by ReLU."""
+        residual = _make_node(op="placeholder", name="res")
+        # prev_node is an internal predecessor (e.g. the matmul result)
+        # that doesn't emit epilogue code — use "get_attr" so it's skipped.
+        prev_node = _make_node(name="prev", op="get_attr")
+        add_node = _make_node(
+            target=torch.ops.aten.add.Tensor,
+            name="add_out",
+            args=(prev_node, residual),
+        )
+        relu_node = _make_node(target=torch.ops.aten.relu.default, name="relu_out")
+        code = gen.generate_epilogue([prev_node, add_node, relu_node])
+        assert code.index("acc = acc + res") < code.index("tl.where")
+
+
+# ---------------------------------------------------------------------------
+# Epilogue: edge cases
+# ---------------------------------------------------------------------------
+
+@pytest.mark.codegen
+class TestEpilogueEdgeCases:
+    """Edge cases and structural guarantees."""
+
+    def test_empty_nodes_returns_header_only(self, gen):
+        code = gen.generate_epilogue([])
+        assert "Epilogue" in code
+        assert "tl.where" not in code
+        assert "tl.math.tanh" not in code
+        assert "tl.load" not in code
+
+    def test_placeholder_nodes_skipped(self, gen):
+        """Placeholder nodes must not produce any code."""
+        ph = _make_node(op="placeholder", name="x")
+        code = gen.generate_epilogue([ph])
+        assert "tl.where" not in code
+        assert "tl.math.tanh" not in code
+        assert "tl.load" not in code
+
+    def test_output_nodes_skipped(self, gen):
+        out = _make_node(op="output", name="output")
+        code = gen.generate_epilogue([out])
+        assert "tl.where" not in code
+
+    def test_returns_nonempty_string(self, gen):
+        node = _make_node(target=torch.ops.aten.relu.default)
+        result = gen.generate_epilogue([node])
+        assert isinstance(result, str)
+        assert len(result) > 0
+
+    def test_sram_comment(self, gen):
+        """Epilogue header must mention SRAM — operations stay in registers."""
+        node = _make_node(target=torch.ops.aten.relu.default)
+        code = gen.generate_epilogue([node])
+        assert "SRAM" in code

@@ -1,12 +1,13 @@
-"""Triton kernel code generation — signature, pointer arithmetic, and K-loop.
+"""Triton kernel code generation — signature, pointer arithmetic, K-loop, and epilogue.
 
 Generates the ``@triton.jit`` function header, pointer parameters, stride
 parameters, ``tl.constexpr`` block sizes, ``tl.program_id`` block offsets,
-initial pointer arithmetic, and the blocked GEMM loop over the K dimension
-for matmul-based fused kernels.
+initial pointer arithmetic, the blocked GEMM loop over the K dimension,
+and the fused epilogue (elementwise post-ops) for matmul-based fused kernels.
 
-This module owns the signature/addressing stage and the tiled computation
-loop.  Store logic is a separate concern added later.
+This module owns the signature/addressing stage, the tiled computation
+loop, and the dynamic AST translation of PyTorch FX nodes into Triton
+register operations.  Store logic is a separate concern added later.
 """
 
 from __future__ import annotations
@@ -277,6 +278,67 @@ class TritonKernelGenerator:
         ]
         return "\n".join(sections)
 
+    def generate_epilogue(
+        self,
+        fusion_group_nodes: list[torch.fx.Node],
+    ) -> str:
+        """Return Triton source for fused post-GEMM operations on ``acc``.
+
+        This is the dynamic AST translation phase: each PyTorch FX node in
+        *fusion_group_nodes* is mapped to the equivalent Triton register
+        operation, keeping all intermediate values in SRAM (no round-trip
+        through HBM between fused ops).
+
+        The method iterates through a **topologically sorted** list of
+        ``torch.fx.Node`` objects and emits Triton code that modifies the
+        ``acc`` register in-place.  Only ``call_function`` nodes produce
+        code; other node types (``placeholder``, ``output``, …) are
+        skipped.
+
+        Supported targets
+        -----------------
+        * ``torch.ops.aten.relu.default`` — ``tl.where(acc > 0, acc, 0.0)``
+        * ``torch.ops.aten.gelu.default`` — fast tanh approximation
+        * ``torch.ops.aten.add.Tensor`` — load a residual tensor tile from
+          HBM into SRAM, then ``acc = acc + residual``
+
+        Parameters
+        ----------
+        fusion_group_nodes :
+            Topologically sorted FX nodes representing the fused
+            elementwise operations to apply after the GEMM K-loop.
+
+        Returns
+        -------
+        str
+            Triton source lines (indented at the kernel body level).
+        """
+        node_ids = {id(n) for n in fusion_group_nodes}
+
+        lines: list[str] = [
+            "",
+            "    # -----------------------------------------------------------",
+            "    # Epilogue — fused post-GEMM operations (all in SRAM registers)",
+            "    # -----------------------------------------------------------",
+        ]
+
+        for node in fusion_group_nodes:
+            if node.op != "call_function":
+                continue
+
+            if node.target == torch.ops.aten.relu.default:
+                lines.append(self._emit_relu())
+            elif node.target == torch.ops.aten.gelu.default:
+                lines.append(self._emit_gelu())
+            elif node.target == torch.ops.aten.add.Tensor:
+                lines.append(self._emit_add(node, node_ids))
+            else:
+                logger.warning(
+                    "Unsupported epilogue target: %s — skipped", node.target,
+                )
+
+        return "\n".join(lines)
+
     # ------------------------------------------------------------------
     # Code-section builders (each returns a ready-to-join string)
     # ------------------------------------------------------------------
@@ -468,6 +530,64 @@ class TritonKernelGenerator:
             "        # Advance to the next K-block (stride along the reduction axis)",
             f"        {ln}_ptrs += BLOCK_SIZE_K * {s_lk}",
             f"        {rn}_ptrs += BLOCK_SIZE_K * {s_rk}",
+        ])
+
+    # ------------------------------------------------------------------
+    # Epilogue emitters (each returns a ready-to-join code snippet)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _emit_relu() -> str:
+        """ReLU: zero out negative values in the accumulator."""
+        return "\n".join([
+            "    # ReLU activation — zero out negatives (register-only, no HBM traffic)",
+            "    acc = tl.where(acc > 0, acc, 0.0)",
+        ])
+
+    @staticmethod
+    def _emit_gelu() -> str:
+        """GeLU: fast tanh approximation matching PyTorch's default.
+
+        Formula: x * 0.5 * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x³)))
+        All arithmetic stays in SRAM registers — no HBM round-trip.
+        """
+        return "\n".join([
+            "    # GeLU activation — fast tanh approximation (all in SRAM registers)",
+            "    # Formula: x * 0.5 * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))",
+            "    acc = 0.5 * acc * (1.0 + tl.math.tanh(0.7978845608 * (acc + 0.044715 * acc * acc * acc)))",
+        ])
+
+    @staticmethod
+    def _emit_add(
+        node: torch.fx.Node,
+        node_ids: set[int],
+    ) -> str:
+        """Residual add: load an external tensor tile from HBM, fuse into acc.
+
+        Identifies the *external* argument (the one not produced by a prior
+        node inside the fusion group) as the residual tensor.
+        """
+        # Find the residual — the arg that lives outside the fusion group.
+        residual_name: str | None = None
+        for arg in node.args:
+            if hasattr(arg, "name") and id(arg) not in node_ids:
+                residual_name = arg.name
+                break
+
+        if residual_name is None:
+            # Both args are internal — just emit a plain add.
+            return "\n".join([
+                "    # Element-wise add (both operands already in SRAM)",
+                "    acc = acc + acc",
+            ])
+
+        return "\n".join([
+            f"    # Residual add — load {residual_name} tile from HBM into SRAM",
+            (
+                f"    {residual_name} = tl.load({residual_name}_ptrs, "
+                f"mask=(offs_m[:, None] < M) & (offs_n[None, :] < N), other=0.0)"
+            ),
+            f"    acc = acc + {residual_name}",
         ])
 
     @staticmethod
