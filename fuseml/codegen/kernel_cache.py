@@ -369,8 +369,15 @@ class KernelCache:
 def build_op_chain(group: Any) -> str:
     """Build a stable operator-chain string from a FusionGroup.
 
-    Concatenates the string representations of every ``call_function``
-    target in execution order, joined by ``"->"``.
+    Concatenates the **canonical** string representations of every
+    ``call_function`` target in execution order, joined by ``"->"``.
+    Uses :func:`~fuseml.passes.topology.canonicalize_target` as the
+    single source of truth for target → string conversion, ensuring
+    consistency with :attr:`FusionGroup.op_signature`.
+
+    The resulting string is completely independent of ``node.name``,
+    placeholder naming conventions (``primals_*``, ``tangents_*``),
+    and any other AOT Autograd tracing artifact.
 
     Parameters
     ----------
@@ -383,10 +390,12 @@ def build_op_chain(group: Any) -> str:
     str
         e.g. ``"aten.addmm.default->aten.gelu.default"``.
     """
+    from fuseml.passes.topology import canonicalize_target
+
     targets: List[str] = []
     for node in group.all_nodes:
         if node.op == "call_function":
-            targets.append(str(node.target))
+            targets.append(canonicalize_target(node.target))
     return "->".join(targets)
 
 

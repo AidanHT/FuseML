@@ -15,11 +15,24 @@ from fuseml._logging import logger
 from fuseml.codegen.kernel_cache import _materialize_ints
 from fuseml.fusion_group import FusionGroup
 from fuseml.passes.graph_cut import (
-    TRANSPARENT_OPS,
     split_fusion_group,
     validate_fusion_group,
 )
-from fuseml.passes.mutation_safety import IN_PLACE_OPS, is_safe_inplace
+from fuseml.passes.mutation_safety import is_safe_inplace
+from fuseml.passes.topology import (
+    ABSORBABLE_OPS,
+    BARRIER_OPS,
+    INPLACE_OPS,
+    REDUCTION_OPS,
+    TRANSPARENT_OPS,
+    TRIGGER_OPS,
+    NodeRole,
+    classify_node,
+    is_trigger,
+    resolve_to_defining_node,
+    symint_safe_eq,
+    symint_safe_len,
+)
 from fuseml.registry import SupportedOpsRegistry, build_default_registry
 
 
@@ -71,54 +84,36 @@ class FuseMLFusionPass:
     # ------------------------------------------------------------------
     # Phase 1 — Discover fusible groups
     # ------------------------------------------------------------------
-    # Ops that act as fusion barriers — require cross-thread synchronization,
-    # reductions, or are heavy compute nodes that should start their own group.
-    _BARRIER_OPS: Set[Callable] = {
-        torch.ops.aten._softmax.default,
-        torch.ops.aten._log_softmax.default,
-        torch.ops.aten.native_layer_norm.default,
-        torch.ops.aten.addmm.default,
-        torch.ops.aten.mm.default,
-        torch.ops.aten.bmm.default,
-        torch.ops.aten.convolution.default,
-    }
-
-    # Pointwise ops eligible for absorption into an existing FusionGroup.
-    _ABSORBABLE_OPS: Set[Callable] = {
-        torch.ops.aten.relu.default,
-        torch.ops.aten.gelu.default,
-        torch.ops.aten.sigmoid.default,
-        torch.ops.aten.add.Tensor,
-        torch.ops.aten.mul.Tensor,
-    }
-
-    # Reduction ops that can be absorbed as the *final* operation in a
-    # fusion group.  They require cross-thread synchronization (tl.atomic_*)
-    # and collapse one tile dimension, so nothing further is absorbed after
-    # a reduction.  Only keepdim=False reductions are absorbed; keepdim=True
-    # is left as a barrier because the output remains 2-D while ``acc`` is
-    # collapsed to 1-D, which the current store path does not handle.
-    _REDUCTION_OPS: Set[Callable] = {
-        torch.ops.aten.sum.dim_IntList,
-        torch.ops.aten.amax.default,
-        torch.ops.aten.mean.dim,
-    }
+    # Canonical op sets are defined in ``fuseml.passes.topology`` and
+    # re-exported here as class attributes for backward compatibility.
+    # Pattern matching uses ``classify_node()`` and ``is_trigger()``
+    # from the topology module for structural dispatch.
+    _BARRIER_OPS: Set[Callable] = BARRIER_OPS
+    _ABSORBABLE_OPS: Set[Callable] = ABSORBABLE_OPS
+    _REDUCTION_OPS: Set[Callable] = REDUCTION_OPS
 
     def _find_fusion_groups(self) -> List[FusionGroup]:
         """Identify contiguous sequences of fusible memory-bound nodes.
 
         Walks ``self.graph_module.graph`` in topological order.  When a
-        trigger node (``aten.addmm.default``) is encountered, a new
+        trigger node is encountered (classified by
+        :func:`~fuseml.passes.topology.is_trigger`), a new
         :class:`FusionGroup` is initialized and the algorithm greedily
-        absorbs downstream pointwise nodes that satisfy:
+        absorbs downstream nodes based on their
+        :class:`~fuseml.passes.topology.NodeRole`:
 
-        * **Op type** — the node's target is in ``_ABSORBABLE_OPS``.
-        * **Topology** — the node has exactly one user (no branching).
+        * **ABSORBABLE** — pointwise ops absorbed unconditionally.
+        * **REDUCTION** — absorbed as the final op (terminates group).
+        * **TRANSPARENT** — view/metadata ops absorbed if shape-preserving.
+        * **INPLACE** — absorbed only when alias-safe.
+        * **BARRIER / UNKNOWN** — halt absorption.
 
-        Absorption halts on barrier ops, multi-user nodes, or any op not
-        in the absorbable set.  Only groups with at least one absorbed
-        node (i.e. len > 1) are returned, since a lone ``addmm`` offers
-        no fusion benefit.
+        Classification relies exclusively on ``node.target`` (ATen op
+        identity) and structural connectivity — never on ``node.name``
+        or placeholder naming conventions introduced by AOT Autograd.
+
+        Only groups with at least one absorbed node (i.e. len > 1) are
+        returned, since a lone trigger offers no fusion benefit.
 
         Returns
         -------
@@ -131,10 +126,8 @@ class FuseMLFusionPass:
         consumed: Set[torch.fx.Node] = set()
 
         for node in self.graph_module.graph.nodes:
-            if node.op != "call_function":
-                continue
-            # Only trigger on the core compute op.
-            if node.target is not torch.ops.aten.addmm.default:
+            # --- Trigger detection via structural classification -----------
+            if not is_trigger(node):
                 continue
             if node in consumed:
                 continue
@@ -155,16 +148,20 @@ class FuseMLFusionPass:
 
                 successor = next(iter(current.users))
 
-                # Must be a call_function to inspect its target.
-                if successor.op != "call_function":
+                # Classify the successor purely by its ATen target.
+                role = classify_node(successor)
+
+                # Non-call_function nodes (placeholder, output, get_attr)
+                # are classified as UNKNOWN — halt absorption.
+                if role is NodeRole.UNKNOWN:
                     break
 
-                # Halt on barrier / heavy-compute ops.
-                if successor.target in self._BARRIER_OPS:
+                # --- BARRIER — halt absorption ----------------------------
+                if role is NodeRole.BARRIER:
                     break
 
-                # --- Reduction absorption (terminates the group) ----------
-                if successor.target in self._REDUCTION_OPS:
+                # --- REDUCTION — absorb and terminate the group -----------
+                if role is NodeRole.REDUCTION:
                     # Only absorb keepdim=False; keepdim=True produces a
                     # 2-D output while the accumulator is collapsed to 1-D,
                     # which the store path cannot handle yet.
@@ -184,12 +181,8 @@ class FuseMLFusionPass:
                     )
                     break  # nothing further after a reduction
 
-                # --- Transparent view/metadata penetration --------------------
-                # If the successor is a view/reshape/unsqueeze that does not
-                # change the 2-D tile shape, absorb it silently and keep
-                # looking for the next compute op.  This lets chains like
-                # addmm → view → relu fuse correctly.
-                if successor.target in TRANSPARENT_OPS:
+                # --- TRANSPARENT — view/metadata penetration --------------
+                if role is NodeRole.TRANSPARENT:
                     if self._is_shape_preserving_2d(successor):
                         group.fused_nodes.append(successor)
                         consumed.add(successor)
@@ -204,12 +197,8 @@ class FuseMLFusionPass:
                     # Shape-changing view → stop absorption.
                     break
 
-                # --- In-place op absorption with aliasing guard --------
-                # In-place aten ops (relu_, add_, mul_, sigmoid_) can be
-                # fused only when the mutated tensor is not aliased by
-                # nodes outside the group.  The safety check walks the
-                # view ancestry chain to catch transitive aliasing.
-                if successor.target in IN_PLACE_OPS:
+                # --- INPLACE — conditionally absorbed with alias guard ----
+                if role is NodeRole.INPLACE:
                     if is_safe_inplace(successor, group_node_set):
                         group.fused_nodes.append(successor)
                         group.output_node = successor
@@ -220,8 +209,6 @@ class FuseMLFusionPass:
                         )
                         current = successor
                         continue
-                    # Aliased externally — halt absorption to preserve
-                    # PyTorch's expected mutation side-effects.
                     logger.debug(
                         "Aborting absorption at in-place op %s — "
                         "mutated tensor is aliased outside the group.",
@@ -229,20 +216,20 @@ class FuseMLFusionPass:
                     )
                     break
 
-                # Only absorb low-intensity pointwise ops.
-                if successor.target not in self._ABSORBABLE_OPS:
-                    break
+                # --- ABSORBABLE — unconditional absorption ----------------
+                if role is NodeRole.ABSORBABLE:
+                    group.fused_nodes.append(successor)
+                    group.output_node = successor
+                    consumed.add(successor)
+                    group_node_set.add(successor)
+                    self._collect_external_inputs(
+                        successor, group_node_set, group,
+                    )
+                    current = successor
+                    continue
 
-                # Absorb the successor.
-                group.fused_nodes.append(successor)
-                group.output_node = successor
-                consumed.add(successor)
-                group_node_set.add(successor)
-
-                # Record any external inputs the absorbed node requires.
-                self._collect_external_inputs(successor, group_node_set, group)
-
-                current = successor
+                # Unrecognised role — conservative halt.
+                break
 
             # --- Escape-node analysis -------------------------------------
             # For every node inside the group (except the final output_node,
@@ -339,11 +326,36 @@ class FuseMLFusionPass:
         group_node_set: Set[torch.fx.Node],
         group: FusionGroup,
     ) -> None:
-        """Add *node*'s args to ``group.inputs`` if produced outside the group."""
+        """Add *node*'s args to ``group.inputs`` if produced outside the group.
+
+        Each argument is resolved to its closest data-producing defining
+        node via :func:`~fuseml.passes.topology.resolve_to_defining_node`,
+        tracing through any transparent view/metadata ops inserted by
+        AOT Autograd.  This ensures the input list references the actual
+        computation that produced the data, not an intermediate reshape
+        artifact — making the FusionGroup's dependency graph robust
+        against tracing-level variability.
+
+        The resolved node is only used if it is *also* outside the group;
+        if resolution lands on a node already inside the group, we fall
+        back to the original arg to preserve correct wiring.
+        """
         for arg in node.args:
-            if isinstance(arg, torch.fx.Node) and arg not in group_node_set:
-                if arg not in group.inputs:
-                    group.inputs.append(arg)
+            if not isinstance(arg, torch.fx.Node):
+                continue
+            if arg in group_node_set:
+                continue
+
+            # Resolve through transparent ops to the defining computation.
+            resolved = resolve_to_defining_node(arg)
+
+            # Use the resolved node if it's still external; otherwise
+            # fall back to the original arg (the transparent op itself
+            # may be needed for correct shape wiring).
+            target_input = resolved if resolved not in group_node_set else arg
+
+            if target_input not in group.inputs:
+                group.inputs.append(target_input)
 
     @staticmethod
     def _is_shape_preserving_2d(node: torch.fx.Node) -> bool:
@@ -354,6 +366,12 @@ class FuseMLFusionPass:
         shape matches the GEMM output dimensions.  Shape-changing views
         (different rank or different M/N) would cause a store mismatch and
         are conservatively rejected.
+
+        Shape comparisons use :func:`~fuseml.passes.topology.symint_safe_eq`
+        to handle ``torch.SymInt`` dimensions introduced by Dynamo without
+        raising ``GuardOnDataDependentSymNode`` errors.  When a dimension
+        cannot be concretely resolved, the comparison conservatively returns
+        ``False``.
 
         Returns ``False`` when ``tensor_meta`` is missing (e.g. ShapeProp
         was not run), ensuring the conservative fallback: views are NOT
@@ -372,11 +390,15 @@ class FuseMLFusionPass:
             return False
 
         # Both must be 2-D with identical dimensions.
-        if len(node_meta.shape) != 2 or len(pred_meta.shape) != 2:
+        # Use SymInt-safe comparison to handle symbolic shapes from Dynamo.
+        node_rank = symint_safe_len(node_meta.shape)
+        pred_rank = symint_safe_len(pred_meta.shape)
+        if node_rank != 2 or pred_rank != 2:
             return False
+
         return (
-            node_meta.shape[0] == pred_meta.shape[0]
-            and node_meta.shape[1] == pred_meta.shape[1]
+            symint_safe_eq(node_meta.shape[0], pred_meta.shape[0])
+            and symint_safe_eq(node_meta.shape[1], pred_meta.shape[1])
         )
 
     # ------------------------------------------------------------------

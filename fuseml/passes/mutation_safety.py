@@ -23,7 +23,7 @@ from typing import Any, Dict, List, Set
 import torch
 
 from fuseml._logging import logger
-from fuseml.passes.graph_cut import TRANSPARENT_OPS
+from fuseml.passes.topology import TRANSPARENT_OPS
 
 
 # ---------------------------------------------------------------------------

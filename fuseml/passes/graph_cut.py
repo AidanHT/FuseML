@@ -25,7 +25,9 @@ from typing import Any, Dict, List, Literal, Set
 import torch
 
 from fuseml._logging import logger
+from fuseml.codegen.kernel_cache import _materialize_ints
 from fuseml.fusion_group import FusionGroup
+from fuseml.passes.topology import TRANSPARENT_OPS
 
 
 # ---------------------------------------------------------------------------
@@ -49,24 +51,6 @@ SUPPORTED_TRITON_OPS: Dict[Any, str] = {
     torch.ops.aten.sum.dim_IntList: "reduction",
     torch.ops.aten.amax.default: "reduction",
     torch.ops.aten.mean.dim: "reduction",
-}
-
-
-# ---------------------------------------------------------------------------
-# Transparent view/metadata ops — absorbed during pattern matching but
-# require no Triton codegen (the epilogue silently skips them)
-# ---------------------------------------------------------------------------
-
-TRANSPARENT_OPS: Set[Any] = {
-    torch.ops.aten.view.default,
-    torch.ops.aten._unsafe_view.default,
-    torch.ops.aten.reshape.default,
-    torch.ops.aten.unsqueeze.default,
-    torch.ops.aten.squeeze.dim,
-    torch.ops.aten.expand.default,
-    torch.ops.aten.permute.default,
-    torch.ops.aten.slice.Tensor,
-    torch.ops.aten.select.int,
 }
 
 
@@ -145,6 +129,9 @@ def _extract_tensor_metadata(node: torch.fx.Node) -> Dict[str, Any]:
     Mirrors :meth:`FuseMLFusionPass._extract_tensor_metadata` so that the
     graph-cut module can rebuild output metadata for truncated sub-groups
     without importing the fusion pass (avoids circular dependencies).
+
+    Uses :func:`_materialize_ints` to safely resolve ``torch.SymInt``
+    dimensions to concrete Python ``int`` values.
     """
     meta = node.meta.get("tensor_meta")
     if meta is None:
@@ -160,8 +147,8 @@ def _extract_tensor_metadata(node: torch.fx.Node) -> Dict[str, Any]:
         return {}
 
     return {
-        "shape": tuple(meta.shape),
-        "stride": tuple(meta.stride),
+        "shape": _materialize_ints(meta.shape),
+        "stride": _materialize_ints(meta.stride),
         "dtype": meta.dtype,
     }
 

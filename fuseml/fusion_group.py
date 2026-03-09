@@ -7,7 +7,7 @@ that will be replaced by a single Triton kernel during graph surgery.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Union
+from typing import Any, Dict, List, Tuple, Union
 
 import torch
 
@@ -75,6 +75,26 @@ class FusionGroup:
     def all_nodes(self) -> List[torch.fx.Node]:
         """Return *base_node* followed by all *fused_nodes*."""
         return [self.base_node] + self.fused_nodes
+
+    @property
+    def op_signature(self) -> Tuple[str, ...]:
+        """Canonical topology tuple built exclusively from ``node.target``.
+
+        Returns a tuple of canonical ATen operator strings for every
+        ``call_function`` node in execution order.  This is completely
+        independent of ``node.name``, placeholder naming conventions
+        (``primals_*``, ``tangents_*``), and any other tracing artifact.
+
+        Two :class:`FusionGroup` instances with identical ``op_signature``
+        represent structurally isomorphic fused operator sequences.
+        """
+        from fuseml.passes.topology import canonicalize_target
+
+        return tuple(
+            canonicalize_target(n.target)
+            for n in self.all_nodes
+            if n.op == "call_function"
+        )
 
     def __len__(self) -> int:
         return 1 + len(self.fused_nodes)
