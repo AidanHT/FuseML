@@ -17,6 +17,9 @@ black>=22.0            # Code formatting
 mypy>=0.990            # Static type checking
 flake8>=4.0            # Linting
 
+# Benchmarking & Visualization
+matplotlib             # Chart generation for benchmark results
+
 # Optional: Performance profiling
 # tensorboard            # Visualization
 # wandb                  # Experiment tracking
