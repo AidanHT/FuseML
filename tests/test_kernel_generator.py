@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from fuseml.codegen.kernel_generator import TensorDescriptor, TritonKernelGenerator
+from fuseml.codegen.kernel_generator import TensorDescriptor, TritonKernelGenerator, next_power_of_2
 
 
 # ---------------------------------------------------------------------------
@@ -1074,3 +1074,51 @@ class TestCompileCache:
         """Fresh generator starts with an empty cache."""
         gen = TritonKernelGenerator()
         assert len(gen._kernel_cache) == 0
+
+
+# ---------------------------------------------------------------------------
+# next_power_of_2 helper
+# ---------------------------------------------------------------------------
+
+@pytest.mark.codegen
+class TestNextPowerOf2:
+    """Verify the power-of-two rounding helper used for BLOCK_SIZE validation."""
+
+    @pytest.mark.parametrize("val, expected", [
+        (1, 1),
+        (2, 2),
+        (3, 4),
+        (4, 4),
+        (5, 8),
+        (7, 8),
+        (8, 8),
+        (31, 32),
+        (32, 32),
+        (33, 64),
+        (64, 64),
+        (100, 128),
+        (127, 128),
+        (128, 128),
+        (129, 256),
+        (255, 256),
+        (256, 256),
+        (1024, 1024),
+        (1025, 2048),
+    ])
+    def test_rounds_up_correctly(self, val, expected):
+        assert next_power_of_2(val) == expected
+
+    def test_result_is_always_power_of_two(self):
+        """Exhaustive check over a wide range."""
+        for v in range(1, 2049):
+            result = next_power_of_2(v)
+            assert result >= v
+            assert result & (result - 1) == 0, f"{v} -> {result} is not a power of 2"
+
+    def test_rejects_zero(self):
+        with pytest.raises(ValueError, match="positive"):
+            next_power_of_2(0)
+
+    def test_rejects_negative(self):
+        with pytest.raises(ValueError, match="positive"):
+            next_power_of_2(-1)

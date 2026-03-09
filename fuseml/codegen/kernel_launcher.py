@@ -18,7 +18,12 @@ from typing import Callable, Sequence
 import torch
 
 from fuseml._logging import logger
-from fuseml.codegen.kernel_generator import TensorDescriptor, _classify, _identify_matmul_operands
+from fuseml.codegen.kernel_generator import (
+    TensorDescriptor,
+    _classify,
+    _identify_matmul_operands,
+    next_power_of_2,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -83,9 +88,12 @@ class KernelLauncher:
         self._input_descriptors = input_descriptors
         self._output_descriptor = output_descriptor
         self._intermediate_descriptors = intermediate_descriptors
-        self._block_size_m = block_size_m
-        self._block_size_n = block_size_n
-        self._block_size_k = block_size_k
+        # Triton requires all BLOCK_SIZE constexprs to be strict powers of
+        # two — invalid values produce PTX compilation failures.  Round up
+        # any non-power-of-two value so callers don't need to worry about it.
+        self._block_size_m = next_power_of_2(block_size_m)
+        self._block_size_n = next_power_of_2(block_size_n)
+        self._block_size_k = next_power_of_2(block_size_k)
         self._reduction_op = reduction_op
 
         # Pre-compute indices so __call__ does not re-scan the list every time.

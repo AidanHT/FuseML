@@ -78,6 +78,35 @@ class TensorDescriptor:
 # Helpers
 # ---------------------------------------------------------------------------
 
+def next_power_of_2(val: int) -> int:
+    """Round *val* up to the next power of two (unchanged if already a power of two).
+
+    Triton requires all ``BLOCK_SIZE_*`` constexpr parameters to be strict
+    powers of two, otherwise the PTX backend will reject the kernel.  Wrap
+    every block-size heuristic through this function before passing values to
+    ``@triton.jit``.
+
+    >>> next_power_of_2(1)
+    1
+    >>> next_power_of_2(31)
+    32
+    >>> next_power_of_2(64)
+    64
+    >>> next_power_of_2(100)
+    128
+    """
+    if val <= 0:
+        raise ValueError(f"Block size must be positive, got {val}")
+    # Bit trick: subtract 1, propagate highest bit, add 1.
+    val -= 1
+    val |= val >> 1
+    val |= val >> 2
+    val |= val >> 4
+    val |= val >> 8
+    val |= val >> 16
+    return val + 1
+
+
 def _stride_param(tensor_name: str, dim_label: str) -> str:
     """Build a stride parameter name.
 

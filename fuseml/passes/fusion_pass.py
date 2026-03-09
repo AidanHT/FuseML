@@ -13,6 +13,7 @@ from torch.fx.passes.shape_prop import ShapeProp
 
 from fuseml._logging import logger
 from fuseml.fusion_group import FusionGroup
+from fuseml.passes.graph_cut import split_fusion_group, validate_fusion_group
 from fuseml.registry import SupportedOpsRegistry, build_default_registry
 
 
@@ -365,6 +366,25 @@ class FuseMLFusionPass:
             ShapeProp(self.graph_module).propagate(*example_inputs)
 
         groups = self._find_fusion_groups()
+
+        # --- Graph-cutting safeguard: validate before surgery -------------
+        # Ensure every node in each group has a known Triton translation.
+        # If an unsupported op slipped through pattern matching, the group
+        # is split so that compilable prefixes are preserved and the rest
+        # falls back to native PyTorch execution.
+        validated: List[FusionGroup] = []
+        for group in groups:
+            segments = split_fusion_group(group)
+            for seg in segments:
+                if seg.kind == "fused" and seg.group is not None:
+                    validated.append(seg.group)
+                else:
+                    logger.info(
+                        "Native fallback for %d node(s): %s",
+                        len(seg.nodes),
+                        [n.name for n in seg.nodes],
+                    )
+        groups = validated
 
         if groups:
             logger.info("Found %d fusion group(s) — applying graph surgery.", len(groups))

@@ -287,3 +287,37 @@ class TestKernelLauncherRepr:
         )
         r = repr(launcher)
         assert "(32,64,16)" in r
+
+
+# ---------------------------------------------------------------------------
+# Power-of-two block size enforcement
+# ---------------------------------------------------------------------------
+
+@pytest.mark.launcher
+class TestBlockSizePowerOfTwo:
+    """Verify KernelLauncher rounds block sizes up to the next power of two."""
+
+    def test_already_power_of_two_unchanged(self, mock_kernel_fn, input_descs, output_desc):
+        launcher = KernelLauncher(
+            mock_kernel_fn, input_descs, output_desc, [], "a", "b",
+            block_size_m=64, block_size_n=128, block_size_k=32,
+        )
+        assert launcher._block_size_m == 64
+        assert launcher._block_size_n == 128
+        assert launcher._block_size_k == 32
+
+    def test_non_power_of_two_rounded_up(self, mock_kernel_fn, input_descs, output_desc):
+        launcher = KernelLauncher(
+            mock_kernel_fn, input_descs, output_desc, [], "a", "b",
+            block_size_m=50, block_size_n=100, block_size_k=24,
+        )
+        assert launcher._block_size_m == 64
+        assert launcher._block_size_n == 128
+        assert launcher._block_size_k == 32
+
+    def test_default_block_sizes_are_power_of_two(self, mock_kernel_fn, input_descs, output_desc):
+        launcher = KernelLauncher(
+            mock_kernel_fn, input_descs, output_desc, [], "a", "b",
+        )
+        for bs in (launcher._block_size_m, launcher._block_size_n, launcher._block_size_k):
+            assert bs & (bs - 1) == 0, f"{bs} is not a power of 2"
