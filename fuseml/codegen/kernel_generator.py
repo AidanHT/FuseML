@@ -58,6 +58,40 @@ _IN_PLACE_EPILOGUE_OPS: frozenset = frozenset({
 
 
 # ---------------------------------------------------------------------------
+# Autotuning — candidate tile sizes, warp counts, and SRAM budget
+# ---------------------------------------------------------------------------
+
+# Bytes-per-element for SRAM footprint estimation.
+_DTYPE_BYTES: dict[torch.dtype, int] = {
+    torch.float32: 4,
+    torch.float16: 2,
+    torch.bfloat16: 2,
+}
+
+# Strict 48 KB SRAM budget — safe minimum across SM70 (Volta), SM80
+# (Ampere), and SM89 (Ada Lovelace).  Configs whose shared-memory
+# footprint exceeds this are pruned before writing the @triton.autotune
+# decorator, preventing "Out of Shared Memory" PTX failures at runtime.
+_AUTOTUNE_SRAM_BUDGET_BYTES: int = 48 * 1024
+
+# Candidate tile dimensions for autotune config generation.
+_AUTOTUNE_BLOCK_M_CHOICES: tuple[int, ...] = (32, 64, 128)
+_AUTOTUNE_BLOCK_N_CHOICES: tuple[int, ...] = (32, 64, 128)
+_AUTOTUNE_BLOCK_K_CHOICES: tuple[int, ...] = (32, 64)
+
+# Standard warp counts and software-pipelining depths.
+_AUTOTUNE_NUM_WARPS_CHOICES: tuple[int, ...] = (4, 8)
+_AUTOTUNE_NUM_STAGES_CHOICES: tuple[int, ...] = (2, 3, 4)
+
+# Reduction-specialised warp counts — higher counts saturate the SMs
+# during tl.atomic_add / tl.atomic_max cross-thread synchronisation.
+_AUTOTUNE_REDUCTION_NUM_WARPS_CHOICES: tuple[int, ...] = (4, 8, 16)
+
+# Default L2 swizzle group width used in all autotune configs.
+_AUTOTUNE_GROUP_SIZE_M: int = 8
+
+
+# ---------------------------------------------------------------------------
 # Reduction info — tracks what happened to acc during the epilogue
 # ---------------------------------------------------------------------------
 
@@ -240,28 +274,215 @@ class TritonKernelGenerator:
         self._last_reduction: ReductionInfo | None = None
 
     # ------------------------------------------------------------------
+    # Autotuning — SRAM-aware config generation
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _compute_sram_footprint(
+        block_m: int,
+        block_n: int,
+        block_k: int,
+        dtype_bytes: int,
+        num_stages: int,
+    ) -> int:
+        """Estimate shared-memory bytes for one GEMM config.
+
+        Each software-pipeline stage holds one A-tile and one B-tile in
+        shared memory simultaneously::
+
+            per_stage = (BLOCK_M × BLOCK_K + BLOCK_K × BLOCK_N) × dtype_bytes
+            total     = num_stages × per_stage
+
+        Returns the total shared-memory footprint in bytes.
+        """
+        a_tile = block_m * block_k * dtype_bytes
+        b_tile = block_k * block_n * dtype_bytes
+        return num_stages * (a_tile + b_tile)
+
+    @staticmethod
+    def _build_autotune_configs(
+        dtype: torch.dtype,
+        has_reduction: bool = False,
+    ) -> list[dict]:
+        """Generate the full Cartesian product of candidate autotune configs.
+
+        Each config is a dict with keys ``BLOCK_SIZE_M``, ``BLOCK_SIZE_N``,
+        ``BLOCK_SIZE_K``, ``GROUP_SIZE_M``, ``num_warps``, ``num_stages``.
+
+        When *has_reduction* is ``True``, the warp-count candidates are
+        expanded to include higher values (up to 16) that better saturate
+        SMs during ``tl.atomic_add`` / ``tl.atomic_max`` synchronisation.
+        """
+        warp_choices = (
+            _AUTOTUNE_REDUCTION_NUM_WARPS_CHOICES
+            if has_reduction
+            else _AUTOTUNE_NUM_WARPS_CHOICES
+        )
+        configs: list[dict] = []
+        for bm in _AUTOTUNE_BLOCK_M_CHOICES:
+            for bn in _AUTOTUNE_BLOCK_N_CHOICES:
+                for bk in _AUTOTUNE_BLOCK_K_CHOICES:
+                    for nw in warp_choices:
+                        for ns in _AUTOTUNE_NUM_STAGES_CHOICES:
+                            configs.append({
+                                "BLOCK_SIZE_M": bm,
+                                "BLOCK_SIZE_N": bn,
+                                "BLOCK_SIZE_K": bk,
+                                "GROUP_SIZE_M": _AUTOTUNE_GROUP_SIZE_M,
+                                "num_warps": nw,
+                                "num_stages": ns,
+                            })
+        return configs
+
+    @staticmethod
+    def _prune_configs_by_sram(
+        configs: list[dict],
+        dtype: torch.dtype,
+        sram_budget: int = _AUTOTUNE_SRAM_BUDGET_BYTES,
+    ) -> list[dict]:
+        """Remove configs whose shared-memory footprint exceeds the SRAM budget.
+
+        Uses :meth:`_compute_sram_footprint` to estimate the shared-memory
+        requirement for each candidate config.  Configs that exceed
+        *sram_budget* are silently dropped — the surviving list is
+        guaranteed to fit within the SM's shared-memory capacity.
+        """
+        dtype_bytes = _DTYPE_BYTES.get(dtype, 4)
+        survivors: list[dict] = []
+        for cfg in configs:
+            footprint = TritonKernelGenerator._compute_sram_footprint(
+                cfg["BLOCK_SIZE_M"],
+                cfg["BLOCK_SIZE_N"],
+                cfg["BLOCK_SIZE_K"],
+                dtype_bytes,
+                cfg["num_stages"],
+            )
+            if footprint <= sram_budget:
+                survivors.append(cfg)
+        logger.debug(
+            "SRAM pruning — %d / %d configs survive (budget=%d bytes, dtype=%s)",
+            len(survivors), len(configs), sram_budget, dtype,
+        )
+        return survivors
+
+    @staticmethod
+    def _section_autotune_decorator(
+        configs: list[dict],
+    ) -> str:
+        """Format the ``@triton.autotune(...)`` decorator from pruned configs.
+
+        The decorator is placed *above* ``@triton.jit`` so that Triton's
+        autotune framework selects the optimal tile size for each unique
+        (M, N, K) combination at runtime.  ``key=['M', 'N', 'K']``
+        ensures re-tuning when the dynamic batch dimensions change.
+        """
+        lines: list[str] = ["@triton.autotune("]
+        lines.append("    configs=[")
+        for cfg in configs:
+            meta = {
+                "BLOCK_SIZE_M": cfg["BLOCK_SIZE_M"],
+                "BLOCK_SIZE_N": cfg["BLOCK_SIZE_N"],
+                "BLOCK_SIZE_K": cfg["BLOCK_SIZE_K"],
+                "GROUP_SIZE_M": cfg["GROUP_SIZE_M"],
+            }
+            nw = cfg["num_warps"]
+            ns = cfg["num_stages"]
+            lines.append(
+                f"        triton.Config({meta}, num_warps={nw}, num_stages={ns}),"
+            )
+        lines.append("    ],")
+        lines.append("    key=['M', 'N', 'K'],")
+        lines.append(")")
+        return "\n".join(lines)
+
+    # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+
+    def generate_autotune_configs(
+        self,
+        input_tensors: list[TensorDescriptor],
+        output_tensor: TensorDescriptor,
+        has_reduction: bool = False,
+    ) -> str:
+        """Return a ``@triton.autotune(...)`` decorator string with SRAM-pruned configs.
+
+        Generates a Cartesian product of candidate tile sizes, warp counts,
+        and pipeline stages, then prunes any config whose shared-memory
+        footprint exceeds FuseML's rigid 48 KB SRAM budget.  The surviving
+        configs are formatted as ``triton.Config(...)`` objects inside the
+        decorator.
+
+        When *has_reduction* is ``True``, higher ``num_warps`` values (up
+        to 16) are included to saturate SMs during the
+        ``tl.atomic_add`` / ``tl.atomic_max`` synchronisation phases that
+        follow reduction epilogues.
+
+        ``M``, ``N``, ``K`` are listed as ``key`` meta-parameters so Triton
+        re-tunes when dynamic batch sizes change.
+
+        Parameters
+        ----------
+        input_tensors :
+            Same descriptor list as :meth:`generate_signature_and_pointers`.
+            Used to determine the operand dtype for SRAM footprint estimation.
+        output_tensor :
+            Descriptor for the output tensor.
+        has_reduction :
+            Whether the fusion group ends in a reduction op
+            (``sum.dim_IntList``, ``amax``, ``mean.dim``).
+
+        Returns
+        -------
+        str
+            The ``@triton.autotune(...)`` decorator, ready to be prepended
+            before ``@triton.jit`` in the generated kernel source.
+        """
+        unique = _deduplicate(input_tensors)
+        matrices, _ = _classify(unique)
+
+        # Use the left operand's dtype for SRAM estimation — the K-loop
+        # loads A and B tiles into shared memory at their native precision.
+        if len(matrices) >= 2:
+            left, _ = _identify_matmul_operands(matrices)
+            operand_dtype = left.dtype
+        else:
+            operand_dtype = output_tensor.dtype
+
+        all_configs = self._build_autotune_configs(operand_dtype, has_reduction)
+        pruned = self._prune_configs_by_sram(all_configs, operand_dtype)
+
+        logger.debug(
+            "Autotune config generation — %d configs after SRAM pruning "
+            "(dtype=%s, reduction=%s)",
+            len(pruned), operand_dtype, has_reduction,
+        )
+
+        return self._section_autotune_decorator(pruned)
 
     def generate_signature_and_pointers(
         self,
         input_tensors: list[TensorDescriptor],
         output_tensor: TensorDescriptor,
         intermediate_tensors: list[TensorDescriptor] | None = None,
+        autotune: bool = False,
+        has_reduction: bool = False,
     ) -> str:
         """Return a Triton kernel source string (no compute loop).
 
         The returned string contains, in order:
 
-        1. ``@triton.jit`` decorator.
-        2. ``def fused_kernel(...)`` with dynamically generated pointer,
+        1. When *autotune* is ``True``, a ``@triton.autotune(...)``
+           decorator with SRAM-pruned configs and ``key=['M', 'N', 'K']``.
+        2. ``@triton.jit`` decorator.
+        3. ``def fused_kernel(...)`` with dynamically generated pointer,
            dimension, stride, and ``tl.constexpr`` block-size parameters.
            Pointers and strides follow the caller-supplied input order.
            When *intermediate_tensors* are provided, their output pointers
            and M×N strides are appended after the primary output parameters.
-        3. ``tl.program_id`` block-offset computation for the M and N
+        4. ``tl.program_id`` block-offset computation for the M and N
            dimensions.
-        4. Initial pointer arithmetic for every input tensor, the output
+        5. Initial pointer arithmetic for every input tensor, the output
            tensor, and each intermediate output tensor, in order.
 
         Parameters
@@ -280,6 +501,13 @@ class TritonKernelGenerator:
             output pointer + M×N strides in the kernel signature and its
             own ``tl.store`` in the epilogue.  Pass ``None`` or an empty
             list when no intermediate stores are required.
+        autotune :
+            When ``True``, prepend a ``@triton.autotune(...)`` decorator
+            with SRAM-pruned configs before ``@triton.jit``.
+        has_reduction :
+            When ``True`` (and *autotune* is also ``True``), include
+            higher ``num_warps`` candidates (up to 16) to saturate SMs
+            during reduction synchronisation phases.
 
         Raises
         ------
@@ -320,13 +548,18 @@ class TritonKernelGenerator:
             elif len(t.shape) == 1:
                 dim_labels[t.name] = (_vector_dim(t, M, N),)
 
-        sections = [
+        sections: list[str] = []
+        if autotune:
+            sections.append(
+                self.generate_autotune_configs(input_tensors, output_tensor, has_reduction)
+            )
+        sections.extend([
             self._section_decorator(),
             self._section_function_def(unique, output_tensor, dim_labels, intermediate_tensors),
             self._section_docstring(),
             self._section_program_ids(),
             self._section_block_offsets(),
-        ]
+        ])
         # Pointer arithmetic — iterate inputs in caller-supplied order.
         for t in unique:
             labels = dim_labels[t.name]

@@ -145,6 +145,12 @@ class KernelLauncher:
         so that ``triton.CompilationError``, CUDA OOM, and PTX assembly
         failures fall back deterministically to the original unfused
         computation.  When ``None``, errors propagate as before.
+    is_autotuned :
+        When ``True``, the kernel has a ``@triton.autotune`` decorator
+        that manages tile sizes, warp counts, and pipeline stages
+        automatically.  The launcher skips its own heuristic tuning and
+        SRAM enforcement, and does not pass block-size / num_warps /
+        num_stages kwargs — the autotuner selects these at runtime.
     """
 
     def __init__(
@@ -161,6 +167,7 @@ class KernelLauncher:
         group_size_m: int = _DEFAULT_GROUP_SIZE_M,
         reduction_op: str | None = None,
         eager_fn: Callable[..., torch.Tensor] | None = None,
+        is_autotuned: bool = False,
     ) -> None:
         # FX graph.call_function() uses target.__name__ to generate node names.
         self.__name__ = "fuseml_fused_kernel"
@@ -176,6 +183,7 @@ class KernelLauncher:
         self._block_size_k = next_power_of_2(block_size_k)
         self._group_size_m = group_size_m
         self._reduction_op = reduction_op
+        self._is_autotuned = is_autotuned
 
         # Pre-compute indices so __call__ does not re-scan the list every time.
         input_names = [d.name for d in input_descriptors]
@@ -451,31 +459,42 @@ class KernelLauncher:
         out_dtype = self._output_descriptor.dtype
 
         # ── Heuristic launch parameters ──────────────────────────────
-        num_warps = self._select_num_warps(M, N, K, out_dtype)
-        num_stages = self._select_num_stages(M, N, K, out_dtype)
+        # When the kernel is autotuned, block sizes, warp counts, and
+        # pipeline stages are embedded in the @triton.autotune configs
+        # and selected automatically at runtime — skip static heuristics.
+        if not self._is_autotuned:
+            num_warps = self._select_num_warps(M, N, K, out_dtype)
+            num_stages = self._select_num_stages(M, N, K, out_dtype)
 
-        # ── SRAM capacity enforcement ─────────────────────────────────
-        # Downscale block dims if the output tile exceeds shared memory.
-        block_m, block_n = self._enforce_sram_capacity(
-            self._block_size_m, self._block_size_n, out_dtype,
-        )
-        block_k = self._block_size_k
+            # ── SRAM capacity enforcement ─────────────────────────────
+            # Downscale block dims if the output tile exceeds shared memory.
+            block_m, block_n = self._enforce_sram_capacity(
+                self._block_size_m, self._block_size_n, out_dtype,
+            )
+            block_k = self._block_size_k
 
-        # If SRAM enforcement reduced the tile, compensate with +1 stage
-        # to improve latency hiding (more loop iterations need overlap).
-        if block_m < self._block_size_m or block_n < self._block_size_n:
-            num_stages = min(num_stages + 1, 4)
+            # If SRAM enforcement reduced the tile, compensate with +1
+            # stage to improve latency hiding (more loop iterations).
+            if block_m < self._block_size_m or block_n < self._block_size_n:
+                num_stages = min(num_stages + 1, 4)
 
         # ── CUDA stream synchronization ───────────────────────────────
         # Launch on PyTorch's current stream to avoid cross-stream races.
         stream_handle = self._get_launch_stream(device)
 
-        logger.debug(
-            "KernelLauncher dispatch — M=%d, N=%d, K=%d, device=%s, "
-            "dtype=%s, num_warps=%d, num_stages=%d, block=(%d,%d,%d)",
-            M, N, K, device, out_dtype, num_warps, num_stages,
-            block_m, block_n, block_k,
-        )
+        if self._is_autotuned:
+            logger.debug(
+                "KernelLauncher dispatch (autotuned) — M=%d, N=%d, K=%d, "
+                "device=%s, dtype=%s",
+                M, N, K, device, out_dtype,
+            )
+        else:
+            logger.debug(
+                "KernelLauncher dispatch — M=%d, N=%d, K=%d, device=%s, "
+                "dtype=%s, num_warps=%d, num_stages=%d, block=(%d,%d,%d)",
+                M, N, K, device, out_dtype, num_warps, num_stages,
+                block_m, block_n, block_k,
+            )
 
         # ── Output allocation ─────────────────────────────────────────
         # Zero-initialise when atomic additions are used in the kernel
@@ -546,17 +565,21 @@ class KernelLauncher:
         # M, N, K are passed as positional args so the generated kernel
         # can use them in boundary masks:
         #   mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
-        # num_warps and num_stages are Triton launch parameters that
-        # control warp scheduling and software pipelining depth.
-        # stream= ensures execution on PyTorch's current CUDA stream.
-        launch_kwargs: dict = {
-            "BLOCK_SIZE_M": block_m,
-            "BLOCK_SIZE_N": block_n,
-            "BLOCK_SIZE_K": block_k,
-            "GROUP_SIZE_M": self._group_size_m,
-            "num_warps": num_warps,
-            "num_stages": num_stages,
-        }
+        #
+        # When the kernel is autotuned, block sizes and tuning params
+        # are managed by @triton.autotune — we pass an empty kwargs dict
+        # so the autotuner selects the optimal config at runtime.
+        if self._is_autotuned:
+            launch_kwargs: dict = {}
+        else:
+            launch_kwargs = {
+                "BLOCK_SIZE_M": block_m,
+                "BLOCK_SIZE_N": block_n,
+                "BLOCK_SIZE_K": block_k,
+                "GROUP_SIZE_M": self._group_size_m,
+                "num_warps": num_warps,
+                "num_stages": num_stages,
+            }
         # Note: Triton 3.x deprecated the ``stream=`` kwarg — the kernel
         # automatically uses the current CUDA stream.
 
@@ -607,11 +630,12 @@ class KernelLauncher:
         in_names = [d.name for d in self._input_descriptors]
         intm_names = [d.name for d in self._intermediate_descriptors]
         reduction = f", reduction={self._reduction_op!r}" if self._reduction_op else ""
+        tuning = ", autotuned=True" if self._is_autotuned else ""
         return (
             f"KernelLauncher("
             f"inputs={in_names}, "
             f"output={self._output_descriptor.name!r}, "
             f"intermediates={intm_names}, "
             f"block=({self._block_size_m},{self._block_size_n},{self._block_size_k})"
-            f"{reduction})"
+            f"{reduction}{tuning})"
         )
