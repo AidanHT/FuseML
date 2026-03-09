@@ -65,6 +65,8 @@ def _make_fingerprint(**overrides) -> TensorFingerprint:
         storage_offset=0,
         aligned=True,
         dtype="torch.float32",
+        broadcast_dims=(False, False),
+        tensor_subclass="Tensor",
     )
     defaults.update(overrides)
     return TensorFingerprint(**defaults)
@@ -624,3 +626,193 @@ class TestCompilerCacheAttribute:
         compiler = FuseMLCompiler()
         assert isinstance(compiler._cache, KernelCache)
         assert compiler._cache.size == 0
+
+
+# ======================================================================
+# SymInt unpacking
+# ======================================================================
+
+class _FakeSymInt:
+    """Mock SymInt-like wrapper that stores an int but is not ``int``."""
+
+    def __init__(self, val: int) -> None:
+        self._val = val
+
+    def __int__(self) -> int:
+        return self._val
+
+    def __index__(self) -> int:
+        return self._val
+
+    def __repr__(self) -> str:
+        return f"SymInt({self._val})"
+
+
+@pytest.mark.cache
+class TestSymIntUnpacking:
+    """SymInt values must be force-evaluated to concrete int in fingerprints."""
+
+    def test_from_tensor_resolves_symint_shape(self):
+        t = torch.randn(4, 128)
+        fp = TensorFingerprint.from_tensor(t)
+        # All shape/stride elements must be plain int.
+        assert all(type(s) is int for s in fp.shape)
+        assert all(type(s) is int for s in fp.stride)
+        assert type(fp.storage_offset) is int
+
+    def test_from_node_resolves_symint_shape(self):
+        """SymInt-like values in tensor_meta.shape are resolved to int."""
+        sym_shape = (_FakeSymInt(8), _FakeSymInt(64))
+        sym_stride = (_FakeSymInt(64), _FakeSymInt(1))
+        meta = SimpleNamespace(shape=sym_shape, stride=sym_stride, dtype=torch.float32)
+        node = SimpleNamespace(name="x", meta={"tensor_meta": meta})
+
+        fp = TensorFingerprint.from_node(node)
+        assert fp is not None
+        assert fp.shape == (8, 64)
+        assert fp.stride == (64, 1)
+        assert all(type(s) is int for s in fp.shape)
+        assert all(type(s) is int for s in fp.stride)
+
+    def test_symint_fingerprints_equal_and_hashable(self):
+        """Fingerprints from SymInt-wrapped and plain-int values must match."""
+        fp_plain = _make_fingerprint(shape=(8, 64), stride=(64, 1))
+
+        sym_shape = (_FakeSymInt(8), _FakeSymInt(64))
+        sym_stride = (_FakeSymInt(64), _FakeSymInt(1))
+        meta = SimpleNamespace(shape=sym_shape, stride=sym_stride, dtype=torch.float32)
+        node = SimpleNamespace(name="x", meta={"tensor_meta": meta})
+        fp_sym = TensorFingerprint.from_node(node)
+
+        assert fp_sym == fp_plain
+        assert hash(fp_sym) == hash(fp_plain)
+
+    def test_symint_cache_key_round_trip(self):
+        """Store with SymInt-derived key, lookup with plain-int key — must hit."""
+        cache = KernelCache()
+
+        # Build fingerprint from SymInt-like node metadata.
+        sym_shape = (_FakeSymInt(4), _FakeSymInt(128))
+        sym_stride = (_FakeSymInt(128), _FakeSymInt(1))
+        meta = SimpleNamespace(shape=sym_shape, stride=sym_stride, dtype=torch.float32)
+        node = SimpleNamespace(name="x", meta={"tensor_meta": meta})
+        fp_sym = TensorFingerprint.from_node(node)
+
+        key_sym = _make_key(input_fingerprints=(fp_sym,))
+        cache.store(key_sym, "sym_launcher")
+
+        # Lookup with a plain-int key that has the same concrete values.
+        fp_plain = _make_fingerprint(shape=(4, 128), stride=(128, 1))
+        key_plain = _make_key(input_fingerprints=(fp_plain,))
+        assert cache.lookup(key_plain) == "sym_launcher"
+
+
+# ======================================================================
+# Subclass awareness — Tensor vs Parameter
+# ======================================================================
+
+@pytest.mark.cache
+class TestSubclassAwareness:
+    """Cache must distinguish torch.Tensor from nn.Parameter."""
+
+    def test_tensor_subclass_plain(self):
+        t = torch.randn(4, 4)
+        fp = TensorFingerprint.from_tensor(t)
+        assert fp.tensor_subclass == "Tensor"
+
+    def test_tensor_subclass_parameter(self):
+        p = torch.nn.Parameter(torch.randn(4, 4))
+        fp = TensorFingerprint.from_tensor(p)
+        assert fp.tensor_subclass == "Parameter"
+
+    def test_subclass_differentiates_fingerprints(self):
+        fp_tensor = _make_fingerprint(tensor_subclass="Tensor")
+        fp_param = _make_fingerprint(tensor_subclass="Parameter")
+        assert fp_tensor != fp_param
+
+    def test_subclass_differentiates_cache_keys(self):
+        cache = KernelCache()
+
+        fp_tensor = _make_fingerprint(tensor_subclass="Tensor")
+        fp_param = _make_fingerprint(tensor_subclass="Parameter")
+
+        k_tensor = _make_key(input_fingerprints=(fp_tensor,))
+        k_param = _make_key(input_fingerprints=(fp_param,))
+
+        cache.store(k_tensor, "tensor_launcher")
+        assert cache.lookup(k_param) is None  # must miss
+        assert cache.misses == 1
+
+    def test_from_node_defaults_to_tensor(self):
+        node = _make_node("x", shape=(8, 64))
+        fp = TensorFingerprint.from_node(node)
+        assert fp is not None
+        assert fp.tensor_subclass == "Tensor"
+
+
+# ======================================================================
+# Broadcast stride differentiation
+# ======================================================================
+
+@pytest.mark.cache
+class TestBroadcastStrideDifferentiation:
+    """Cache must track broadcast (stride-0) dimensions explicitly."""
+
+    def test_broadcast_dims_from_expanded_tensor(self):
+        base = torch.randn(1, 64)
+        expanded = base.expand(128, 64)
+        fp = TensorFingerprint.from_tensor(expanded)
+        assert fp.broadcast_dims == (True, False)
+        assert fp.shape == (128, 64)
+        assert fp.stride[0] == 0
+
+    def test_broadcast_dims_contiguous(self):
+        t = torch.randn(4, 128)
+        fp = TensorFingerprint.from_tensor(t)
+        assert fp.broadcast_dims == (False, False)
+
+    def test_broadcast_vs_nonbroadcast_not_equal(self):
+        fp_normal = _make_fingerprint(
+            shape=(128, 64), stride=(64, 1),
+            broadcast_dims=(False, False),
+        )
+        fp_broadcast = _make_fingerprint(
+            shape=(128, 64), stride=(0, 1),
+            broadcast_dims=(True, False),
+        )
+        assert fp_normal != fp_broadcast
+
+    def test_broadcast_pattern_differentiates_cache_keys(self):
+        cache = KernelCache()
+
+        fp_normal = _make_fingerprint(
+            shape=(128, 64), stride=(64, 1),
+            broadcast_dims=(False, False),
+        )
+        fp_broadcast = _make_fingerprint(
+            shape=(128, 64), stride=(0, 1),
+            broadcast_dims=(True, False),
+        )
+
+        k_normal = _make_key(input_fingerprints=(fp_normal,))
+        k_broadcast = _make_key(input_fingerprints=(fp_broadcast,))
+
+        cache.store(k_normal, "normal_launcher")
+        assert cache.lookup(k_broadcast) is None  # must miss
+        assert cache.misses == 1
+
+    def test_1d_bias_no_broadcast(self):
+        t = torch.randn(64)
+        fp = TensorFingerprint.from_tensor(t)
+        assert fp.broadcast_dims == (False,)
+        assert fp.shape == (64,)
+
+    def test_broadcast_dims_from_node_metadata(self):
+        """Stride-0 in node metadata produces broadcast_dims=(True, False)."""
+        meta = SimpleNamespace(
+            shape=(128, 64), stride=(0, 1), dtype=torch.float32,
+        )
+        node = SimpleNamespace(name="x", meta={"tensor_meta": meta})
+        fp = TensorFingerprint.from_node(node)
+        assert fp is not None
+        assert fp.broadcast_dims == (True, False)

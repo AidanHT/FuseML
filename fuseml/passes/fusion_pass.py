@@ -12,6 +12,7 @@ import torch
 from torch.fx.passes.shape_prop import ShapeProp
 
 from fuseml._logging import logger
+from fuseml.codegen.kernel_cache import _materialize_ints
 from fuseml.fusion_group import FusionGroup
 from fuseml.passes.graph_cut import split_fusion_group, validate_fusion_group
 from fuseml.registry import SupportedOpsRegistry, build_default_registry
@@ -247,8 +248,8 @@ class FuseMLFusionPass:
             return {}
 
         return {
-            "shape": tuple(meta.shape),
-            "stride": tuple(meta.stride),
+            "shape": _materialize_ints(meta.shape),
+            "stride": _materialize_ints(meta.stride),
             "dtype": meta.dtype,
         }
 

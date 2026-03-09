@@ -35,6 +35,26 @@ from fuseml._logging import logger
 
 
 # ---------------------------------------------------------------------------
+# SymInt materialisation helpers
+# ---------------------------------------------------------------------------
+
+def _materialize_ints(vals) -> tuple[int, ...]:
+    """Force-evaluate every element to a concrete Python ``int``.
+
+    PyTorch 2.0+ may represent dimensions as ``torch.SymInt`` in FX graphs
+    with dynamic shapes.  ``SymInt`` objects are not reliably hashable with
+    ``hash()`` and cannot be stored in frozen-dataclass fields that expect
+    ``int``.  This helper resolves them eagerly.
+    """
+    return tuple(int(v) for v in vals)
+
+
+def _materialize_int(val) -> int:
+    """Force-evaluate a single value (possibly ``torch.SymInt``) to ``int``."""
+    return int(val)
+
+
+# ---------------------------------------------------------------------------
 # TensorFingerprint — per-tensor memory layout descriptor
 # ---------------------------------------------------------------------------
 
@@ -54,6 +74,15 @@ class TensorFingerprint:
       vector widths), which would cause GPU memory faults.
     - **dtype**: the scalar type, stored as a string for deterministic
       hashing across sessions.
+    - **broadcast_dims**: a boolean tuple recording which dimensions have
+      stride 0 (the standard convention for broadcast/expanded dimensions).
+      A ``torch.Tensor`` produced by ``.expand()`` has stride 0 on the
+      expanded axis; this must be part of the cache key so that kernels
+      compiled for one broadcast pattern are never dispatched on another.
+    - **tensor_subclass**: the type name of the tensor (e.g. ``"Tensor"``
+      or ``"Parameter"``).  ``nn.Parameter`` and ``torch.Tensor`` behave
+      differently in autograd lifecycle; mixing them in the cache can
+      cause lifecycle scoping bugs.
     """
 
     shape: Tuple[int, ...]
@@ -61,6 +90,8 @@ class TensorFingerprint:
     storage_offset: int
     aligned: bool
     dtype: str  # str(torch.dtype) for deterministic hashing
+    broadcast_dims: Tuple[bool, ...] = ()
+    tensor_subclass: str = "Tensor"
 
     # ── Deterministic hash and equality ────────────────────────────────
 
@@ -78,6 +109,8 @@ class TensorFingerprint:
             self.storage_offset,
             self.aligned,
             self.dtype,
+            self.broadcast_dims,
+            self.tensor_subclass,
         ))
 
     def __eq__(self, other: object) -> bool:
@@ -91,6 +124,8 @@ class TensorFingerprint:
             and self.storage_offset == other.storage_offset
             and self.aligned == other.aligned
             and self.dtype == other.dtype
+            and self.broadcast_dims == other.broadcast_dims
+            and self.tensor_subclass == other.tensor_subclass
         )
 
     # ── Factory methods ────────────────────────────────────────────────
@@ -103,12 +138,15 @@ class TensorFingerprint:
         ATen storage — shape, stride, storage_offset, pointer alignment,
         and dtype.
         """
+        stride = _materialize_ints(t.stride())
         return cls(
-            shape=tuple(t.shape),
-            stride=tuple(t.stride()),
-            storage_offset=t.storage_offset(),
+            shape=_materialize_ints(t.shape),
+            stride=stride,
+            storage_offset=_materialize_int(t.storage_offset()),
             aligned=(t.data_ptr() % 16 == 0),
             dtype=str(t.dtype),
+            broadcast_dims=tuple(s == 0 for s in stride),
+            tensor_subclass=type(t).__name__,
         )
 
     @classmethod
@@ -134,33 +172,36 @@ class TensorFingerprint:
                     meta = None
 
         if meta is not None and hasattr(meta, "shape"):
+            stride = _materialize_ints(meta.stride)
             return cls(
-                shape=tuple(meta.shape),
-                stride=tuple(meta.stride),
+                shape=_materialize_ints(meta.shape),
+                stride=stride,
                 storage_offset=0,
                 aligned=True,
                 dtype=str(meta.dtype),
+                broadcast_dims=tuple(s == 0 for s in stride),
             )
 
         # Fall back to FakeTensor stored by torch.compile.
         val = node.meta.get("val")
         if val is not None and hasattr(val, "shape"):
             stride = (
-                tuple(val.stride())
+                _materialize_ints(val.stride())
                 if callable(getattr(val, "stride", None))
                 else (1,) * len(val.shape)
             )
             offset = (
-                val.storage_offset()
+                _materialize_int(val.storage_offset())
                 if callable(getattr(val, "storage_offset", None))
                 else 0
             )
             return cls(
-                shape=tuple(val.shape),
+                shape=_materialize_ints(val.shape),
                 stride=stride,
                 storage_offset=offset,
                 aligned=True,  # FakeTensors don't have a real data_ptr
                 dtype=str(val.dtype),
+                broadcast_dims=tuple(s == 0 for s in stride),
             )
 
         return None
@@ -221,6 +262,8 @@ class KernelCacheKey:
             parts.append(fp.storage_offset)
             parts.append(fp.aligned)
             parts.append(fp.dtype)
+            parts.append(fp.broadcast_dims)
+            parts.append(fp.tensor_subclass)
         parts.append(self.output_shape)
         parts.append(self.output_dtype)
         parts.append(self.device)

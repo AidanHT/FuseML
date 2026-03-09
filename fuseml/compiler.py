@@ -29,6 +29,7 @@ from fuseml._logging import logger
 from fuseml.codegen.kernel_cache import (
     KernelCache,
     KernelCacheKey,
+    _materialize_ints,
     build_cache_key,
 )
 from fuseml.codegen.kernel_generator import (
@@ -77,18 +78,18 @@ def _node_to_descriptor(node: torch.fx.Node) -> TensorDescriptor | None:
                 tensor_meta = None
 
     if tensor_meta is not None and hasattr(tensor_meta, "shape"):
-        shape = tuple(tensor_meta.shape)
+        shape = _materialize_ints(tensor_meta.shape)
         # TensorMetadata stores stride as a plain tuple.
-        stride = tuple(tensor_meta.stride)
+        stride = _materialize_ints(tensor_meta.stride)
         dtype = tensor_meta.dtype
         return TensorDescriptor(name=node.name, shape=shape, stride=stride, dtype=dtype)
 
     # Fall back to FakeTensor stored by torch.compile.
     val = node.meta.get("val")
     if val is not None and hasattr(val, "shape"):
-        shape = tuple(val.shape)
+        shape = _materialize_ints(val.shape)
         # FakeTensor exposes stride() as a method.
-        stride = tuple(val.stride()) if callable(getattr(val, "stride", None)) else (1,) * len(shape)
+        stride = _materialize_ints(val.stride()) if callable(getattr(val, "stride", None)) else (1,) * len(shape)
         dtype = val.dtype
         return TensorDescriptor(name=node.name, shape=shape, stride=stride, dtype=dtype)
 
@@ -105,8 +106,8 @@ def _descriptor_from_metadata(name: str, meta: dict) -> TensorDescriptor | None:
         return None
     return TensorDescriptor(
         name=name,
-        shape=tuple(meta["shape"]),
-        stride=tuple(meta["stride"]),
+        shape=_materialize_ints(meta["shape"]),
+        stride=_materialize_ints(meta["stride"]),
         dtype=meta["dtype"],
     )
 
