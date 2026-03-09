@@ -188,7 +188,8 @@ class TestEpilogueSum:
         assert "tl.sum(acc, axis=0)" in code
         assert "mask=offs_n < N" in code
 
-    def test_sum_comment_mentions_synchronization(self, gen, output_reduced_m):
+    def test_sum_comment_mentions_two_stage(self, gen, output_reduced_m):
+        """Comment must describe the two-stage reduction strategy."""
         sum_node = _make_node(
             target=torch.ops.aten.sum.dim_IntList,
             name="sum_out",
@@ -197,7 +198,7 @@ class TestEpilogueSum:
         code = gen.generate_epilogue(
             [sum_node], output_descriptor=output_reduced_m,
         )
-        assert "cross-thread" in code.lower() or "synchronization" in code.lower()
+        assert "two-stage" in code.lower() or "block-local" in code.lower()
 
 
 # ---------------------------------------------------------------------------
@@ -297,6 +298,49 @@ class TestEpiloqueMean:
         )
         assert gen._last_reduction is not None
         assert gen._last_reduction.op == "mean"
+
+    def test_mean_keeps_fp32_accumulation(self, gen, output_reduced_m):
+        """Mean partial sums must stay in FP32 — no .to(triton_dtype) cast."""
+        mean_node = _make_node(
+            target=torch.ops.aten.mean.dim,
+            name="mean_out",
+            args=(_make_node(name="prev"), [-1], False),
+        )
+        code = gen.generate_epilogue(
+            [mean_node], output_descriptor=output_reduced_m,
+        )
+        # Must NOT cast before atomic — accumulate in FP32
+        assert ".to(tl.float32)" not in code
+        assert ".to(tl.float16)" not in code
+        assert ".to(tl.bfloat16)" not in code
+        # Must have "FP32" or "fp32" in comments explaining the strategy
+        assert "fp32" in code.lower()
+
+    def test_mean_bf16_output_still_fp32_accumulation(self, gen):
+        """Even with bf16 output, mean partial sums must be FP32."""
+        out = TensorDescriptor("out", (128,), (1,), torch.bfloat16)
+        mean_node = _make_node(
+            target=torch.ops.aten.mean.dim,
+            name="mean_out",
+            args=(_make_node(name="prev"), [-1], False),
+        )
+        code = gen.generate_epilogue([mean_node], output_descriptor=out)
+        # No cast to bf16 before atomic — stays FP32
+        assert ".to(tl.bfloat16)" not in code
+        assert "tl.sum(acc, axis=1)" in code
+        assert "tl.atomic_add(out_ptrs," in code
+
+    def test_mean_comment_mentions_two_stage(self, gen, output_reduced_m):
+        """Mean comment must describe the two-stage strategy."""
+        mean_node = _make_node(
+            target=torch.ops.aten.mean.dim,
+            name="mean_out",
+            args=(_make_node(name="prev"), [-1], False),
+        )
+        code = gen.generate_epilogue(
+            [mean_node], output_descriptor=output_reduced_m,
+        )
+        assert "two-stage" in code.lower() or "block-local" in code.lower()
 
 
 # ---------------------------------------------------------------------------

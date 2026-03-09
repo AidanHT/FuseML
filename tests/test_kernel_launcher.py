@@ -16,10 +16,15 @@ import torch
 from fuseml.codegen.kernel_generator import TensorDescriptor
 from fuseml.codegen.kernel_launcher import (
     KernelLauncher,
+    LaunchParams,
     _DEFAULT_GROUP_SIZE_M,
     _DEFAULT_SRAM_BUDGET_BYTES,
     _LARGE_WORKING_SET_BYTES,
     _MIN_BLOCK_DIM,
+    _enforce_sram_capacity,
+    _select_num_stages,
+    _select_num_warps,
+    compute_launch_params,
 )
 
 
@@ -100,18 +105,28 @@ class TestKernelLauncherInit:
 
     def test_default_block_sizes(self, mock_kernel_fn, input_descs, output_desc):
         launcher = KernelLauncher(mock_kernel_fn, input_descs, output_desc, [], "a", "b")
-        assert launcher._block_size_m == 64
-        assert launcher._block_size_n == 64
-        assert launcher._block_size_k == 32
+        assert launcher._launch_params.block_m == 64
+        assert launcher._launch_params.block_n == 64
+        assert launcher._launch_params.block_k == 32
 
     def test_custom_block_sizes(self, mock_kernel_fn, input_descs, output_desc):
         launcher = KernelLauncher(
             mock_kernel_fn, input_descs, output_desc, [], "a", "b",
             block_size_m=128, block_size_n=128, block_size_k=64,
         )
-        assert launcher._block_size_m == 128
-        assert launcher._block_size_n == 128
-        assert launcher._block_size_k == 64
+        assert launcher._launch_params.block_m == 128
+        assert launcher._launch_params.block_n == 128
+        assert launcher._launch_params.block_k == 64
+
+    def test_explicit_launch_params(self, mock_kernel_fn, input_descs, output_desc):
+        lp = LaunchParams(block_m=32, block_n=64, block_k=16, group_size_m=4, num_warps=2, num_stages=3)
+        launcher = KernelLauncher(
+            mock_kernel_fn, input_descs, output_desc, [], "a", "b",
+            launch_params=lp,
+        )
+        assert launcher._launch_params is lp
+        assert launcher._launch_params.block_m == 32
+        assert launcher._launch_params.num_warps == 2
 
 
 # ---------------------------------------------------------------------------
@@ -287,9 +302,10 @@ class TestKernelLauncherRepr:
         assert "'out'" in r
 
     def test_repr_contains_block_sizes(self, mock_kernel_fn, input_descs, output_desc):
+        lp = LaunchParams(block_m=32, block_n=64, block_k=16, group_size_m=8, num_warps=4, num_stages=2)
         launcher = KernelLauncher(
             mock_kernel_fn, input_descs, output_desc, [], "a", "b",
-            block_size_m=32, block_size_n=64, block_size_k=16,
+            launch_params=lp,
         )
         r = repr(launcher)
         assert "(32,64,16)" in r
@@ -308,24 +324,25 @@ class TestBlockSizePowerOfTwo:
             mock_kernel_fn, input_descs, output_desc, [], "a", "b",
             block_size_m=64, block_size_n=128, block_size_k=32,
         )
-        assert launcher._block_size_m == 64
-        assert launcher._block_size_n == 128
-        assert launcher._block_size_k == 32
+        assert launcher._launch_params.block_m == 64
+        assert launcher._launch_params.block_n == 128
+        assert launcher._launch_params.block_k == 32
 
     def test_non_power_of_two_rounded_up(self, mock_kernel_fn, input_descs, output_desc):
         launcher = KernelLauncher(
             mock_kernel_fn, input_descs, output_desc, [], "a", "b",
             block_size_m=50, block_size_n=100, block_size_k=24,
         )
-        assert launcher._block_size_m == 64
-        assert launcher._block_size_n == 128
-        assert launcher._block_size_k == 32
+        assert launcher._launch_params.block_m == 64
+        assert launcher._launch_params.block_n == 128
+        assert launcher._launch_params.block_k == 32
 
     def test_default_block_sizes_are_power_of_two(self, mock_kernel_fn, input_descs, output_desc):
         launcher = KernelLauncher(
             mock_kernel_fn, input_descs, output_desc, [], "a", "b",
         )
-        for bs in (launcher._block_size_m, launcher._block_size_n, launcher._block_size_k):
+        lp = launcher._launch_params
+        for bs in (lp.block_m, lp.block_n, lp.block_k):
             assert bs & (bs - 1) == 0, f"{bs} is not a power of 2"
 
 
@@ -452,30 +469,30 @@ class TestSelectNumWarps:
 
     def test_tiny_problem_returns_2(self):
         """M*N < 1024 → 2 warps regardless of dtype."""
-        assert KernelLauncher._select_num_warps(16, 16, 64, torch.float32) == 2
-        assert KernelLauncher._select_num_warps(16, 16, 64, torch.float16) == 2
+        assert _select_num_warps(16, 16, 64, torch.float32) == 2
+        assert _select_num_warps(16, 16, 64, torch.float16) == 2
 
     def test_fp32_medium_returns_4(self):
         """FP32 with moderate tile size → 4 warps."""
-        assert KernelLauncher._select_num_warps(128, 256, 64, torch.float32) == 4
+        assert _select_num_warps(128, 256, 64, torch.float32) == 4
 
     def test_fp16_large_returns_8(self):
         """FP16 with large tile (>= 4096 elements) → 8 warps for tensor cores."""
-        assert KernelLauncher._select_num_warps(128, 256, 64, torch.float16) == 8
+        assert _select_num_warps(128, 256, 64, torch.float16) == 8
 
     def test_bf16_large_returns_8(self):
         """BF16 behaves like FP16."""
-        assert KernelLauncher._select_num_warps(128, 256, 64, torch.bfloat16) == 8
+        assert _select_num_warps(128, 256, 64, torch.bfloat16) == 8
 
     def test_fp16_small_tile_returns_4(self):
         """FP16 with tile area < 4096 but >= 1024 → 4 warps (not enough to justify 8)."""
-        assert KernelLauncher._select_num_warps(32, 64, 64, torch.float16) == 4
+        assert _select_num_warps(32, 64, 64, torch.float16) == 4
 
     def test_return_value_is_power_of_2(self):
         """All returned num_warps should be powers of 2 (Triton requirement)."""
         for M, N, K in [(16, 16, 8), (64, 64, 32), (256, 512, 128)]:
             for dt in (torch.float32, torch.float16, torch.bfloat16):
-                nw = KernelLauncher._select_num_warps(M, N, K, dt)
+                nw = _select_num_warps(M, N, K, dt)
                 assert nw & (nw - 1) == 0, f"num_warps={nw} is not a power of 2"
 
 
@@ -490,28 +507,28 @@ class TestSelectNumStages:
     def test_small_working_set_returns_2(self):
         """When total bytes < threshold → 2 stages."""
         # (M+N)*K*bpe = (32+64)*32*4 = 12288 bytes << 512KB
-        assert KernelLauncher._select_num_stages(32, 64, 32, torch.float32) == 2
+        assert _select_num_stages(32, 64, 32, torch.float32) == 2
 
     def test_large_fp32_returns_3(self):
         """Large FP32 working set → 3 stages."""
         # Need (M+N)*K*4 >= 512*1024 = 524288
         # e.g. M=1024, N=1024, K=128 → (2048)*128*4 = 1,048,576 > 524,288
-        assert KernelLauncher._select_num_stages(1024, 1024, 128, torch.float32) == 3
+        assert _select_num_stages(1024, 1024, 128, torch.float32) == 3
 
     def test_large_fp16_returns_5(self):
         """Large FP16 working set → 5 stages (deep cp.async pipelining on Ada)."""
         # (M+N)*K*2 >= 524288 → e.g. M=1024, N=1024, K=256
         # (2048)*256*2 = 1,048,576 > 524,288
-        assert KernelLauncher._select_num_stages(1024, 1024, 256, torch.float16) == 5
+        assert _select_num_stages(1024, 1024, 256, torch.float16) == 5
 
     def test_large_bf16_returns_5(self):
         """BF16 behaves like FP16 for stage selection (Ada cp.async)."""
-        assert KernelLauncher._select_num_stages(1024, 1024, 256, torch.bfloat16) == 5
+        assert _select_num_stages(1024, 1024, 256, torch.bfloat16) == 5
 
     def test_returned_values_are_positive(self):
         for M, N, K in [(8, 8, 4), (128, 256, 64), (2048, 2048, 512)]:
             for dt in (torch.float32, torch.float16, torch.bfloat16):
-                ns = KernelLauncher._select_num_stages(M, N, K, dt)
+                ns = _select_num_stages(M, N, K, dt)
                 assert ns >= 2, f"num_stages={ns} should be >= 2"
 
 
@@ -558,7 +575,12 @@ class TestKernelLaunchHeuristics:
 
     def test_fp16_output_gets_8_warps(self, mock_kernel_fn, input_descs):
         out_fp16 = TensorDescriptor("out", (128, 256), (256, 1), torch.float16)
-        launcher = KernelLauncher(mock_kernel_fn, input_descs, out_fp16, [], "a", "b")
+        # Pre-compute with FP16 output dtype to get 8 warps
+        lp = compute_launch_params(128, 256, 64, torch.float16)
+        launcher = KernelLauncher(
+            mock_kernel_fn, input_descs, out_fp16, [], "a", "b",
+            launch_params=lp,
+        )
         a = torch.randn(128, 64)
         b = torch.randn(64, 256)
         launcher(a, b)
@@ -763,19 +785,19 @@ class TestSRAMCapacityEnforcement:
 
     def test_small_tile_unchanged(self):
         """64x64 FP32 = 16KB < 100KB → no change."""
-        m, n = KernelLauncher._enforce_sram_capacity(64, 64, torch.float32)
+        m, n = _enforce_sram_capacity(64, 64, torch.float32)
         assert (m, n) == (64, 64)
 
     def test_large_tile_downscaled(self):
         """256x256 FP32 = 256KB > 100KB → must shrink."""
-        m, n = KernelLauncher._enforce_sram_capacity(256, 256, torch.float32)
+        m, n = _enforce_sram_capacity(256, 256, torch.float32)
         assert m * n * 4 <= _DEFAULT_SRAM_BUDGET_BYTES
         assert m & (m - 1) == 0  # power of 2
         assert n & (n - 1) == 0
 
     def test_halves_larger_dim_first(self):
         """256x256 FP32 = 256KB > 100KB → halve M first since M >= N."""
-        m, n = KernelLauncher._enforce_sram_capacity(256, 256, torch.float32)
+        m, n = _enforce_sram_capacity(256, 256, torch.float32)
         assert m * n * 4 <= _DEFAULT_SRAM_BUDGET_BYTES
         # With 100KB budget, 256x256 FP32 = 256KB needs downscaling
         assert m <= 256
@@ -785,17 +807,17 @@ class TestSRAMCapacityEnforcement:
 
     def test_128x128_fp32_fits_ada(self):
         """128x128 FP32 = 64KB < 100KB → unchanged on Ada."""
-        m, n = KernelLauncher._enforce_sram_capacity(128, 128, torch.float32)
+        m, n = _enforce_sram_capacity(128, 128, torch.float32)
         assert (m, n) == (128, 128)
 
     def test_fp16_allows_larger_tiles(self):
         """128x128 FP16 = 32KB < 100KB → unchanged."""
-        m, n = KernelLauncher._enforce_sram_capacity(128, 128, torch.float16)
+        m, n = _enforce_sram_capacity(128, 128, torch.float16)
         assert (m, n) == (128, 128)
 
     def test_respects_minimum_floor(self):
         """Even with tiny budget, dimensions don't go below _MIN_BLOCK_DIM."""
-        m, n = KernelLauncher._enforce_sram_capacity(
+        m, n = _enforce_sram_capacity(
             64, 64, torch.float32, sram_budget_bytes=64,
         )
         assert m >= _MIN_BLOCK_DIM
@@ -803,7 +825,7 @@ class TestSRAMCapacityEnforcement:
 
     def test_custom_budget(self):
         """Custom budget is respected."""
-        m, n = KernelLauncher._enforce_sram_capacity(
+        m, n = _enforce_sram_capacity(
             64, 64, torch.float32, sram_budget_bytes=8 * 1024,
         )
         # 64x64x4 = 16KB > 8KB → need downscaling
@@ -813,7 +835,7 @@ class TestSRAMCapacityEnforcement:
         """Downscaled dimensions must remain powers of 2."""
         for bm, bn in [(256, 256), (128, 256), (512, 64)]:
             for dt in (torch.float32, torch.float16, torch.bfloat16):
-                m, n = KernelLauncher._enforce_sram_capacity(bm, bn, dt)
+                m, n = _enforce_sram_capacity(bm, bn, dt)
                 assert m & (m - 1) == 0, f"m={m} not power of 2"
                 assert n & (n - 1) == 0, f"n={n} not power of 2"
 
@@ -824,7 +846,7 @@ class TestSRAMCapacityEnforcement:
 
 @pytest.mark.launcher
 class TestSRAMEnforcementInCall:
-    """Verify __call__ passes SRAM-safe block sizes to the kernel launch."""
+    """Verify pre-computed LaunchParams passes SRAM-safe block sizes to kernel."""
 
     @pytest.fixture(autouse=True)
     def _inject_mock_triton(self, monkeypatch):
@@ -832,8 +854,8 @@ class TestSRAMEnforcementInCall:
         mock_triton.cdiv = lambda a, b: (a + b - 1) // b
         monkeypatch.setitem(sys.modules, "triton", mock_triton)
 
-    def test_oversized_blocks_downscaled_in_launch(self, mock_kernel_fn, input_descs, output_desc):
-        """Block sizes that exceed SRAM budget are downscaled before launch."""
+    def test_oversized_blocks_downscaled_at_init(self, mock_kernel_fn, input_descs, output_desc):
+        """Block sizes that exceed SRAM budget are downscaled at construction."""
         launcher = KernelLauncher(
             mock_kernel_fn, input_descs, output_desc, [], "a", "b",
             block_size_m=256, block_size_n=256,  # 256*256*4 = 256KB >> 100KB
@@ -846,7 +868,7 @@ class TestSRAMEnforcementInCall:
         bsn = call["kwargs"]["BLOCK_SIZE_N"]
         assert bsm * bsn * 4 <= _DEFAULT_SRAM_BUDGET_BYTES
 
-    def test_safe_blocks_unchanged_in_launch(self, mock_kernel_fn, input_descs, output_desc):
+    def test_safe_blocks_unchanged_at_init(self, mock_kernel_fn, input_descs, output_desc):
         """Block sizes within SRAM budget pass through unchanged."""
         launcher = KernelLauncher(
             mock_kernel_fn, input_descs, output_desc, [], "a", "b",
@@ -924,3 +946,413 @@ class TestCUDAStreamSync:
         # Triton 3.x automatically uses the current CUDA stream;
         # the launcher no longer passes stream= explicitly.
         assert "stream" not in call["kwargs"]
+
+
+# ---------------------------------------------------------------------------
+# Mean reduction — FP32 accumulation and axis-aware division
+# ---------------------------------------------------------------------------
+
+@pytest.mark.launcher
+class TestMeanReductionFP32:
+    """Mean reduction: FP32 accumulation buffer, correct division, dtype cast."""
+
+    @pytest.fixture(autouse=True)
+    def _inject_mock_triton(self, monkeypatch):
+        mock_triton = types.ModuleType("triton")
+        mock_triton.cdiv = lambda a, b: (a + b - 1) // b
+        monkeypatch.setitem(sys.modules, "triton", mock_triton)
+
+    def test_mean_output_allocated_fp32(self, mock_kernel_fn, input_descs):
+        """Mean accumulation buffer must be FP32 regardless of output dtype."""
+        out = TensorDescriptor("out", (128,), (1,), torch.bfloat16)
+        launcher = KernelLauncher(
+            mock_kernel_fn, input_descs, out, [], "a", "b",
+            reduction_op="mean", reduction_axis=1,
+        )
+        a = torch.randn(128, 64)
+        b = torch.randn(64, 256)
+        result = launcher(a, b)
+        # Output must be in the target dtype (bf16) after division + cast
+        assert result.dtype == torch.bfloat16
+
+    def test_mean_fp32_output_stays_fp32(self, mock_kernel_fn, input_descs):
+        """When output is already FP32, no extra cast needed."""
+        out = TensorDescriptor("out", (128,), (1,), torch.float32)
+        launcher = KernelLauncher(
+            mock_kernel_fn, input_descs, out, [], "a", "b",
+            reduction_op="mean", reduction_axis=1,
+        )
+        a = torch.randn(128, 64)
+        b = torch.randn(64, 256)
+        result = launcher(a, b)
+        assert result.dtype == torch.float32
+
+    def test_mean_divides_by_n_for_axis_1(self, mock_kernel_fn, input_descs):
+        """axis=1 (reduce N): division should be by N (=256)."""
+        out = TensorDescriptor("out", (128,), (1,), torch.float32)
+        launcher = KernelLauncher(
+            mock_kernel_fn, input_descs, out, [], "a", "b",
+            reduction_op="mean", reduction_axis=1,
+        )
+        a = torch.randn(128, 64)
+        b = torch.randn(64, 256)
+        result = launcher(a, b)
+        # Result shape should be (M=128,)
+        assert result.shape == (128,)
+
+    def test_mean_divides_by_m_for_axis_0(self, mock_kernel_fn, input_descs):
+        """axis=0 (reduce M): division should be by M (=128), output shape (N=256,)."""
+        out = TensorDescriptor("out", (256,), (1,), torch.float32)
+        launcher = KernelLauncher(
+            mock_kernel_fn, input_descs, out, [], "a", "b",
+            reduction_op="mean", reduction_axis=0,
+        )
+        a = torch.randn(128, 64)
+        b = torch.randn(64, 256)
+        result = launcher(a, b)
+        # Surviving dim is N=256
+        assert result.shape == (256,)
+
+    def test_sum_output_not_fp32_promoted(self, mock_kernel_fn, input_descs):
+        """Sum reduction should NOT use FP32 accumulation (only mean does)."""
+        out = TensorDescriptor("out", (128,), (1,), torch.bfloat16)
+        launcher = KernelLauncher(
+            mock_kernel_fn, input_descs, out, [], "a", "b",
+            reduction_op="sum", reduction_axis=1,
+        )
+        a = torch.randn(128, 64)
+        b = torch.randn(64, 256)
+        result = launcher(a, b)
+        # Sum output stays in the requested dtype
+        assert result.dtype == torch.bfloat16
+
+    def test_max_output_uses_neg_inf(self, mock_kernel_fn, input_descs):
+        """Max reduction should pre-fill with -inf in the output dtype."""
+        out = TensorDescriptor("out", (128,), (1,), torch.float32)
+        launcher = KernelLauncher(
+            mock_kernel_fn, input_descs, out, [], "a", "b",
+            reduction_op="max", reduction_axis=1,
+        )
+        a = torch.randn(128, 64)
+        b = torch.randn(64, 256)
+        result = launcher(a, b)
+        assert result.dtype == torch.float32
+
+    def test_reduction_axis_default_is_1(self, mock_kernel_fn, input_descs):
+        """When reduction_axis is not specified, it defaults to 1."""
+        out = TensorDescriptor("out", (128,), (1,), torch.float32)
+        launcher = KernelLauncher(
+            mock_kernel_fn, input_descs, out, [], "a", "b",
+            reduction_op="mean",
+        )
+        assert launcher._reduction_axis == 1
+
+    def test_repr_includes_axis(self, mock_kernel_fn, input_descs):
+        """Repr should show reduction op and axis."""
+        out = TensorDescriptor("out", (128,), (1,), torch.float32)
+        launcher = KernelLauncher(
+            mock_kernel_fn, input_descs, out, [], "a", "b",
+            reduction_op="mean", reduction_axis=1,
+        )
+        r = repr(launcher)
+        assert "mean" in r
+        assert "axis=1" in r
+
+
+# ---------------------------------------------------------------------------
+# Zero-overhead dispatcher — grid, allocation, and stride fast-paths
+# ---------------------------------------------------------------------------
+
+@pytest.mark.launcher
+class TestZeroOverheadGrid:
+    """Verify native integer division grid replaces triton.cdiv."""
+
+    @pytest.fixture(autouse=True)
+    def _inject_mock_triton(self, monkeypatch):
+        mock_triton = types.ModuleType("triton")
+        monkeypatch.setitem(sys.modules, "triton", mock_triton)
+
+    def test_no_triton_cdiv_dependency(self, mock_kernel_fn, input_descs, output_desc):
+        """__call__ must not reference triton.cdiv — uses native // division."""
+        launcher = KernelLauncher(mock_kernel_fn, input_descs, output_desc, [], "a", "b")
+        a = torch.randn(128, 64)
+        b = torch.randn(64, 256)
+        # If triton.cdiv were still used, this would raise AttributeError
+        # because the mock triton module has no cdiv attribute.
+        launcher(a, b)
+        call = mock_kernel_fn.calls[0]
+        (total_programs,) = call["grid"]
+        assert total_programs == 8  # ceil(128/64) * ceil(256/64)
+
+    def test_native_division_matches_cdiv(self, mock_kernel_fn, input_descs, output_desc):
+        """Native (a + b - 1) // b matches triton.cdiv for non-divisible dims."""
+        a_desc = TensorDescriptor("a", (100, 64), (64, 1), torch.float32)
+        b_desc = TensorDescriptor("b", (64, 200), (200, 1), torch.float32)
+        out_desc = TensorDescriptor("out", (100, 200), (200, 1), torch.float32)
+        launcher = KernelLauncher(
+            mock_kernel_fn, [a_desc, b_desc], out_desc, [], "a", "b",
+        )
+        a = torch.randn(100, 64)
+        b = torch.randn(64, 200)
+        launcher(a, b)
+        call = mock_kernel_fn.calls[0]
+        (total_programs,) = call["grid"]
+        expected = ((100 + 64 - 1) // 64) * ((200 + 64 - 1) // 64)
+        assert total_programs == expected
+
+    def test_grid_is_lambda_closure(self, mock_kernel_fn, input_descs, output_desc):
+        """Grid is a lambda that captures M, N from the enclosing scope."""
+        launcher = KernelLauncher(mock_kernel_fn, input_descs, output_desc, [], "a", "b")
+        a = torch.randn(128, 64)
+        b = torch.randn(64, 256)
+        launcher(a, b)
+        call = mock_kernel_fn.calls[0]
+        grid = call["grid"]
+        assert isinstance(grid, tuple)
+        assert len(grid) == 1
+
+
+@pytest.mark.launcher
+class TestSmartOutputAllocation:
+    """Verify torch.empty_strided allocation with async reduction init."""
+
+    @pytest.fixture(autouse=True)
+    def _inject_mock_triton(self, monkeypatch):
+        mock_triton = types.ModuleType("triton")
+        monkeypatch.setitem(sys.modules, "triton", mock_triton)
+
+    def test_2d_output_is_row_major_strided(self, mock_kernel_fn, input_descs, output_desc):
+        """Non-reduced output must be row-major with stride (N, 1)."""
+        launcher = KernelLauncher(mock_kernel_fn, input_descs, output_desc, [], "a", "b")
+        a = torch.randn(128, 64)
+        b = torch.randn(64, 256)
+        result = launcher(a, b)
+        assert result.stride() == (256, 1)
+
+    def test_2d_output_is_contiguous(self, mock_kernel_fn, input_descs, output_desc):
+        """Row-major empty_strided output must be contiguous."""
+        launcher = KernelLauncher(mock_kernel_fn, input_descs, output_desc, [], "a", "b")
+        a = torch.randn(128, 64)
+        b = torch.randn(64, 256)
+        result = launcher(a, b)
+        assert result.is_contiguous()
+
+    def test_sum_output_stride_is_1(self, mock_kernel_fn, input_descs):
+        """Sum reduction output must have stride (1,)."""
+        out = TensorDescriptor("out", (128,), (1,), torch.float32)
+        launcher = KernelLauncher(
+            mock_kernel_fn, input_descs, out, [], "a", "b",
+            reduction_op="sum", reduction_axis=1,
+        )
+        a = torch.randn(128, 64)
+        b = torch.randn(64, 256)
+        result = launcher(a, b)
+        assert result.stride() == (1,)
+
+    def test_max_output_stride_is_1(self, mock_kernel_fn, input_descs):
+        """Max reduction output must have stride (1,)."""
+        out = TensorDescriptor("out", (128,), (1,), torch.float32)
+        launcher = KernelLauncher(
+            mock_kernel_fn, input_descs, out, [], "a", "b",
+            reduction_op="max", reduction_axis=1,
+        )
+        a = torch.randn(128, 64)
+        b = torch.randn(64, 256)
+        result = launcher(a, b)
+        assert result.stride() == (1,)
+
+    def test_intermediate_buffers_row_major(self, mock_kernel_fn, input_descs, output_desc):
+        """Intermediate escape buffers must be row-major strided."""
+        intm = TensorDescriptor("esc0", (128, 256), (256, 1), torch.float32)
+        launcher = KernelLauncher(
+            mock_kernel_fn, input_descs, output_desc, [intm], "a", "b",
+        )
+        a = torch.randn(128, 64)
+        b = torch.randn(64, 256)
+        launcher(a, b)
+        call = mock_kernel_fn.calls[0]
+        # The intermediate tensor is args[3] (after 2 inputs + 1 output)
+        intm_tensor = call["args"][3]
+        assert intm_tensor.stride() == (256, 1)
+        assert intm_tensor.is_contiguous()
+
+    def test_dtype_extracted_from_descriptor(self, mock_kernel_fn, input_descs):
+        """Output dtype must come from the descriptor, not hardcoded."""
+        for dtype in (torch.float32, torch.float16, torch.bfloat16):
+            out = TensorDescriptor("out", (128, 256), (256, 1), dtype)
+            launcher = KernelLauncher(mock_kernel_fn, input_descs, out, [], "a", "b")
+            a = torch.randn(128, 64)
+            b = torch.randn(64, 256)
+            result = launcher(a, b)
+            assert result.dtype == dtype, f"Expected {dtype}, got {result.dtype}"
+
+
+@pytest.mark.launcher
+class TestBitwiseNegativeStrideCheck:
+    """Verify the bitwise OR fold in _has_negative_strides."""
+
+    def test_positive_strides_bitwise_or_non_negative(self):
+        """OR of positive strides is non-negative."""
+        t = torch.randn(128, 64)
+        # All strides positive → bits non-negative → False
+        assert not KernelLauncher._has_negative_strides(t)
+
+    def test_mixed_positive_strides(self):
+        """Various positive strides OR'd together stay non-negative."""
+        base = torch.randn(256, 128)
+        t = base[::2, ::2]  # stride (256, 2)
+        assert not KernelLauncher._has_negative_strides(t)
+
+    def test_zero_stride_or_keeps_non_negative(self):
+        """Zero stride OR'd with positive stays non-negative."""
+        t = torch.randn(1, 64).expand(128, 64)  # stride (0, 1)
+        assert not KernelLauncher._has_negative_strides(t)
+
+    def test_negative_stride_sets_sign_bit(self):
+        """Any negative stride sets the sign bit in the OR result."""
+        class _FakeNeg:
+            ndim = 2
+            def stride(self): return (-64, 1)
+        assert KernelLauncher._has_negative_strides(_FakeNeg())
+
+    def test_single_negative_among_positives(self):
+        """One negative stride among positives triggers detection."""
+        class _FakeMixed:
+            ndim = 3
+            def stride(self): return (256, -1, 1)
+        assert KernelLauncher._has_negative_strides(_FakeMixed())
+
+    def test_all_negative_strides(self):
+        """All negative strides detected."""
+        class _FakeAllNeg:
+            ndim = 2
+            def stride(self): return (-128, -1)
+        assert KernelLauncher._has_negative_strides(_FakeAllNeg())
+
+    def test_scalar_fast_path(self):
+        """0-D tensors skip the bitwise check entirely."""
+        t = torch.tensor(3.14)
+        assert not KernelLauncher._has_negative_strides(t)
+
+
+# ---------------------------------------------------------------------------
+# LaunchParams — frozen dataclass
+# ---------------------------------------------------------------------------
+
+@pytest.mark.launcher
+class TestLaunchParams:
+    """Verify LaunchParams is immutable and stores all fields."""
+
+    def test_frozen(self):
+        lp = LaunchParams(block_m=64, block_n=64, block_k=32, group_size_m=8, num_warps=4, num_stages=2)
+        with pytest.raises(AttributeError):
+            lp.block_m = 128  # type: ignore[misc]
+
+    def test_fields(self):
+        lp = LaunchParams(block_m=128, block_n=64, block_k=32, group_size_m=16, num_warps=8, num_stages=5)
+        assert lp.block_m == 128
+        assert lp.block_n == 64
+        assert lp.block_k == 32
+        assert lp.group_size_m == 16
+        assert lp.num_warps == 8
+        assert lp.num_stages == 5
+
+    def test_equality(self):
+        a = LaunchParams(64, 64, 32, 8, 4, 2)
+        b = LaunchParams(64, 64, 32, 8, 4, 2)
+        assert a == b
+
+    def test_inequality(self):
+        a = LaunchParams(64, 64, 32, 8, 4, 2)
+        b = LaunchParams(128, 64, 32, 8, 4, 2)
+        assert a != b
+
+
+# ---------------------------------------------------------------------------
+# compute_launch_params — static pre-computation
+# ---------------------------------------------------------------------------
+
+@pytest.mark.launcher
+class TestComputeLaunchParams:
+    """Verify compute_launch_params pre-computes SRAM-safe configurations."""
+
+    def test_returns_launch_params(self):
+        lp = compute_launch_params(128, 256, 64, torch.float32)
+        assert isinstance(lp, LaunchParams)
+
+    def test_default_block_sizes(self):
+        lp = compute_launch_params(128, 256, 64, torch.float32)
+        assert lp.block_m == 64
+        assert lp.block_n == 64
+        assert lp.block_k == 32
+        assert lp.group_size_m == 8
+
+    def test_custom_block_sizes(self):
+        lp = compute_launch_params(
+            128, 256, 64, torch.float32,
+            block_size_m=32, block_size_n=128, block_size_k=64,
+        )
+        # 32*128*4 = 16KB < 100KB → no downscaling
+        assert lp.block_m == 32
+        assert lp.block_n == 128
+        assert lp.block_k == 64
+
+    def test_oversized_blocks_downscaled(self):
+        lp = compute_launch_params(
+            128, 256, 64, torch.float32,
+            block_size_m=256, block_size_n=256,
+        )
+        assert lp.block_m * lp.block_n * 4 <= _DEFAULT_SRAM_BUDGET_BYTES
+
+    def test_non_power_of_two_rounded(self):
+        lp = compute_launch_params(
+            128, 256, 64, torch.float32,
+            block_size_m=50, block_size_n=100, block_size_k=24,
+        )
+        assert lp.block_m & (lp.block_m - 1) == 0
+        assert lp.block_n & (lp.block_n - 1) == 0
+        assert lp.block_k & (lp.block_k - 1) == 0
+
+    def test_fp16_gets_more_warps(self):
+        lp_fp32 = compute_launch_params(128, 256, 64, torch.float32)
+        lp_fp16 = compute_launch_params(128, 256, 64, torch.float16)
+        # FP16 large tile → 8 warps; FP32 → 4 warps
+        assert lp_fp16.num_warps == 8
+        assert lp_fp32.num_warps == 4
+
+    def test_sram_downscale_bumps_stages(self):
+        lp_safe = compute_launch_params(128, 256, 64, torch.float32)
+        lp_big = compute_launch_params(
+            128, 256, 64, torch.float32,
+            block_size_m=256, block_size_n=256,
+        )
+        # Downscaled blocks get +1 stage (capped at 4)
+        assert lp_big.num_stages == min(lp_safe.num_stages + 1, 4)
+
+    def test_sram_autotuner_path(self):
+        from fuseml.codegen.sram_autotuner import SRAMAutotuner
+        autotuner = SRAMAutotuner()
+        lp = compute_launch_params(128, 256, 64, torch.float32, sram_autotuner=autotuner)
+        assert isinstance(lp, LaunchParams)
+        # The autotuner should produce valid power-of-2 blocks
+        assert lp.block_m & (lp.block_m - 1) == 0
+        assert lp.block_n & (lp.block_n - 1) == 0
+
+    def test_launch_params_injected_into_kwargs(self):
+        """Pre-computed LaunchParams are injected into kernel kwargs at dispatch."""
+        mock_fn = _MockKernelFn()
+        input_descs = [
+            TensorDescriptor("a", (128, 64), (64, 1), torch.float32),
+            TensorDescriptor("b", (64, 256), (256, 1), torch.float32),
+        ]
+        out = TensorDescriptor("out", (128, 256), (256, 1), torch.float32)
+        lp = LaunchParams(block_m=32, block_n=64, block_k=16, group_size_m=4, num_warps=2, num_stages=3)
+        launcher = KernelLauncher(mock_fn, input_descs, out, [], "a", "b", launch_params=lp)
+        launcher(torch.randn(128, 64), torch.randn(64, 256))
+        call = mock_fn.calls[0]
+        assert call["kwargs"]["BLOCK_SIZE_M"] == 32
+        assert call["kwargs"]["BLOCK_SIZE_N"] == 64
+        assert call["kwargs"]["BLOCK_SIZE_K"] == 16
+        assert call["kwargs"]["GROUP_SIZE_M"] == 4
+        assert call["kwargs"]["num_warps"] == 2
+        assert call["kwargs"]["num_stages"] == 3

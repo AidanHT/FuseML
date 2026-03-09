@@ -423,27 +423,33 @@ class TestKernelLauncherWithAutotuner:
         mock_triton.cdiv = lambda a, b: (a + b - 1) // b
         monkeypatch.setitem(sys.modules, "triton", mock_triton)
 
-    def test_autotuner_stored_on_launcher(self, mock_kernel_fn, input_descs, output_desc):
+    def test_autotuner_produces_launch_params(self, mock_kernel_fn, input_descs, output_desc):
+        """SRAMAutotuner config is consumed at init and stored in LaunchParams."""
         tuner = SRAMAutotuner()
         launcher = KernelLauncher(
             mock_kernel_fn, input_descs, output_desc, [], "a", "b",
             sram_autotuner=tuner,
         )
-        assert launcher._sram_autotuner is tuner
+        # The autotuner's config is baked into LaunchParams at init.
+        assert launcher._launch_params is not None
+        assert tuner.cache_size == 1  # consumed at init time
 
-    def test_autotuner_none_by_default(self, mock_kernel_fn, input_descs, output_desc):
+    def test_no_autotuner_uses_heuristics(self, mock_kernel_fn, input_descs, output_desc):
+        """Without autotuner, launch params are computed via static heuristics."""
         launcher = KernelLauncher(
             mock_kernel_fn, input_descs, output_desc, [], "a", "b",
         )
-        assert launcher._sram_autotuner is None
+        assert launcher._launch_params is not None
 
-    def test_repr_shows_autotuner(self, mock_kernel_fn, input_descs, output_desc):
+    def test_repr_shows_block_sizes(self, mock_kernel_fn, input_descs, output_desc):
+        """Repr includes pre-computed block sizes from autotuner config."""
         tuner = SRAMAutotuner()
         launcher = KernelLauncher(
             mock_kernel_fn, input_descs, output_desc, [], "a", "b",
             sram_autotuner=tuner,
         )
-        assert "sram_autotuner=True" in repr(launcher)
+        r = repr(launcher)
+        assert "block=(" in r
 
     def test_repr_no_autotuner(self, mock_kernel_fn, input_descs, output_desc):
         launcher = KernelLauncher(
@@ -487,18 +493,16 @@ class TestKernelLauncherWithAutotuner:
         sram = compute_sram_bytes(bm, bn, bk, 4, ns)
         assert sram <= _DEFAULT_SRAM_BUDGET_BYTES
 
-    def test_autotuner_caches_after_launch(self, mock_kernel_fn, input_descs, output_desc):
-        """After launch, the autotuner's cache should have an entry."""
+    def test_autotuner_consumed_at_init(self, mock_kernel_fn, input_descs, output_desc):
+        """Autotuner is consumed at init — cache entry exists immediately."""
         tuner = SRAMAutotuner()
         launcher = KernelLauncher(
             mock_kernel_fn, input_descs, output_desc, [], "a", "b",
             sram_autotuner=tuner,
         )
-        assert tuner.cache_size == 0
-        a = torch.randn(128, 64)
-        b = torch.randn(64, 256)
-        launcher(a, b)
+        # Config selected at init, not at dispatch
         assert tuner.cache_size == 1
+        assert launcher._launch_params is not None
 
     def test_autotuner_cache_hit_on_second_launch(self, mock_kernel_fn, input_descs, output_desc):
         """Second launch with same shapes should hit autotuner cache."""
