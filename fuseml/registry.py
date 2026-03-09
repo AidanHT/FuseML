@@ -108,4 +108,16 @@ def build_default_registry() -> SupportedOpsRegistry:
         category="elementwise",
     )
 
+    # --- Reduction ops — require cross-thread synchronization but can be
+    #     fused into the epilogue of a matmul kernel via tl.atomic_add /
+    #     tl.atomic_max to avoid a separate HBM round-trip. --------------------
+    registry.register_many(
+        [
+            torch.ops.aten.sum.dim_IntList,
+            torch.ops.aten.amax.default,
+            torch.ops.aten.mean.dim,
+        ],
+        category="reduction",
+    )
+
     return registry

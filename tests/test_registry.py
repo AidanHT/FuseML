@@ -41,7 +41,7 @@ class TestBuildDefaultRegistry:
         assert registry.get_category(op) == "elementwise"
 
     def test_total_count(self, registry):
-        assert len(registry) == 6  # 1 linear + 5 elementwise
+        assert len(registry) == 9  # 1 linear + 5 elementwise + 3 reduction
 
 
 # ---------------------------------------------------------------------------

@@ -5,7 +5,7 @@ Public API re-exports for convenient access::
     from fuseml import FuseMLFusionPass, FusionGroup, SupportedOpsRegistry
 """
 
-from fuseml.codegen.kernel_generator import TensorDescriptor, TritonKernelGenerator
+from fuseml.codegen.kernel_generator import ReductionInfo, TensorDescriptor, TritonKernelGenerator
 from fuseml.compiler import FuseMLCompiler
 from fuseml.fusion_group import FusionGroup
 from fuseml.passes.control_flow_validation import (
@@ -20,6 +20,7 @@ __all__ = [
     "FuseMLCompiler",
     "FuseMLFusionPass",
     "FusionGroup",
+    "ReductionInfo",
     "SupportedOpsRegistry",
     "TensorDescriptor",
     "TritonKernelGenerator",

@@ -326,7 +326,9 @@ class FuseMLCompiler:
             input_descs, out_desc, intermediate_descs
         )
         kloop = self._generator.generate_k_loop(input_descs, out_desc)
-        epilogue = self._generator.generate_epilogue(group.all_nodes, escape_stores)
+        epilogue = self._generator.generate_epilogue(
+            group.all_nodes, escape_stores, output_descriptor=out_desc,
+        )
 
         full_kernel_str = sig + "\n" + kloop + "\n" + epilogue
 
@@ -337,6 +339,17 @@ class FuseMLCompiler:
             logger.warning("Triton compilation failed for %s: %s", group, exc)
             return None
 
+        # ── Detect reduction for launcher initialisation ─────────────
+        reduction_op: str | None = None
+        if group.fused_nodes:
+            last_target = group.fused_nodes[-1].target
+            if last_target == torch.ops.aten.sum.dim_IntList:
+                reduction_op = "sum"
+            elif last_target == torch.ops.aten.amax.default:
+                reduction_op = "max"
+            elif last_target == torch.ops.aten.mean.dim:
+                reduction_op = "mean"
+
         # ── Assemble launcher ─────────────────────────────────────────
         launcher = KernelLauncher(
             kernel_fn=kernel_fn,
@@ -345,6 +358,7 @@ class FuseMLCompiler:
             intermediate_descriptors=intermediate_descs,
             left_name=left.name,
             right_name=right.name,
+            reduction_op=reduction_op,
         )
 
         logger.info("Built %r for group %s.", launcher, group)

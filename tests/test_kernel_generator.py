@@ -14,9 +14,11 @@ from fuseml.codegen.kernel_generator import TensorDescriptor, TritonKernelGenera
 # Helpers — lightweight FX node stand-ins for epilogue tests
 # ---------------------------------------------------------------------------
 
-def _make_node(*, op="call_function", target=None, name="node", args=()):
+def _make_node(*, op="call_function", target=None, name="node", args=(), meta=None):
     """Create a minimal object that quacks like ``torch.fx.Node``."""
-    return SimpleNamespace(op=op, target=target, name=name, args=args)
+    ns = SimpleNamespace(op=op, target=target, name=name, args=args)
+    ns.meta = meta or {}
+    return ns
 
 
 # ---------------------------------------------------------------------------
@@ -815,10 +817,10 @@ class TestStoreSection:
         code = gen._section_store(output_tensor)
         assert "mask=(offs_m[:, None] < M) & (offs_n[None, :] < N)" in code
 
-    def test_store_no_cast_fp32(self, gen, output_tensor):
-        """fp32 accumulator → fp32 output needs no dtype cast."""
+    def test_store_unconditional_cast_fp32(self, gen, output_tensor):
+        """fp32 output — unconditional cast to tl.float32 (identity, zero cost)."""
         code = gen._section_store(output_tensor)
-        assert ".to(" not in code
+        assert "acc = acc.to(tl.float32)" in code
 
     def test_store_cast_fp16(self, gen):
         """fp32 accumulator → fp16 output requires explicit cast."""
