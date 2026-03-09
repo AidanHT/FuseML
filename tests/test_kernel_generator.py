@@ -340,21 +340,36 @@ class TestKLoopStructure:
 
 @pytest.mark.codegen
 class TestKLoopMasking:
-    """Verify mask handling prevents out-of-bounds reads."""
+    """Verify 2-D compound masks prevent OOB reads on all axes.
+
+    A K-only mask segfaults when M or N are not divisible by their
+    block sizes.  Each load must guard *both* the spatial boundary
+    (M for left, N for right) and the K boundary.
+    """
 
     def test_k_mask_computed(self, gen, matmul_inputs, output_tensor):
         code = gen.generate_k_loop(matmul_inputs, output_tensor)
         assert "k_mask = offs_k < K - k * BLOCK_SIZE_K" in code
 
-    def test_left_mask_broadcast(self, gen, matmul_inputs, output_tensor):
-        """Left operand mask broadcasts along rows: k_mask[None, :]."""
+    def test_left_m_boundary(self, gen, matmul_inputs, output_tensor):
+        """Left operand load guards the M boundary."""
         code = gen.generate_k_loop(matmul_inputs, output_tensor)
-        assert "mask=k_mask[None, :]" in code
+        assert "offs_m[:, None] < M" in code
 
-    def test_right_mask_broadcast(self, gen, matmul_inputs, output_tensor):
-        """Right operand mask broadcasts along columns: k_mask[:, None]."""
+    def test_left_compound_mask(self, gen, matmul_inputs, output_tensor):
+        """Left load uses full 2-D mask: M boundary & K boundary."""
         code = gen.generate_k_loop(matmul_inputs, output_tensor)
-        assert "mask=k_mask[:, None]" in code
+        assert "mask=(offs_m[:, None] < M) & (k_mask[None, :])" in code
+
+    def test_right_n_boundary(self, gen, matmul_inputs, output_tensor):
+        """Right operand load guards the N boundary."""
+        code = gen.generate_k_loop(matmul_inputs, output_tensor)
+        assert "offs_n[None, :] < N" in code
+
+    def test_right_compound_mask(self, gen, matmul_inputs, output_tensor):
+        """Right load uses full 2-D mask: K boundary & N boundary."""
+        code = gen.generate_k_loop(matmul_inputs, output_tensor)
+        assert "mask=(k_mask[:, None]) & (offs_n[None, :] < N)" in code
 
     def test_other_zero(self, gen, matmul_inputs, output_tensor):
         """Masked-out elements must be zero to avoid corrupting the dot product."""
