@@ -68,79 +68,81 @@ def output_bf16():
 
 @pytest.mark.precision
 class TestUpcastingOnLoad:
-    """Verify explicit FP32 upcast on half-precision K-loop loads."""
+    """Verify block-pointer loads use native dtype for Tensor Core throughput.
 
-    def test_fp16_left_upcast(self, gen, output_fp32):
-        """FP16 left operand must chain .to(tl.float32) onto tl.load."""
+    With the Ada-optimised block-pointer K-loop, matmul operands are loaded
+    in their native dtype (bf16/fp16) and passed directly to ``tl.dot``
+    which accumulates in fp32 via ``acc=acc``.  Pre-casting to fp32 would
+    bypass the Tensor Core pipeline.
+    """
+
+    def test_fp16_left_no_upcast(self, gen, output_fp32):
+        """FP16 left operand must NOT chain .to(tl.float32) — Tensor Cores handle it."""
         a = TensorDescriptor("a", (128, 64), (64, 1), torch.float16)
         b = TensorDescriptor("b", (64, 256), (256, 1), torch.float32)
         code = gen.generate_k_loop([a, b], output_fp32)
-        # Find the left load line — must contain the upcast
+        # Block pointer loads should not have fp32 upcast
         for line in code.splitlines():
-            if "a = tl.load(a_ptrs," in line:
-                assert ".to(tl.float32)" in line, (
-                    "FP16 left operand load must chain .to(tl.float32)"
+            if "a = tl.load(a_block_ptr," in line:
+                assert ".to(tl.float32)" not in line, (
+                    "FP16 matmul operand must stay in native dtype for Tensor Cores"
                 )
                 break
         else:
-            pytest.fail("Left operand load line not found")
+            pytest.fail("Left operand block pointer load line not found")
 
-    def test_fp16_right_upcast(self, gen, output_fp32):
-        """FP16 right operand must chain .to(tl.float32) onto tl.load."""
+    def test_fp16_right_no_upcast(self, gen, output_fp32):
+        """FP16 right operand must NOT chain .to(tl.float32)."""
         a = TensorDescriptor("a", (128, 64), (64, 1), torch.float32)
         b = TensorDescriptor("b", (64, 256), (256, 1), torch.float16)
         code = gen.generate_k_loop([a, b], output_fp32)
         for line in code.splitlines():
-            if "b = tl.load(b_ptrs," in line:
-                assert ".to(tl.float32)" in line, (
-                    "FP16 right operand load must chain .to(tl.float32)"
+            if "b = tl.load(b_block_ptr," in line:
+                assert ".to(tl.float32)" not in line, (
+                    "FP16 matmul operand must stay in native dtype for Tensor Cores"
                 )
                 break
         else:
-            pytest.fail("Right operand load line not found")
+            pytest.fail("Right operand block pointer load line not found")
 
-    def test_bf16_both_upcast(self, gen, output_fp32):
-        """BF16 inputs on both operands must both get .to(tl.float32)."""
+    def test_bf16_both_no_upcast(self, gen, output_fp32):
+        """BF16 matmul operands must NOT get .to(tl.float32) on loads."""
         a = TensorDescriptor("a", (128, 64), (64, 1), torch.bfloat16)
         b = TensorDescriptor("b", (64, 256), (256, 1), torch.bfloat16)
         code = gen.generate_k_loop([a, b], output_fp32)
-        assert code.count(".to(tl.float32)") >= 2, (
-            "Both BF16 operands must be upcast to FP32"
-        )
+        # Block pointer load lines must not have upcast
+        for line in code.splitlines():
+            if "tl.load(" in line and "_block_ptr" in line:
+                assert ".to(tl.float32)" not in line, (
+                    "BF16 matmul operands must stay in native dtype for Tensor Cores"
+                )
 
     def test_fp32_no_upcast(self, gen, output_fp32):
         """FP32 inputs must NOT emit .to(tl.float32) on K-loop loads."""
         a = TensorDescriptor("a", (128, 64), (64, 1), torch.float32)
         b = TensorDescriptor("b", (64, 256), (256, 1), torch.float32)
         code = gen.generate_k_loop([a, b], output_fp32)
-        # The K-loop itself should not contain .to(tl.float32) — only
-        # the bias loading (which isn't present here) or the store would.
         for line in code.splitlines():
-            if "tl.load(" in line and "_ptrs" in line:
+            if "tl.load(" in line and "_block_ptr" in line:
                 assert ".to(tl.float32)" not in line, (
                     "FP32 operands should not chain .to(tl.float32)"
                 )
 
-    def test_mixed_precision_only_half_upcast(self, gen, output_fp32):
-        """Only the FP16 operand gets upcast, FP32 stays as-is."""
+    def test_mixed_precision_no_matmul_upcast(self, gen, output_fp32):
+        """Neither operand gets upcast — Tensor Cores handle mixed precision."""
         a = TensorDescriptor("a", (128, 64), (64, 1), torch.float16)
         b = TensorDescriptor("b", (64, 256), (256, 1), torch.float32)
         code = gen.generate_k_loop([a, b], output_fp32)
-        # Left (FP16) has upcast, right (FP32) does not
         for line in code.splitlines():
-            if "a = tl.load(a_ptrs," in line:
-                assert ".to(tl.float32)" in line
-            if "b = tl.load(b_ptrs," in line:
+            if "tl.load(" in line and "_block_ptr" in line:
                 assert ".to(tl.float32)" not in line
 
-    def test_upcast_before_dot(self, gen, output_fp32):
-        """Upcast must appear before tl.dot to prevent precision loss."""
+    def test_fp32_accumulation_via_acc_param(self, gen, output_fp32):
+        """fp32 accumulation is achieved via acc=acc in tl.dot, not upcast."""
         a = TensorDescriptor("a", (128, 64), (64, 1), torch.float16)
         b = TensorDescriptor("b", (64, 256), (256, 1), torch.float16)
         code = gen.generate_k_loop([a, b], output_fp32)
-        # The .to(tl.float32) must appear on the load lines which
-        # come before tl.dot
-        assert code.index(".to(tl.float32)") < code.index("tl.dot(")
+        assert "acc = tl.dot(a, b, acc=acc)" in code
 
 
 @pytest.mark.precision
@@ -593,23 +595,25 @@ class TestPrecisionIntegration:
     """End-to-end pipeline tests combining multiple precision features."""
 
     def test_fp16_inputs_fp16_output_full_pipeline(self, gen):
-        """FP16→FP32 accumulator→FP16 output: upcast + saturation + cast."""
+        """FP16 matmul with fp32 accumulation, epilogue downcast, and saturation store."""
         a = TensorDescriptor("a", (128, 64), (64, 1), torch.float16)
         b = TensorDescriptor("b", (64, 256), (256, 1), torch.float16)
         out = TensorDescriptor("out", (128, 256), (256, 1), torch.float16)
 
-        sig = gen.generate_signature_and_pointers([a, b], out)
         kloop = gen.generate_k_loop([a, b], out)
         store = gen._section_store(out)
 
-        # K-loop has upcasts
-        assert ".to(tl.float32)" in kloop
+        # K-loop uses native dtype loads + fp32 accumulation via acc=acc
+        assert "acc = tl.dot(a, b, acc=acc)" in kloop
+        # K-loop epilogue downcast: FP16 saturation + narrowing cast
+        assert "65504" in kloop
+        assert "acc.to(tl.float16)" in kloop or ".to(tl.float16)" in kloop
         # Store has saturation + cast
         assert "65504.0" in store
         assert "acc.to(tl.float16)" in store
 
     def test_bf16_inputs_bf16_output_no_saturation(self, gen):
-        """BF16 inputs/output: upcast on load, no saturation on store."""
+        """BF16 matmul with fp32 accumulation and epilogue downcast, no saturation."""
         a = TensorDescriptor("a", (128, 64), (64, 1), torch.bfloat16)
         b = TensorDescriptor("b", (64, 256), (256, 1), torch.bfloat16)
         out = TensorDescriptor("out", (128, 256), (256, 1), torch.bfloat16)
@@ -617,7 +621,9 @@ class TestPrecisionIntegration:
         kloop = gen.generate_k_loop([a, b], out)
         store = gen._section_store(out)
 
-        assert ".to(tl.float32)" in kloop
+        # K-loop uses native dtype + epilogue downcast to bf16
+        assert "acc = tl.dot(a, b, acc=acc)" in kloop
+        assert ".to(tl.bfloat16)" in kloop
         assert "65504" not in store
         assert "acc.to(tl.bfloat16)" in store
 

@@ -108,7 +108,8 @@ class TestSignatureGeneration:
         code = gen.generate_signature_and_pointers(matmul_inputs, output_tensor)
         assert "tl.arange(0, BLOCK_SIZE_M)" in code
         assert "tl.arange(0, BLOCK_SIZE_N)" in code
-        assert "tl.arange(0, BLOCK_SIZE_K)" in code
+        # offs_k is no longer emitted — K-axis handled by block pointers
+        assert "tl.arange(0, BLOCK_SIZE_K)" not in code
 
 
 # ---------------------------------------------------------------------------
@@ -158,12 +159,22 @@ class TestPointerArithmetic:
     """Verify pointer arithmetic patterns in generated code."""
 
     def test_a_pointer_arithmetic(self, gen, matmul_inputs, output_tensor):
+        """Matmul operands use tl.make_block_ptr instead of scalar offsets."""
         code = gen.generate_signature_and_pointers(matmul_inputs, output_tensor)
-        assert "a_ptrs = a_ptr + (offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak)" in code
+        assert "a_block_ptr = tl.make_block_ptr(" in code
+        assert "base=a_ptr," in code
+        assert "shape=(M, K)," in code
+        assert "strides=(stride_am, stride_ak)," in code
+        assert "block_shape=(BLOCK_SIZE_M, BLOCK_SIZE_K)," in code
 
     def test_b_pointer_arithmetic(self, gen, matmul_inputs, output_tensor):
+        """Matmul operands use tl.make_block_ptr instead of scalar offsets."""
         code = gen.generate_signature_and_pointers(matmul_inputs, output_tensor)
-        assert "b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn)" in code
+        assert "b_block_ptr = tl.make_block_ptr(" in code
+        assert "base=b_ptr," in code
+        assert "shape=(K, N)," in code
+        assert "strides=(stride_bk, stride_bn)," in code
+        assert "block_shape=(BLOCK_SIZE_K, BLOCK_SIZE_N)," in code
 
     def test_output_pointer_arithmetic(self, gen, matmul_inputs, output_tensor):
         code = gen.generate_signature_and_pointers(matmul_inputs, output_tensor)
@@ -222,8 +233,8 @@ class TestInputOrdering:
         a = TensorDescriptor("a", (128, 64), (64, 1), torch.float32)
         b = TensorDescriptor("b", (64, 256), (256, 1), torch.float32)
         code = gen.generate_signature_and_pointers([bias, a, b], output_tensor)
-        # bias_ptrs section comes before a_ptrs section
-        assert code.index("bias_ptrs") < code.index("a_ptrs")
+        # bias_ptrs section comes before a_block_ptr section
+        assert code.index("bias_ptrs") < code.index("a_block_ptr")
 
 
 # ---------------------------------------------------------------------------
@@ -261,12 +272,14 @@ class TestReversedMatrixOrder:
         assert ptr_line.index("b_ptr") < ptr_line.index("a_ptr")
 
     def test_reversed_order_correct_pointer_arithmetic(self, gen, output_tensor):
-        """Pointer arithmetic uses the correct dimension labels after swap."""
+        """Block pointer setup uses correct labels after auto-swap."""
         b = TensorDescriptor("b", (64, 256), (256, 1), torch.float32)
         a = TensorDescriptor("a", (128, 64), (64, 1), torch.float32)
         code = gen.generate_signature_and_pointers([b, a], output_tensor)
-        assert "a_ptrs = a_ptr + (offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak)" in code
-        assert "b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn)" in code
+        assert "a_block_ptr = tl.make_block_ptr(" in code
+        assert "b_block_ptr = tl.make_block_ptr(" in code
+        assert "strides=(stride_am, stride_ak)," in code
+        assert "strides=(stride_bk, stride_bn)," in code
 
 
 # ---------------------------------------------------------------------------
@@ -380,15 +393,15 @@ class TestKLoopStructure:
 
     def test_dot_product(self, gen, matmul_inputs, output_tensor):
         code = gen.generate_k_loop(matmul_inputs, output_tensor)
-        assert "acc += tl.dot(a, b)" in code
+        assert "acc = tl.dot(a, b, acc=acc)" in code
 
     def test_load_left(self, gen, matmul_inputs, output_tensor):
         code = gen.generate_k_loop(matmul_inputs, output_tensor)
-        assert "a = tl.load(a_ptrs," in code
+        assert "a = tl.load(a_block_ptr," in code
 
     def test_load_right(self, gen, matmul_inputs, output_tensor):
         code = gen.generate_k_loop(matmul_inputs, output_tensor)
-        assert "b = tl.load(b_ptrs," in code
+        assert "b = tl.load(b_block_ptr," in code
 
 
 # ---------------------------------------------------------------------------
@@ -396,42 +409,53 @@ class TestKLoopStructure:
 # ---------------------------------------------------------------------------
 
 @pytest.mark.codegen
-class TestKLoopMasking:
-    """Verify 2-D compound masks prevent OOB reads on all axes.
+class TestKLoopBoundaryHandling:
+    """Verify block-pointer boundary_check replaces explicit compound masks.
 
-    A K-only mask segfaults when M or N are not divisible by their
-    block sizes.  Each load must guard *both* the spatial boundary
-    (M for left, N for right) and the K boundary.
+    With ``tl.make_block_ptr``, boundary checking is handled by the
+    ``boundary_check=(0, 1)`` parameter, which tells the Triton compiler
+    to insert minimal PTX guard code for both tile dimensions.  This
+    replaces the old explicit ``(offs_m < M) & (k_mask)`` compound masks.
     """
 
-    def test_k_mask_computed(self, gen, matmul_inputs, output_tensor):
+    def test_boundary_check_on_left(self, gen, matmul_inputs, output_tensor):
+        """Left operand load uses boundary_check for both dimensions."""
         code = gen.generate_k_loop(matmul_inputs, output_tensor)
-        assert "k_mask = offs_k < K - k * BLOCK_SIZE_K" in code
+        # Find the left load line and verify boundary_check
+        for line in code.splitlines():
+            if "a = tl.load(a_block_ptr," in line:
+                assert "boundary_check=(0, 1)" in line
+                break
+        else:
+            pytest.fail("Left operand block-pointer load line not found")
 
-    def test_left_m_boundary(self, gen, matmul_inputs, output_tensor):
-        """Left operand load guards the M boundary."""
+    def test_boundary_check_on_right(self, gen, matmul_inputs, output_tensor):
+        """Right operand load uses boundary_check for both dimensions."""
         code = gen.generate_k_loop(matmul_inputs, output_tensor)
-        assert "offs_m[:, None] < M" in code
+        for line in code.splitlines():
+            if "b = tl.load(b_block_ptr," in line:
+                assert "boundary_check=(0, 1)" in line
+                break
+        else:
+            pytest.fail("Right operand block-pointer load line not found")
 
-    def test_left_compound_mask(self, gen, matmul_inputs, output_tensor):
-        """Left load uses full 2-D mask: M boundary & K boundary."""
+    def test_no_explicit_k_mask(self, gen, matmul_inputs, output_tensor):
+        """Block pointers eliminate explicit K-boundary masks."""
         code = gen.generate_k_loop(matmul_inputs, output_tensor)
-        assert "mask=(offs_m[:, None] < M) & (k_mask[None, :])" in code
+        assert "k_mask" not in code
 
-    def test_right_n_boundary(self, gen, matmul_inputs, output_tensor):
-        """Right operand load guards the N boundary."""
+    def test_no_explicit_offs_k(self, gen, matmul_inputs, output_tensor):
+        """Block pointers eliminate the need for offs_k in the K-loop."""
         code = gen.generate_k_loop(matmul_inputs, output_tensor)
-        assert "offs_n[None, :] < N" in code
+        assert "offs_k" not in code
 
-    def test_right_compound_mask(self, gen, matmul_inputs, output_tensor):
-        """Right load uses full 2-D mask: K boundary & N boundary."""
+    def test_no_other_zero(self, gen, matmul_inputs, output_tensor):
+        """Block pointers use boundary_check instead of other=0.0 padding."""
         code = gen.generate_k_loop(matmul_inputs, output_tensor)
-        assert "mask=(k_mask[:, None]) & (offs_n[None, :] < N)" in code
-
-    def test_other_zero(self, gen, matmul_inputs, output_tensor):
-        """Masked-out elements must be zero to avoid corrupting the dot product."""
-        code = gen.generate_k_loop(matmul_inputs, output_tensor)
-        assert "other=0.0" in code
+        # other=0.0 should not appear on the block-pointer load lines
+        for line in code.splitlines():
+            if "tl.load(" in line and "block_ptr" in line:
+                assert "other=" not in line
 
 
 # ---------------------------------------------------------------------------
@@ -452,22 +476,22 @@ class TestKLoopEvictionPolicies:
     def test_left_load_evict_last(self, gen, matmul_inputs, output_tensor):
         code = gen.generate_k_loop(matmul_inputs, output_tensor)
         assert "eviction_policy='evict_last'" in code
-        # Specifically on the left operand load line
+        # Specifically on the left operand block-pointer load line
         for line in code.splitlines():
-            if "a = tl.load(a_ptrs," in line:
+            if "a = tl.load(a_block_ptr," in line:
                 assert "eviction_policy='evict_last'" in line
                 break
         else:
-            pytest.fail("Left operand load line not found")
+            pytest.fail("Left operand block-pointer load line not found")
 
     def test_right_load_evict_last(self, gen, matmul_inputs, output_tensor):
         code = gen.generate_k_loop(matmul_inputs, output_tensor)
         for line in code.splitlines():
-            if "b = tl.load(b_ptrs," in line:
+            if "b = tl.load(b_block_ptr," in line:
                 assert "eviction_policy='evict_last'" in line
                 break
         else:
-            pytest.fail("Right operand load line not found")
+            pytest.fail("Right operand block-pointer load line not found")
 
     def test_evict_last_comment_present(self, gen, matmul_inputs, output_tensor):
         """Generated code must explain the eviction policy rationale."""
@@ -486,16 +510,16 @@ class TestKLoopPointerAdvance:
 
     def test_advance_left_ptrs(self, gen, matmul_inputs, output_tensor):
         code = gen.generate_k_loop(matmul_inputs, output_tensor)
-        assert "a_ptrs += BLOCK_SIZE_K * stride_ak" in code
+        assert "a_block_ptr = tl.advance(a_block_ptr, (0, BLOCK_SIZE_K))" in code
 
     def test_advance_right_ptrs(self, gen, matmul_inputs, output_tensor):
         code = gen.generate_k_loop(matmul_inputs, output_tensor)
-        assert "b_ptrs += BLOCK_SIZE_K * stride_bk" in code
+        assert "b_block_ptr = tl.advance(b_block_ptr, (BLOCK_SIZE_K, 0))" in code
 
     def test_advance_after_dot(self, gen, matmul_inputs, output_tensor):
-        """Pointer advancement must come after the dot product."""
+        """Block pointer advancement must come after the dot product."""
         code = gen.generate_k_loop(matmul_inputs, output_tensor)
-        assert code.index("tl.dot") < code.index("a_ptrs += BLOCK_SIZE_K")
+        assert code.index("tl.dot") < code.index("tl.advance(a_block_ptr")
 
 
 # ---------------------------------------------------------------------------
@@ -510,22 +534,22 @@ class TestKLoopReversedOrder:
         b = TensorDescriptor("b", (64, 256), (256, 1), torch.float32)
         a = TensorDescriptor("a", (128, 64), (64, 1), torch.float32)
         code = gen.generate_k_loop([b, a], output_tensor)
-        assert "a = tl.load(a_ptrs," in code
-        assert "b = tl.load(b_ptrs," in code
+        assert "a = tl.load(a_block_ptr," in code
+        assert "b = tl.load(b_block_ptr," in code
 
     def test_reversed_order_correct_advance(self, gen, output_tensor):
         b = TensorDescriptor("b", (64, 256), (256, 1), torch.float32)
         a = TensorDescriptor("a", (128, 64), (64, 1), torch.float32)
         code = gen.generate_k_loop([b, a], output_tensor)
-        assert "a_ptrs += BLOCK_SIZE_K * stride_ak" in code
-        assert "b_ptrs += BLOCK_SIZE_K * stride_bk" in code
+        assert "tl.advance(a_block_ptr, (0, BLOCK_SIZE_K))" in code
+        assert "tl.advance(b_block_ptr, (BLOCK_SIZE_K, 0))" in code
 
     def test_reversed_order_correct_dot(self, gen, output_tensor):
-        """dot(left, right) must use the correct operand names after auto-swap."""
+        """dot(left, right, acc=acc) must use the correct names after auto-swap."""
         b = TensorDescriptor("b", (64, 256), (256, 1), torch.float32)
         a = TensorDescriptor("a", (128, 64), (64, 1), torch.float32)
         code = gen.generate_k_loop([b, a], output_tensor)
-        assert "acc += tl.dot(a, b)" in code
+        assert "acc = tl.dot(a, b, acc=acc)" in code
 
 
 # ---------------------------------------------------------------------------
@@ -568,22 +592,22 @@ class TestKLoopEdgeCases:
         a = TensorDescriptor("a", (128, 64), (64, 1), torch.float32)
         b = TensorDescriptor("b", (64, 256), (256, 1), torch.float32)
         code = gen.generate_k_loop([bias, a, b], output_tensor)
-        assert "a = tl.load(a_ptrs," in code
-        assert "b = tl.load(b_ptrs," in code
+        assert "a = tl.load(a_block_ptr," in code
+        assert "b = tl.load(b_block_ptr," in code
         # Bias is loaded after the K-loop and broadcast-added to acc
         assert "tl.load(bias" in code
         assert "acc = acc + bias" in code
 
     def test_multichar_tensor_names(self, gen, output_tensor):
-        """Multi-char names use underscore-separated stride params."""
+        """Multi-char names use block pointer loads and tl.advance."""
         left = TensorDescriptor("input", (128, 64), (64, 1), torch.float32)
         right = TensorDescriptor("weight", (64, 256), (256, 1), torch.float32)
         code = gen.generate_k_loop([left, right], output_tensor)
-        assert "input = tl.load(input_ptrs," in code
-        assert "weight = tl.load(weight_ptrs," in code
-        assert "input_ptrs += BLOCK_SIZE_K * stride_input_k" in code
-        assert "weight_ptrs += BLOCK_SIZE_K * stride_weight_k" in code
-        assert "acc += tl.dot(input, weight)" in code
+        assert "input = tl.load(input_block_ptr," in code
+        assert "weight = tl.load(weight_block_ptr," in code
+        assert "tl.advance(input_block_ptr, (0, BLOCK_SIZE_K))" in code
+        assert "tl.advance(weight_block_ptr, (BLOCK_SIZE_K, 0))" in code
+        assert "acc = tl.dot(input, weight, acc=acc)" in code
 
 
 # ---------------------------------------------------------------------------
@@ -617,12 +641,16 @@ class TestEpilogueRelu:
 
 @pytest.mark.codegen
 class TestEpilogueGelu:
-    """GeLU post-op: fast tanh approximation."""
+    """GeLU post-op: fast-math Padé polynomial approximation."""
 
-    def test_gelu_emits_tanh(self, gen):
+    def test_gelu_emits_pade_approx(self, gen):
+        """Uses Padé(3,2) rational polynomial instead of libdevice.tanh."""
         node = _make_node(target=torch.ops.aten.gelu.default)
         code = gen.generate_epilogue([node])
-        assert "libdevice.tanh" in code
+        assert "_tanh_approx" in code
+        assert "27.0" in code
+        # Must NOT use the slow libdevice path
+        assert "libdevice.tanh" not in code
 
     def test_gelu_sqrt_2_over_pi(self, gen):
         """Must use sqrt(2/pi) ≈ 0.7978845608 constant."""
@@ -643,10 +671,16 @@ class TestEpilogueGelu:
         assert "0.5 * acc" in code
 
     def test_gelu_modifies_acc(self, gen):
-        """Result must be assigned back to acc."""
+        """Result must be assigned back to acc using the polynomial approx."""
         node = _make_node(target=torch.ops.aten.gelu.default)
         code = gen.generate_epilogue([node])
-        assert "acc = 0.5 * acc * (1.0 + tl.extra.cuda.libdevice.tanh(" in code
+        assert "acc = 0.5 * acc * (1.0 + _tanh_approx)" in code
+
+    def test_gelu_pade_inner_sq(self, gen):
+        """Padé approximation computes inner² for the rational polynomial."""
+        node = _make_node(target=torch.ops.aten.gelu.default)
+        code = gen.generate_epilogue([node])
+        assert "_inner_sq = _gelu_inner * _gelu_inner" in code
 
     def test_gelu_no_hbm_load(self, gen):
         """GeLU is register-only — must not emit tl.load."""
@@ -810,7 +844,7 @@ class TestEpilogueChained:
             args=(gelu_node, residual),
         )
         code = gen.generate_epilogue([gelu_node, add_node])
-        assert code.index("libdevice.tanh") < code.index("tl.load")
+        assert code.index("_tanh_approx") < code.index("tl.load")
 
     def test_add_then_relu(self, gen):
         """Residual add followed by ReLU."""
@@ -895,7 +929,7 @@ class TestEpilogueTransparentOps:
         code = gen.generate_epilogue([relu_node, view_node, gelu_node])
         assert "tl.where" in code        # relu
         assert "no-op" in code            # view
-        assert "libdevice.tanh" in code     # gelu
+        assert "_tanh_approx" in code     # gelu (Padé polynomial)
 
     def test_unsqueeze_emits_noop(self, gen):
         node = _make_node(target=torch.ops.aten.unsqueeze.default)

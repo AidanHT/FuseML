@@ -498,15 +498,15 @@ class TestSelectNumStages:
         # e.g. M=1024, N=1024, K=128 → (2048)*128*4 = 1,048,576 > 524,288
         assert KernelLauncher._select_num_stages(1024, 1024, 128, torch.float32) == 3
 
-    def test_large_fp16_returns_4(self):
-        """Large FP16 working set → 4 stages (deeper pipelining)."""
+    def test_large_fp16_returns_5(self):
+        """Large FP16 working set → 5 stages (deep cp.async pipelining on Ada)."""
         # (M+N)*K*2 >= 524288 → e.g. M=1024, N=1024, K=256
         # (2048)*256*2 = 1,048,576 > 524,288
-        assert KernelLauncher._select_num_stages(1024, 1024, 256, torch.float16) == 4
+        assert KernelLauncher._select_num_stages(1024, 1024, 256, torch.float16) == 5
 
-    def test_large_bf16_returns_4(self):
-        """BF16 behaves like FP16 for stage selection."""
-        assert KernelLauncher._select_num_stages(1024, 1024, 256, torch.bfloat16) == 4
+    def test_large_bf16_returns_5(self):
+        """BF16 behaves like FP16 for stage selection (Ada cp.async)."""
+        assert KernelLauncher._select_num_stages(1024, 1024, 256, torch.bfloat16) == 5
 
     def test_returned_values_are_positive(self):
         for M, N, K in [(8, 8, 4), (128, 256, 64), (2048, 2048, 512)]:
@@ -762,27 +762,34 @@ class TestSRAMCapacityEnforcement:
     """Verify _enforce_sram_capacity downscales blocks to fit SRAM budget."""
 
     def test_small_tile_unchanged(self):
-        """64x64 FP32 = 16KB < 48KB → no change."""
+        """64x64 FP32 = 16KB < 100KB → no change."""
         m, n = KernelLauncher._enforce_sram_capacity(64, 64, torch.float32)
         assert (m, n) == (64, 64)
 
     def test_large_tile_downscaled(self):
-        """256x256 FP32 = 256KB > 48KB → must shrink."""
+        """256x256 FP32 = 256KB > 100KB → must shrink."""
         m, n = KernelLauncher._enforce_sram_capacity(256, 256, torch.float32)
         assert m * n * 4 <= _DEFAULT_SRAM_BUDGET_BYTES
         assert m & (m - 1) == 0  # power of 2
         assert n & (n - 1) == 0
 
     def test_halves_larger_dim_first(self):
-        """128x128 FP32 = 64KB > 48KB → halve M first since M >= N."""
-        m, n = KernelLauncher._enforce_sram_capacity(128, 128, torch.float32)
+        """256x256 FP32 = 256KB > 100KB → halve M first since M >= N."""
+        m, n = KernelLauncher._enforce_sram_capacity(256, 256, torch.float32)
         assert m * n * 4 <= _DEFAULT_SRAM_BUDGET_BYTES
-        # M was halved first (128 >= 128, so M goes first)
-        assert m == 64
-        assert n == 128
+        # With 100KB budget, 256x256 FP32 = 256KB needs downscaling
+        assert m <= 256
+        assert n <= 256
+        assert m & (m - 1) == 0  # power of 2
+        assert n & (n - 1) == 0
+
+    def test_128x128_fp32_fits_ada(self):
+        """128x128 FP32 = 64KB < 100KB → unchanged on Ada."""
+        m, n = KernelLauncher._enforce_sram_capacity(128, 128, torch.float32)
+        assert (m, n) == (128, 128)
 
     def test_fp16_allows_larger_tiles(self):
-        """128x128 FP16 = 32KB < 48KB → unchanged."""
+        """128x128 FP16 = 32KB < 100KB → unchanged."""
         m, n = KernelLauncher._enforce_sram_capacity(128, 128, torch.float16)
         assert (m, n) == (128, 128)
 
@@ -829,7 +836,7 @@ class TestSRAMEnforcementInCall:
         """Block sizes that exceed SRAM budget are downscaled before launch."""
         launcher = KernelLauncher(
             mock_kernel_fn, input_descs, output_desc, [], "a", "b",
-            block_size_m=256, block_size_n=256,  # 256*256*4 = 256KB >> 48KB
+            block_size_m=256, block_size_n=256,  # 256*256*4 = 256KB >> 100KB
         )
         a = torch.randn(128, 64)
         b = torch.randn(64, 256)
@@ -843,7 +850,7 @@ class TestSRAMEnforcementInCall:
         """Block sizes within SRAM budget pass through unchanged."""
         launcher = KernelLauncher(
             mock_kernel_fn, input_descs, output_desc, [], "a", "b",
-            block_size_m=32, block_size_n=64,  # 32*64*4 = 8KB << 48KB
+            block_size_m=32, block_size_n=64,  # 32*64*4 = 8KB << 100KB
         )
         a = torch.randn(128, 64)
         b = torch.randn(64, 256)

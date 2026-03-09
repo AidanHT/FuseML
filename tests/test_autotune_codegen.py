@@ -121,8 +121,8 @@ def output_fp16():
 class TestAutotuneConstants:
     """Verify the module-level autotuning constants."""
 
-    def test_sram_budget_is_48kb(self):
-        assert _AUTOTUNE_SRAM_BUDGET_BYTES == 48 * 1024
+    def test_sram_budget_is_100kb(self):
+        assert _AUTOTUNE_SRAM_BUDGET_BYTES == 100 * 1024
 
     def test_block_m_choices(self):
         assert _AUTOTUNE_BLOCK_M_CHOICES == (32, 64, 128)
@@ -137,7 +137,7 @@ class TestAutotuneConstants:
         assert _AUTOTUNE_NUM_WARPS_CHOICES == (4, 8)
 
     def test_num_stages_choices(self):
-        assert _AUTOTUNE_NUM_STAGES_CHOICES == (2, 3, 4)
+        assert _AUTOTUNE_NUM_STAGES_CHOICES == (2, 3, 4, 5)
 
     def test_reduction_num_warps_includes_16(self):
         assert 16 in _AUTOTUNE_REDUCTION_NUM_WARPS_CHOICES
@@ -567,7 +567,7 @@ class TestAutotuneSignatureIntegration:
         )
         assert "offs_m" in code
         assert "offs_n" in code
-        assert "offs_k" in code
+        # offs_k is no longer emitted — block pointers handle K-axis advancement
 
 
 # ===========================================================================
@@ -735,7 +735,7 @@ class TestAutotuneEndToEnd:
         assert "tl.store(" in full
 
     def test_autotune_fp16_with_safe_downcast(self, gen, matmul_inputs_fp16, output_fp16):
-        """FP16 autotune + K-loop upcast + saturation store."""
+        """FP16 autotune + native Tensor Core loads + saturation store."""
         sig = gen.generate_signature_and_pointers(
             matmul_inputs_fp16, output_fp16, autotune=True,
         )
@@ -743,8 +743,8 @@ class TestAutotuneEndToEnd:
         store = gen._section_store(output_fp16)
         full = "\n".join([sig, kloop, store])
         assert "@triton.autotune(" in full
-        assert ".to(tl.float32)" in kloop  # upcast on load
-        assert "65504.0" in store           # FP16 saturation
+        assert "acc = tl.dot(" in kloop       # fp32 accum via acc=acc
+        assert "65504.0" in store             # FP16 saturation
 
     def test_autotune_reduction_full_pipeline(self, gen, matmul_inputs_fp32):
         """Reduction autotune: higher warps + reduced output + atomic store."""
