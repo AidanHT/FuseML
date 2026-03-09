@@ -31,14 +31,21 @@ from fuseml.passes.graph_cut import (
     split_fusion_group,
     validate_fusion_group,
 )
+from fuseml.passes.mutation_safety import (
+    IN_PLACE_OPS,
+    MutationFinding,
+    is_safe_inplace,
+)
 from fuseml.registry import SupportedOpsRegistry, build_default_registry
 
 __all__ = [
     "ControlFlowError",
     "FuseMLCompiler",
     "FuseMLFusionPass",
+    "IN_PLACE_OPS",
     "FusionGroup",
     "GraphSegment",
+    "MutationFinding",
     "KernelCache",
     "KernelCacheKey",
     "ReductionInfo",
@@ -51,6 +58,7 @@ __all__ = [
     "build_default_registry",
     "build_op_chain",
     "fuseml_fused_kernel_placeholder",
+    "is_safe_inplace",
     "next_power_of_2",
     "split_fusion_group",
     "validate_fusion_group",

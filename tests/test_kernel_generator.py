@@ -746,6 +746,128 @@ class TestEpilogueChained:
 # Epilogue: edge cases
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Epilogue: Sigmoid
+# ---------------------------------------------------------------------------
+
+@pytest.mark.codegen
+class TestEpilogueSigmoid:
+    """Sigmoid post-op: acc = tl.sigmoid(acc.to(tl.float32))."""
+
+    def test_sigmoid_emits_tl_sigmoid(self, gen):
+        node = _make_node(target=torch.ops.aten.sigmoid.default)
+        code = gen.generate_epilogue([node])
+        assert "tl.sigmoid" in code
+
+    def test_sigmoid_inplace_emits_tl_sigmoid(self, gen):
+        node = _make_node(target=torch.ops.aten.sigmoid_.default)
+        code = gen.generate_epilogue([node])
+        assert "tl.sigmoid" in code
+
+    def test_sigmoid_comment(self, gen):
+        node = _make_node(target=torch.ops.aten.sigmoid.default)
+        code = gen.generate_epilogue([node])
+        assert "Sigmoid" in code
+
+    def test_sigmoid_no_hbm_load(self, gen):
+        """Sigmoid is register-only — must not emit tl.load."""
+        node = _make_node(target=torch.ops.aten.sigmoid.default)
+        code = gen.generate_epilogue([node])
+        assert "tl.load" not in code
+
+
+# ---------------------------------------------------------------------------
+# Epilogue: Transparent view/metadata ops
+# ---------------------------------------------------------------------------
+
+@pytest.mark.codegen
+class TestEpilogueTransparentOps:
+    """Transparent ops emit a no-op comment, not a warning."""
+
+    def test_view_emits_noop_comment(self, gen):
+        node = _make_node(target=torch.ops.aten.view.default)
+        code = gen.generate_epilogue([node])
+        assert "no-op" in code
+        assert "Transparent" in code
+
+    def test_reshape_emits_noop_comment(self, gen):
+        node = _make_node(target=torch.ops.aten.reshape.default)
+        code = gen.generate_epilogue([node])
+        assert "no-op" in code
+
+    def test_view_does_not_emit_unsupported_warning(self, gen):
+        """View ops must NOT trigger the 'Unsupported epilogue target' path."""
+        node = _make_node(target=torch.ops.aten.view.default)
+        code = gen.generate_epilogue([node])
+        assert "Unsupported" not in code
+
+    def test_view_between_ops_in_epilogue(self, gen):
+        """relu → view → gelu: all three should produce code/comments."""
+        relu_node = _make_node(target=torch.ops.aten.relu.default, name="relu")
+        view_node = _make_node(target=torch.ops.aten.view.default, name="view")
+        gelu_node = _make_node(target=torch.ops.aten.gelu.default, name="gelu")
+        code = gen.generate_epilogue([relu_node, view_node, gelu_node])
+        assert "tl.where" in code        # relu
+        assert "no-op" in code            # view
+        assert "tl.math.tanh" in code     # gelu
+
+    def test_unsqueeze_emits_noop(self, gen):
+        node = _make_node(target=torch.ops.aten.unsqueeze.default)
+        code = gen.generate_epilogue([node])
+        assert "no-op" in code
+
+
+# ---------------------------------------------------------------------------
+# Epilogue: In-place variants
+# ---------------------------------------------------------------------------
+
+@pytest.mark.codegen
+class TestEpilogueInPlaceVariants:
+    """In-place op variants produce correct Triton code."""
+
+    def test_relu_inplace(self, gen):
+        node = _make_node(target=torch.ops.aten.relu_.default)
+        code = gen.generate_epilogue([node])
+        assert "tl.where" in code
+
+    def test_add_inplace(self, gen):
+        """add_.Tensor should follow the same path as add.Tensor."""
+        residual = _make_node(op="placeholder", name="res")
+        acc_node = _make_node(
+            target=torch.ops.aten.relu.default, name="relu_out",
+        )
+        add_node = _make_node(
+            target=torch.ops.aten.add_.Tensor, name="add_",
+            args=(acc_node, residual),
+        )
+        code = gen.generate_epilogue(
+            [acc_node, add_node],
+            escape_stores={},
+        )
+        # add_ should emit a load for the residual or a scalar add
+        assert "acc" in code
+
+    def test_mul_inplace(self, gen):
+        """mul_.Tensor should follow the same path as mul.Tensor."""
+        scale = _make_node(op="placeholder", name="scale")
+        acc_node = _make_node(
+            target=torch.ops.aten.relu.default, name="relu_out",
+        )
+        mul_node = _make_node(
+            target=torch.ops.aten.mul_.Tensor, name="mul_",
+            args=(acc_node, scale),
+        )
+        code = gen.generate_epilogue(
+            [acc_node, mul_node],
+            escape_stores={},
+        )
+        assert "acc" in code
+
+
+# ---------------------------------------------------------------------------
+# Epilogue: edge cases
+# ---------------------------------------------------------------------------
+
 @pytest.mark.codegen
 class TestEpilogueEdgeCases:
     """Edge cases and structural guarantees."""

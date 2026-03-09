@@ -568,3 +568,69 @@ class TestViewPenetrationTransparentOpsSet:
     ])
     def test_op_in_transparent_set(self, op):
         assert op in TRANSPARENT_OPS
+
+
+# ---------------------------------------------------------------------------
+# Tests — escape node safety (post-reduction guard)
+# ---------------------------------------------------------------------------
+
+class TestEscapeNodeSafety:
+    """Verify the post-reduction escape guard in _find_fusion_groups."""
+
+    def test_escape_before_reduction_preserved(self):
+        """addmm → relu → sum: relu has external user → relu in
+        intermediate_outputs (escape before reduction is safe)."""
+
+        class ReluThenSum(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear = nn.Linear(64, 64)
+
+            def forward(self, x):
+                h = torch.relu(self.linear(x))
+                # h is used both by sum and by an identity branch
+                return h.sum(dim=-1, keepdim=False), h
+
+        gm = trace_no_grad(ReluThenSum(), torch.randn(2, 64))
+        groups = find_groups(gm)
+
+        # If addmm → relu → sum formed a group, relu should be an escape
+        # node (consumed by both sum and the output tuple).
+        for g in groups:
+            relu_nodes = [
+                n for n in g.all_nodes
+                if n.target is torch.ops.aten.relu.default
+            ]
+            sum_nodes = [
+                n for n in g.all_nodes
+                if n.target is torch.ops.aten.sum.dim_IntList
+            ]
+            if relu_nodes and sum_nodes:
+                # relu should be in intermediate_outputs
+                assert relu_nodes[0] in g.intermediate_outputs
+
+    def test_no_escape_after_reduction_structurally(self):
+        """Reduction always terminates the group (break), so nothing can
+        appear after it in all_nodes.  This tests the structural invariant."""
+
+        class LinearReluSum(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear = nn.Linear(64, 64)
+
+            def forward(self, x):
+                return torch.relu(self.linear(x)).sum(dim=-1, keepdim=False)
+
+        gm = trace_no_grad(LinearReluSum(), torch.randn(2, 64))
+        groups = find_groups(gm)
+
+        for g in groups:
+            reduction_seen = False
+            for n in g.all_nodes:
+                if n.target in FuseMLFusionPass._REDUCTION_OPS:
+                    reduction_seen = True
+                elif reduction_seen:
+                    # No node should appear after a reduction
+                    assert False, (
+                        f"Node {n.name} appears after reduction in group"
+                    )

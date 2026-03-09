@@ -39,8 +39,12 @@ SUPPORTED_TRITON_OPS: Dict[Any, str] = {
     torch.ops.aten.relu.default: "elementwise",
     torch.ops.aten.relu_.default: "elementwise",
     torch.ops.aten.gelu.default: "elementwise",
+    torch.ops.aten.sigmoid.default: "elementwise",
+    torch.ops.aten.sigmoid_.default: "elementwise",
     torch.ops.aten.add.Tensor: "elementwise",
+    torch.ops.aten.add_.Tensor: "elementwise",
     torch.ops.aten.mul.Tensor: "elementwise",
+    torch.ops.aten.mul_.Tensor: "elementwise",
     # Reductions — cross-thread synchronization via tl.atomic_*
     torch.ops.aten.sum.dim_IntList: "reduction",
     torch.ops.aten.amax.default: "reduction",

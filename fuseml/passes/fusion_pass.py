@@ -19,6 +19,7 @@ from fuseml.passes.graph_cut import (
     split_fusion_group,
     validate_fusion_group,
 )
+from fuseml.passes.mutation_safety import IN_PLACE_OPS, is_safe_inplace
 from fuseml.registry import SupportedOpsRegistry, build_default_registry
 
 
@@ -203,6 +204,31 @@ class FuseMLFusionPass:
                     # Shape-changing view → stop absorption.
                     break
 
+                # --- In-place op absorption with aliasing guard --------
+                # In-place aten ops (relu_, add_, mul_, sigmoid_) can be
+                # fused only when the mutated tensor is not aliased by
+                # nodes outside the group.  The safety check walks the
+                # view ancestry chain to catch transitive aliasing.
+                if successor.target in IN_PLACE_OPS:
+                    if is_safe_inplace(successor, group_node_set):
+                        group.fused_nodes.append(successor)
+                        group.output_node = successor
+                        consumed.add(successor)
+                        group_node_set.add(successor)
+                        self._collect_external_inputs(
+                            successor, group_node_set, group,
+                        )
+                        current = successor
+                        continue
+                    # Aliased externally — halt absorption to preserve
+                    # PyTorch's expected mutation side-effects.
+                    logger.debug(
+                        "Aborting absorption at in-place op %s — "
+                        "mutated tensor is aliased outside the group.",
+                        successor.name,
+                    )
+                    break
+
                 # Only absorb low-intensity pointwise ops.
                 if successor.target not in self._ABSORBABLE_OPS:
                     break
@@ -233,6 +259,28 @@ class FuseMLFusionPass:
                     if user not in group_set:
                         group.intermediate_outputs.append(n)
                         break
+
+            # --- Safety: no escape node after a reduction (defensive) ----
+            # A reduction collapses acc from 2-D to 1-D.  An intermediate
+            # tl.store emitted *after* the reduction would reference the
+            # wrong shape.  The break-after-reduction rule (line 184)
+            # structurally prevents this, but we guard against future
+            # regressions by stripping any such escape nodes here.
+            intermediate_set = set(group.intermediate_outputs)
+            if intermediate_set:
+                reduction_seen = False
+                for n in group.all_nodes:
+                    if n.target in self._REDUCTION_OPS:
+                        reduction_seen = True
+                    elif reduction_seen and n in intermediate_set:
+                        logger.warning(
+                            "Escape node %s after reduction in group %s "
+                            "— removing from intermediate_outputs "
+                            "(unsafe store).",
+                            n.name,
+                            group,
+                        )
+                        group.intermediate_outputs.remove(n)
 
             # --- Resolve get_attr parameter bindings ----------------------
             self._resolve_get_attr_bindings(group)
@@ -473,16 +521,20 @@ class FuseMLFusionPass:
 
         # Phase 2: Sweep orphaned get_attr nodes that may persist after
         # standard DCE (e.g. a weight get_attr whose sole consumer was a
-        # now-dead transpose node).
-        for n in list(graph.nodes):
+        # now-dead transpose node).  Iterate in reverse topological order
+        # so that dependents are erased before their dependencies — this
+        # prevents erase_node from raising on nodes that still have users
+        # within the orphaned set.
+        for n in reversed(list(graph.nodes)):
             if n.op == "get_attr" and len(n.users) == 0:
                 logger.debug("Removing orphaned get_attr node: %s", n.name)
                 graph.erase_node(n)
 
         # Phase 3: Sweep orphaned call_function intermediates (e.g. aten.t
         # that only fed fused nodes).  Skip placeholder nodes — they are
-        # the newly inserted targets.
-        for n in list(graph.nodes):
+        # the newly inserted targets.  Reverse order for the same
+        # dependency-safety reason as Phase 2.
+        for n in reversed(list(graph.nodes)):
             if (
                 n.op == "call_function"
                 and len(n.users) == 0

@@ -18,6 +18,7 @@ from dataclasses import dataclass
 import torch
 
 from fuseml._logging import logger
+from fuseml.passes.graph_cut import TRANSPARENT_OPS
 
 
 # ---------------------------------------------------------------------------
@@ -475,6 +476,8 @@ class TritonKernelGenerator:
             # identical register semantics — tl.where(acc > 0, acc, 0.0) —
             # because the Triton accumulator is a register tile, not a
             # memory-backed tensor.  No separate in-place path is needed.
+            # The aliasing safety check in mutation_safety.py guarantees
+            # the in-place variant is only fused when alias-safe.
             if node.target in (
                 torch.ops.aten.relu.default,
                 torch.ops.aten.relu_.default,
@@ -482,9 +485,20 @@ class TritonKernelGenerator:
                 lines.append(self._emit_relu())
             elif node.target == torch.ops.aten.gelu.default:
                 lines.append(self._emit_gelu())
-            elif node.target == torch.ops.aten.add.Tensor:
+            elif node.target in (
+                torch.ops.aten.sigmoid.default,
+                torch.ops.aten.sigmoid_.default,
+            ):
+                lines.append(self._emit_sigmoid())
+            elif node.target in (
+                torch.ops.aten.add.Tensor,
+                torch.ops.aten.add_.Tensor,
+            ):
                 lines.append(self._emit_add(node, node_ids))
-            elif node.target == torch.ops.aten.mul.Tensor:
+            elif node.target in (
+                torch.ops.aten.mul.Tensor,
+                torch.ops.aten.mul_.Tensor,
+            ):
                 lines.append(self._emit_mul(node, node_ids))
             # ----- Reduction operators — cross-thread synchronization -----
             elif node.target == torch.ops.aten.sum.dim_IntList:
@@ -499,6 +513,16 @@ class TritonKernelGenerator:
                 axis, keepdim = self._determine_reduction_axis(node)
                 self._last_reduction = ReductionInfo(axis=axis, op="mean", keepdim=keepdim)
                 lines.append(self._emit_mean(axis, out_name, triton_dtype))
+            # ----- Transparent view/metadata ops (no Triton code needed) --
+            # Shape-preserving view/reshape/unsqueeze ops absorbed during
+            # pattern matching.  acc remains in SRAM registers unchanged;
+            # stride transformation is handled at the store boundary via
+            # runtime stride parameters passed to tl.store.
+            elif node.target in TRANSPARENT_OPS:
+                lines.append(
+                    f"    # (no-op) Transparent view/metadata: "
+                    f"{node.target} — acc unchanged in SRAM"
+                )
             else:
                 logger.warning(
                     "Unsupported epilogue target: %s — skipped", node.target,
@@ -911,6 +935,20 @@ class TritonKernelGenerator:
             "    # GeLU activation — fast tanh approximation (all in SRAM registers)",
             "    # Formula: x * 0.5 * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))",
             "    acc = 0.5 * acc * (1.0 + tl.math.tanh(0.7978845608 * (acc + 0.044715 * acc * acc * acc)))",
+        ])
+
+    @staticmethod
+    def _emit_sigmoid() -> str:
+        """Sigmoid: 1/(1+exp(-x)) in SRAM registers.
+
+        Uses Triton's built-in ``tl.sigmoid`` which computes the logistic
+        function element-wise on the accumulator tile.  The explicit cast
+        to ``tl.float32`` prevents precision loss when the accumulator is
+        in a lower-precision format.
+        """
+        return "\n".join([
+            "    # Sigmoid activation — 1/(1+exp(-x)) (register-only, no HBM traffic)",
+            "    acc = tl.sigmoid(acc.to(tl.float32))",
         ])
 
     @staticmethod

@@ -331,6 +331,59 @@ class TestSurgeryDanglingOutputGuard:
         gm.graph.lint()
 
 
+class TestSurgeryReverseTopologicalErasure:
+    """Verify dead code sweeps use reverse topological order."""
+    pytestmark = pytest.mark.surgery
+
+    def test_cascading_get_attr_cleanup(self):
+        """get_attr → t() → addmm → relu: after surgery, both t() and
+        get_attr should be erased without error."""
+        model = nn.Sequential(nn.Linear(64, 64), nn.ReLU())
+        gm = trace_no_grad(model, torch.randn(2, 64))
+        gm, groups = run_surgery(gm)
+
+        if groups:
+            # No orphaned get_attr nodes should remain.
+            orphaned_get_attr = [
+                n for n in gm.graph.nodes
+                if n.op == "get_attr" and len(n.users) == 0
+            ]
+            assert len(orphaned_get_attr) == 0
+
+    def test_orphaned_call_function_erased(self):
+        """Orphaned call_function intermediates (e.g. aten.t) should be
+        erased by the reverse-order sweep."""
+        model = nn.Sequential(nn.Linear(64, 64), nn.ReLU())
+        gm = trace_no_grad(model, torch.randn(2, 64))
+        gm, groups = run_surgery(gm)
+
+        if groups:
+            orphaned_cf = [
+                n for n in gm.graph.nodes
+                if n.op == "call_function"
+                and len(n.users) == 0
+                and n.target is not fuseml_fused_kernel_placeholder
+            ]
+            assert len(orphaned_cf) == 0
+
+    def test_graph_lint_after_reverse_cleanup(self):
+        """Graph must pass lint() after reverse-order DCE."""
+        model = nn.Sequential(nn.Linear(64, 64), nn.ReLU())
+        gm = trace_no_grad(model, torch.randn(2, 64))
+        gm, groups = run_surgery(gm)
+        gm.graph.lint()
+
+    def test_multi_phase_cleanup_idempotent(self):
+        """Running surgery twice should be safe — second run is a no-op."""
+        model = nn.Sequential(nn.Linear(64, 64), nn.ReLU())
+        gm = trace_no_grad(model, torch.randn(2, 64))
+        gm, groups1 = run_surgery(gm)
+        # Second run on already-fused graph — should find no new groups.
+        gm, groups2 = run_surgery(gm)
+        assert len(groups2) == 0
+        gm.graph.lint()
+
+
 class TestSurgeryPlaceholderRaises:
     """The placeholder should raise if actually called."""
     pytestmark = pytest.mark.surgery
