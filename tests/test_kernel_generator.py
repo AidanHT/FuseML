@@ -133,6 +133,117 @@ class TestPointerArithmetic:
 
 
 # ---------------------------------------------------------------------------
+# Input ordering (Bug A fix)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.codegen
+class TestInputOrdering:
+    """Pointer list and stride blocks must follow caller-supplied order."""
+
+    def test_preserves_input_order_bias_first(self, gen, output_tensor):
+        """addmm convention: [bias, A, B] — pointers must appear in that order."""
+        bias = TensorDescriptor("bias", (256,), (1,), torch.float32)
+        a = TensorDescriptor("a", (128, 64), (64, 1), torch.float32)
+        b = TensorDescriptor("b", (64, 256), (256, 1), torch.float32)
+        code = gen.generate_signature_and_pointers([bias, a, b], output_tensor)
+        # The pointer line must list bias_ptr before a_ptr
+        ptr_line = [l for l in code.splitlines() if "bias_ptr" in l and "a_ptr" in l][0]
+        assert ptr_line.index("bias_ptr") < ptr_line.index("a_ptr")
+
+    def test_stride_order_matches_input_order(self, gen, output_tensor):
+        """Stride blocks must appear in the same order as inputs."""
+        bias = TensorDescriptor("bias", (256,), (1,), torch.float32)
+        a = TensorDescriptor("a", (128, 64), (64, 1), torch.float32)
+        b = TensorDescriptor("b", (64, 256), (256, 1), torch.float32)
+        code = gen.generate_signature_and_pointers([bias, a, b], output_tensor)
+        # stride_bias_n must appear before stride_am in the source
+        assert code.index("stride_bias_n") < code.index("stride_am")
+
+    def test_pointer_arithmetic_order_matches_input_order(self, gen, output_tensor):
+        """Pointer arithmetic sections follow caller order."""
+        bias = TensorDescriptor("bias", (256,), (1,), torch.float32)
+        a = TensorDescriptor("a", (128, 64), (64, 1), torch.float32)
+        b = TensorDescriptor("b", (64, 256), (256, 1), torch.float32)
+        code = gen.generate_signature_and_pointers([bias, a, b], output_tensor)
+        # bias_ptrs section comes before a_ptrs section
+        assert code.index("bias_ptrs") < code.index("a_ptrs")
+
+
+# ---------------------------------------------------------------------------
+# Reversed matrix order (Bug B fix)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.codegen
+class TestReversedMatrixOrder:
+    """Generator must auto-detect left/right operands regardless of input order."""
+
+    def test_reversed_order_does_not_crash(self, gen, output_tensor):
+        """Passing B first, then A — should still infer M, N, K correctly."""
+        b = TensorDescriptor("b", (64, 256), (256, 1), torch.float32)
+        a = TensorDescriptor("a", (128, 64), (64, 1), torch.float32)
+        code = gen.generate_signature_and_pointers([b, a], output_tensor)
+        assert "def fused_kernel(" in code
+
+    def test_reversed_order_correct_labels(self, gen, output_tensor):
+        """A gets (m, k) labels and B gets (k, n) regardless of input order."""
+        b = TensorDescriptor("b", (64, 256), (256, 1), torch.float32)
+        a = TensorDescriptor("a", (128, 64), (64, 1), torch.float32)
+        code = gen.generate_signature_and_pointers([b, a], output_tensor)
+        # A always gets m/k strides, B always gets k/n strides
+        assert "stride_am" in code
+        assert "stride_ak" in code
+        assert "stride_bk" in code
+        assert "stride_bn" in code
+
+    def test_reversed_order_preserves_caller_pointer_order(self, gen, output_tensor):
+        """Even with auto-detection, pointer list follows caller order [b, a]."""
+        b = TensorDescriptor("b", (64, 256), (256, 1), torch.float32)
+        a = TensorDescriptor("a", (128, 64), (64, 1), torch.float32)
+        code = gen.generate_signature_and_pointers([b, a], output_tensor)
+        ptr_line = [l for l in code.splitlines() if "b_ptr" in l and "a_ptr" in l][0]
+        assert ptr_line.index("b_ptr") < ptr_line.index("a_ptr")
+
+    def test_reversed_order_correct_pointer_arithmetic(self, gen, output_tensor):
+        """Pointer arithmetic uses the correct dimension labels after swap."""
+        b = TensorDescriptor("b", (64, 256), (256, 1), torch.float32)
+        a = TensorDescriptor("a", (128, 64), (64, 1), torch.float32)
+        code = gen.generate_signature_and_pointers([b, a], output_tensor)
+        assert "a_ptrs = a_ptr + (offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak)" in code
+        assert "b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn)" in code
+
+
+# ---------------------------------------------------------------------------
+# Auxiliary 2-D tensors (Bug C fix)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.codegen
+class TestAuxiliary2DTensor:
+    """Extra 2-D inputs (e.g. residual connections) get (M x N) treatment."""
+
+    def test_residual_gets_pointer(self, gen, output_tensor):
+        a = TensorDescriptor("a", (128, 64), (64, 1), torch.float32)
+        b = TensorDescriptor("b", (64, 256), (256, 1), torch.float32)
+        res = TensorDescriptor("res", (128, 256), (256, 1), torch.float32)
+        code = gen.generate_signature_and_pointers([a, b, res], output_tensor)
+        assert "res_ptr" in code
+
+    def test_residual_gets_mn_strides(self, gen, output_tensor):
+        a = TensorDescriptor("a", (128, 64), (64, 1), torch.float32)
+        b = TensorDescriptor("b", (64, 256), (256, 1), torch.float32)
+        res = TensorDescriptor("res", (128, 256), (256, 1), torch.float32)
+        code = gen.generate_signature_and_pointers([a, b, res], output_tensor)
+        assert "stride_res_m" in code
+        assert "stride_res_n" in code
+
+    def test_residual_gets_pointer_arithmetic(self, gen, output_tensor):
+        a = TensorDescriptor("a", (128, 64), (64, 1), torch.float32)
+        b = TensorDescriptor("b", (64, 256), (256, 1), torch.float32)
+        res = TensorDescriptor("res", (128, 256), (256, 1), torch.float32)
+        code = gen.generate_signature_and_pointers([a, b, res], output_tensor)
+        assert "res_ptrs = res_ptr + (offs_m[:, None] * stride_res_m + offs_n[None, :] * stride_res_n)" in code
+
+
+# ---------------------------------------------------------------------------
 # Edge cases and validation
 # ---------------------------------------------------------------------------
 

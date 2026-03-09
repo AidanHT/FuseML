@@ -89,6 +89,35 @@ def _vector_dim(tensor: TensorDescriptor, M: int, N: int) -> str:
     return "n"
 
 
+def _identify_matmul_operands(
+    matrices: list[TensorDescriptor],
+) -> tuple[TensorDescriptor, TensorDescriptor]:
+    """Find the (left, right) matmul pair from a list of 2-D tensors.
+
+    Tries both orderings of the first two matrices to find the one where
+    the inner (contracting) dimensions align: ``left.shape[1] == right.shape[0]``.
+
+    Returns
+    -------
+    (left, right) : tuple[TensorDescriptor, TensorDescriptor]
+        ``left`` is the (M, K) operand, ``right`` is the (K, N) operand.
+
+    Raises
+    ------
+    ValueError
+        If neither ordering produces matching inner dimensions.
+    """
+    m0, m1 = matrices[0], matrices[1]
+    if m0.shape[1] == m1.shape[0]:
+        return m0, m1
+    if m1.shape[1] == m0.shape[0]:
+        return m1, m0
+    raise ValueError(
+        f"Contracting dimension mismatch: "
+        f"{m0.name}{m0.shape} vs {m1.name}{m1.shape}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # TritonKernelGenerator
 # ---------------------------------------------------------------------------
@@ -118,18 +147,20 @@ class TritonKernelGenerator:
         1. ``@triton.jit`` decorator.
         2. ``def fused_kernel(...)`` with dynamically generated pointer,
            dimension, stride, and ``tl.constexpr`` block-size parameters.
+           Pointers and strides follow the caller-supplied input order.
         3. ``tl.program_id`` block-offset computation for the M and N
            dimensions.
         4. Initial pointer arithmetic for every input tensor and the
-           output tensor.
+           output tensor, in the caller-supplied order.
 
         Parameters
         ----------
         input_tensors :
-            Descriptors for each unique input.  Must include exactly two
-            2-D tensors (the matmul operands A and B); additional 1-D
-            tensors are treated as bias vectors broadcast along the
-            matching dimension.
+            Descriptors for each unique input.  Must include at least two
+            2-D tensors (the matmul operands A and B); additional 2-D
+            tensors are treated as auxiliary (M x N) operands (e.g.
+            residual connections).  1-D tensors are treated as bias
+            vectors broadcast along the matching dimension.
         output_tensor :
             Descriptor for the 2-D output tensor.
 
@@ -140,38 +171,51 @@ class TritonKernelGenerator:
             (contracting) dimensions of the two matrices do not match.
         """
         unique = _deduplicate(input_tensors)
-        matrices, vectors = _classify(unique)
+        matrices, _ = _classify(unique)
 
         if len(matrices) < 2:
             raise ValueError(
                 f"Need >= 2 two-dimensional inputs for matmul, got {len(matrices)}"
             )
 
-        a, b = matrices[0], matrices[1]
-        M, K_a = a.shape
-        K_b, N = b.shape
-        if K_a != K_b:
-            raise ValueError(
-                f"Contracting dimension mismatch: "
-                f"{a.name}{a.shape} vs {b.name}{b.shape}"
-            )
+        # Identify the matmul pair — tries both orderings.
+        left, right = _identify_matmul_operands(matrices)
+        M, K = left.shape
+        N = right.shape[1]
 
         logger.debug(
             "Generating kernel signature — M=%d, N=%d, K=%d, inputs=%s",
-            M, N, K_a, [t.name for t in unique],
+            M, N, K, [t.name for t in unique],
         )
+
+        # Map every input tensor to its dimension labels.
+        dim_labels: dict[str, tuple[str, ...]] = {
+            left.name: ("m", "k"),
+            right.name: ("k", "n"),
+        }
+        for t in unique:
+            if t.name in dim_labels:
+                continue
+            if len(t.shape) == 2:
+                # Auxiliary 2-D tensor (e.g. residual) — same tile as output.
+                dim_labels[t.name] = ("m", "n")
+            elif len(t.shape) == 1:
+                dim_labels[t.name] = (_vector_dim(t, M, N),)
 
         sections = [
             self._section_decorator(),
-            self._section_function_def(a, b, vectors, output_tensor),
+            self._section_function_def(unique, output_tensor, dim_labels),
             self._section_docstring(),
             self._section_program_ids(),
             self._section_block_offsets(),
-            self._section_matrix_ptrs(a, ("m", "k")),
-            self._section_matrix_ptrs(b, ("k", "n")),
         ]
-        for v in vectors:
-            sections.append(self._section_vector_ptrs(v, M, N))
+        # Pointer arithmetic — iterate inputs in caller-supplied order.
+        for t in unique:
+            labels = dim_labels[t.name]
+            if len(labels) == 2:
+                sections.append(self._section_matrix_ptrs(t, labels))
+            else:
+                sections.append(self._section_vector_ptrs(t, labels[0]))
         sections.append(self._section_output_ptrs(output_tensor))
         sections.append(self._section_footer())
 
@@ -187,20 +231,20 @@ class TritonKernelGenerator:
 
     @staticmethod
     def _section_function_def(
-        a: TensorDescriptor,
-        b: TensorDescriptor,
-        vectors: list[TensorDescriptor],
+        inputs: list[TensorDescriptor],
         output: TensorDescriptor,
+        dim_labels: dict[str, tuple[str, ...]],
     ) -> str:
         """Build ``def fused_kernel(...):``.
 
         Parameter groups, in order:
-        pointers -> dimensions -> strides (A, B, vectors, output) -> constexpr.
+        pointers -> dimensions -> strides (each input in caller order,
+        then output) -> constexpr block sizes.
         """
         params: list[str] = []
 
-        # -- Pointers --
-        all_tensors = [a, b, *vectors, output]
+        # -- Pointers: inputs in caller-supplied order, then output --
+        all_tensors = [*inputs, output]
         ptr_names = ", ".join(f"{t.name}_ptr" for t in all_tensors)
         params.append("    # Pointers to input / output tensors")
         params.append(f"    {ptr_names},")
@@ -209,24 +253,14 @@ class TritonKernelGenerator:
         params.append("    # Matrix dimensions")
         params.append("    M, N, K,")
 
-        # -- Strides: A (M x K) --
-        s_am = _stride_param(a.name, "m")
-        s_ak = _stride_param(a.name, "k")
-        params.append(f"    # Strides for {a.name} (M x K)")
-        params.append(f"    {s_am}, {s_ak},")
-
-        # -- Strides: B (K x N) --
-        s_bk = _stride_param(b.name, "k")
-        s_bn = _stride_param(b.name, "n")
-        params.append(f"    # Strides for {b.name} (K x N)")
-        params.append(f"    {s_bk}, {s_bn},")
-
-        # -- Strides: vectors --
-        for v in vectors:
-            dim = _vector_dim(v, a.shape[0], b.shape[1])
-            sv = _stride_param(v.name, dim)
-            params.append(f"    # Stride for {v.name} ({v.shape[0]},)")
-            params.append(f"    {sv},")
+        # -- Strides: one block per input, in caller-supplied order --
+        for t in inputs:
+            labels = dim_labels[t.name]
+            dim_desc = " x ".join(l.upper() for l in labels)
+            stride_names = ", ".join(_stride_param(t.name, l) for l in labels)
+            comment = "Strides" if len(labels) > 1 else "Stride"
+            params.append(f"    # {comment} for {t.name} ({dim_desc})")
+            params.append(f"    {stride_names},")
 
         # -- Strides: output (M x N) --
         s_om = _stride_param(output.name, "m")
@@ -300,12 +334,10 @@ class TritonKernelGenerator:
     @staticmethod
     def _section_vector_ptrs(
         tensor: TensorDescriptor,
-        M: int,
-        N: int,
+        dim: str,
     ) -> str:
         """Pointer arithmetic for a 1-D vector (bias), broadcast along one dim."""
         n = tensor.name
-        dim = _vector_dim(tensor, M, N)
         sv = _stride_param(n, dim)
         return "\n".join([
             "",
