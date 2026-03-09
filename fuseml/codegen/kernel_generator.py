@@ -35,6 +35,27 @@ _TRITON_DTYPE_MAP: dict[torch.dtype, str] = {
     torch.bfloat16: "tl.bfloat16",
 }
 
+# Maximum finite value representable in IEEE 754 FP16.  Values beyond this
+# overflow to ±inf during downcast from FP32.  Used for saturating clamp
+# before the final tl.store to prevent silent precision catastrophes.
+_FP16_MAX: float = 65504.0
+
+# Half-precision dtypes that require explicit FP32 upcast before tl.dot()
+# accumulation to prevent numerical underflow/overflow in the K-loop.
+_HALF_PRECISION_DTYPES: frozenset[torch.dtype] = frozenset({
+    torch.float16, torch.bfloat16,
+})
+
+# In-place op targets that reuse the accumulator registers directly without
+# allocating temporary SRAM buffers.  The codegen emits a register-reuse
+# annotation for these ops so the generated kernel is self-documenting.
+_IN_PLACE_EPILOGUE_OPS: frozenset = frozenset({
+    torch.ops.aten.relu_.default,
+    torch.ops.aten.sigmoid_.default,
+    torch.ops.aten.add_.Tensor,
+    torch.ops.aten.mul_.Tensor,
+})
+
 
 # ---------------------------------------------------------------------------
 # Reduction info — tracks what happened to acc during the epilogue
@@ -386,16 +407,19 @@ class TritonKernelGenerator:
         _, vectors = _classify(unique)
         for v in vectors:
             dim = _vector_dim(v, left.shape[0], right.shape[-1])
+            # Upcast half-precision bias to FP32 to match the accumulator
+            # dtype and prevent silent precision loss during addition.
+            bias_cast = ".to(tl.float32)" if v.dtype in _HALF_PRECISION_DTYPES else ""
             if dim == "n":
                 sections.append(
                     f"\n    # Bias addition — load {v.name} and broadcast along N axis"
-                    f"\n    {v.name} = tl.load({v.name}_ptrs, mask=offs_n < N, other=0.0)"
+                    f"\n    {v.name} = tl.load({v.name}_ptrs, mask=offs_n < N, other=0.0){bias_cast}"
                     f"\n    acc = acc + {v.name}[None, :]"
                 )
             else:
                 sections.append(
                     f"\n    # Bias addition — load {v.name} and broadcast along M axis"
-                    f"\n    {v.name} = tl.load({v.name}_ptrs, mask=offs_m < M, other=0.0)"
+                    f"\n    {v.name} = tl.load({v.name}_ptrs, mask=offs_m < M, other=0.0){bias_cast}"
                     f"\n    acc = acc + {v.name}[:, None]"
                 )
 
@@ -509,12 +533,19 @@ class TritonKernelGenerator:
             # Use the pre-surgery snapshot when available.
             saved_args = node_args_snapshot.get(node.name)
 
-            # Both the functional (relu) and in-place (relu_) variants produce
-            # identical register semantics — tl.where(acc > 0, acc, 0.0) —
-            # because the Triton accumulator is a register tile, not a
-            # memory-backed tensor.  No separate in-place path is needed.
-            # The aliasing safety check in mutation_safety.py guarantees
-            # the in-place variant is only fused when alias-safe.
+            # In-place mutation annotation — emit register-reuse guarantee.
+            # When the FusionGroup contains an in-place op (relu_, add_, etc.)
+            # the generator reuses the accumulator registers directly instead
+            # of allocating a temporary SRAM buffer.  This is safe because:
+            # 1. Triton's acc is a register tile, not a memory-backed tensor.
+            # 2. The aliasing safety check in mutation_safety.py guarantees
+            #    the in-place variant is only fused when alias-safe.
+            if node.target in _IN_PLACE_EPILOGUE_OPS:
+                lines.append(
+                    "    # In-place mutation — accumulator registers reused directly,\n"
+                    "    # no temporary SRAM buffer allocated (zero extra memory traffic)"
+                )
+
             if node.target in (
                 torch.ops.aten.relu.default,
                 torch.ops.aten.relu_.default,
@@ -928,6 +959,13 @@ class TritonKernelGenerator:
         rn = right.name
         s_lk = _stride_param(ln, "k")
         s_rk = _stride_param(rn, "k")
+
+        # Explicit FP32 upcast for half-precision inputs — prevents
+        # numerical underflow/overflow during tl.dot() accumulation.
+        # FP32 inputs get an empty suffix (identity, zero cost).
+        left_cast = ".to(tl.float32)" if left.dtype in _HALF_PRECISION_DTYPES else ""
+        right_cast = ".to(tl.float32)" if right.dtype in _HALF_PRECISION_DTYPES else ""
+
         return "\n".join([
             "",
             "    # -----------------------------------------------------------",
@@ -952,14 +990,14 @@ class TritonKernelGenerator:
             (
                 f"        {ln} = tl.load({ln}_ptrs, "
                 f"mask=(offs_m[:, None] < M) & (k_mask[None, :]), "
-                f"other=0.0, eviction_policy='evict_last')"
+                f"other=0.0, eviction_policy='evict_last'){left_cast}"
             ),
             f"        # Load (BLOCK_SIZE_K x BLOCK_SIZE_N) tile of {rn} from HBM → SRAM",
             f"        # Full 2-D mask guards both the K boundary and the N boundary",
             (
                 f"        {rn} = tl.load({rn}_ptrs, "
                 f"mask=(k_mask[:, None]) & (offs_n[None, :] < N), "
-                f"other=0.0, eviction_policy='evict_last')"
+                f"other=0.0, eviction_policy='evict_last'){right_cast}"
             ),
             "",
             "        # Tile-level matrix multiply — accumulated entirely in SRAM",
@@ -980,6 +1018,13 @@ class TritonKernelGenerator:
         out-of-bounds threads do not corrupt memory.  When the output
         dtype differs from the fp32 accumulator, an explicit cast is
         emitted first to match the target precision.
+
+        **Safe downcasting** — for FP16 targets the accumulator is clamped
+        to the finite representable range (±65504) before the narrowing
+        cast.  Without this saturation, large FP32 values silently overflow
+        to ±inf during ``.to(tl.float16)``, corrupting downstream
+        computation.  BF16 shares FP32's exponent range so no saturation
+        is needed; FP32 → FP32 is an identity cast (zero runtime cost).
         """
         n = output.name
         triton_dtype = _TRITON_DTYPE_MAP.get(output.dtype, "tl.float32")
@@ -990,13 +1035,26 @@ class TritonKernelGenerator:
             "    # Store — write the (BLOCK_SIZE_M, BLOCK_SIZE_N) result tile",
             "    # from SRAM back to HBM exactly once per program instance",
             "    # -----------------------------------------------------------",
-            # Unconditional cast: the accumulator is always tl.float32.
-            # For fp32 outputs this is an identity cast (zero runtime cost);
-            # for fp16/bf16 outputs it narrows the result to the target dtype.
-            # Keeping the cast unconditional makes the dtype contract explicit
-            # and ensures correctness survives future dtype changes.
-            f"    acc = acc.to({triton_dtype})",
         ]
+
+        # FP16 saturating clamp — prevent overflow to ±inf during downcast.
+        # FP16 max finite = 65504; anything larger becomes inf after cast.
+        # BF16 shares FP32's 8-bit exponent so its range is identical to
+        # FP32 (~3.4e38) — no saturation needed.
+        if output.dtype == torch.float16:
+            lines.extend([
+                f"    # FP16 safe downcast — saturate to ±{_FP16_MAX} before",
+                f"    # narrowing cast to prevent overflow to ±inf",
+                f"    acc = tl.where(acc > {_FP16_MAX}, {_FP16_MAX}, acc)",
+                f"    acc = tl.where(acc < -{_FP16_MAX}, -{_FP16_MAX}, acc)",
+            ])
+
+        # Unconditional cast: the accumulator is always tl.float32.
+        # For fp32 outputs this is an identity cast (zero runtime cost);
+        # for fp16/bf16 outputs it narrows the result to the target dtype.
+        # Keeping the cast unconditional makes the dtype contract explicit
+        # and ensures correctness survives future dtype changes.
+        lines.append(f"    acc = acc.to({triton_dtype})")
 
         lines.append(
             f"    tl.store({n}_ptrs, acc, "
@@ -1094,6 +1152,44 @@ class TritonKernelGenerator:
         return fake is not None and len(fake.shape) == 1
 
     @staticmethod
+    def _detect_epilogue_broadcast(ext_node: torch.fx.Node | None) -> str | None:
+        """Detect stride-0 broadcast dimensions on a 2-D external tensor.
+
+        Inspects the FX node's metadata (``TensorFingerprint``-equivalent
+        stride information) to determine if one dimension has stride == 0,
+        indicating that PyTorch's ``.expand()`` or broadcasting produced a
+        zero-stride axis.  When detected, the epilogue can generate 1-D
+        pointer arithmetic and let Triton broadcast to ``[BLOCK_M, BLOCK_N]``
+        instead of loading a full 2-D tile of identical rows/columns.
+
+        Returns
+        -------
+        ``"m"`` if dim 0 is broadcast (stride[0] == 0) — load along N.
+        ``"n"`` if dim 1 is broadcast (stride[1] == 0) — load along M.
+        ``None`` if no broadcast detected, tensor is not 2-D, or no metadata.
+        """
+        if ext_node is None:
+            return None
+        fake = ext_node.meta.get("val")
+        if fake is None:
+            fake = ext_node.meta.get("tensor_meta")
+        if fake is None or not hasattr(fake, "shape") or len(fake.shape) != 2:
+            return None
+        # Extract stride — FakeTensor uses .stride() callable,
+        # TensorMeta uses .stride attribute.
+        raw_stride = getattr(fake, "stride", None)
+        if raw_stride is None:
+            return None
+        stride = raw_stride() if callable(raw_stride) else raw_stride
+        if len(stride) != 2:
+            return None
+        if stride[0] == 0:
+            return "m"  # broadcast along M — load 1-D along N
+        if stride[1] == 0:
+            return "n"  # broadcast along N — load 1-D along M
+        return None
+
+    @staticmethod
     def _emit_add(
         node: torch.fx.Node,
         node_ids: set[int],
@@ -1140,6 +1236,32 @@ class TritonKernelGenerator:
                     f"    # {residual_name}_ptrs is a 1-D pointer block (no M stride).",
                     f"    {residual_name} = tl.load({residual_name}_ptrs, mask=offs_n < N, other=0.0)",
                     f"    acc = acc + {residual_name}[None, :]",
+                ])
+
+            # Check for stride-0 broadcast dimensions on 2-D tensors.
+            # When TensorFingerprint.broadcast_dims indicates a zero-stride
+            # axis, generate 1-D pointer arithmetic and let Triton broadcast
+            # to [BLOCK_M, BLOCK_N] — avoids loading duplicate rows/columns.
+            broadcast_dim = TritonKernelGenerator._detect_epilogue_broadcast(
+                residual_arg_node,
+            )
+            if broadcast_dim == "m":
+                s_n = _stride_param(residual_name, "n")
+                return "\n".join([
+                    f"    # Broadcast add — {residual_name} has stride=0 along M",
+                    f"    # (broadcast_dims[0]=True); load 1-D along N, broadcast to",
+                    f"    # [BLOCK_M, BLOCK_N] via [None, :] (no redundant row loads).",
+                    f"    {residual_name} = tl.load({residual_name}_ptr + offs_n * {s_n}, mask=offs_n < N, other=0.0)",
+                    f"    acc = acc + {residual_name}[None, :]",
+                ])
+            if broadcast_dim == "n":
+                s_m = _stride_param(residual_name, "m")
+                return "\n".join([
+                    f"    # Broadcast add — {residual_name} has stride=0 along N",
+                    f"    # (broadcast_dims[1]=True); load 1-D along M, broadcast to",
+                    f"    # [BLOCK_M, BLOCK_N] via [:, None] (no redundant column loads).",
+                    f"    {residual_name} = tl.load({residual_name}_ptr + offs_m * {s_m}, mask=offs_m < M, other=0.0)",
+                    f"    acc = acc + {residual_name}[:, None]",
                 ])
 
             return "\n".join([
@@ -1195,6 +1317,27 @@ class TritonKernelGenerator:
                     f"    # into acc.  {ext_name}_ptrs is a 1-D pointer block (no M stride).",
                     f"    {ext_name} = tl.load({ext_name}_ptrs, mask=offs_n < N, other=0.0)",
                     f"    acc = acc * {ext_name}[None, :]",
+                ])
+
+            # Check for stride-0 broadcast dimensions on 2-D tensors.
+            broadcast_dim = TritonKernelGenerator._detect_epilogue_broadcast(ext_node)
+            if broadcast_dim == "m":
+                s_n = _stride_param(ext_name, "n")
+                return "\n".join([
+                    f"    # Broadcast mul — {ext_name} has stride=0 along M",
+                    f"    # (broadcast_dims[0]=True); load 1-D along N, broadcast to",
+                    f"    # [BLOCK_M, BLOCK_N] via [None, :] (no redundant row loads).",
+                    f"    {ext_name} = tl.load({ext_name}_ptr + offs_n * {s_n}, mask=offs_n < N, other=0.0)",
+                    f"    acc = acc * {ext_name}[None, :]",
+                ])
+            if broadcast_dim == "n":
+                s_m = _stride_param(ext_name, "m")
+                return "\n".join([
+                    f"    # Broadcast mul — {ext_name} has stride=0 along N",
+                    f"    # (broadcast_dims[1]=True); load 1-D along M, broadcast to",
+                    f"    # [BLOCK_M, BLOCK_N] via [:, None] (no redundant column loads).",
+                    f"    {ext_name} = tl.load({ext_name}_ptr + offs_m * {s_m}, mask=offs_m < M, other=0.0)",
+                    f"    acc = acc * {ext_name}[:, None]",
                 ])
 
             return "\n".join([
