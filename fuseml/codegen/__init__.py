@@ -15,6 +15,12 @@ from fuseml.codegen.kernel_generator import (
     next_power_of_2,
 )
 from fuseml.codegen.kernel_launcher import KernelLauncher
+from fuseml.codegen.sram_autotuner import (
+    SRAMAutotuner,
+    TuneConfig,
+    compute_sram_bytes,
+    generate_sram_safe_configs,
+)
 
 __all__ = [
     "EagerFallbackGuard",
@@ -22,10 +28,14 @@ __all__ = [
     "KernelCacheKey",
     "KernelLauncher",
     "ReductionInfo",
+    "SRAMAutotuner",
     "TensorDescriptor",
     "TensorFingerprint",
     "TritonKernelGenerator",
+    "TuneConfig",
     "build_cache_key",
     "build_op_chain",
+    "compute_sram_bytes",
+    "generate_sram_safe_configs",
     "next_power_of_2",
 ]

@@ -51,6 +51,7 @@ from fuseml.codegen.kernel_generator import (
     TensorDescriptor,
     next_power_of_2,
 )
+from fuseml.codegen.sram_autotuner import SRAMAutotuner
 
 
 # ---------------------------------------------------------------------------
@@ -152,6 +153,15 @@ class KernelLauncher:
         automatically.  The launcher skips its own heuristic tuning and
         SRAM enforcement, and does not pass block-size / num_warps /
         num_stages kwargs — the autotuner selects these at runtime.
+    sram_autotuner :
+        Optional :class:`~fuseml.codegen.sram_autotuner.SRAMAutotuner`
+        instance.  When provided (and *is_autotuned* is ``False``), the
+        launcher replaces its static ``_select_num_warps`` /
+        ``_select_num_stages`` heuristics with a dynamic SRAM-aware
+        configuration search.  The autotuner generates all valid
+        ``(BLOCK_M, BLOCK_N, BLOCK_K, num_warps, num_stages)`` tuples,
+        scores them against the runtime problem dimensions, and caches
+        the optimal configuration for subsequent launches.
     """
 
     def __init__(
@@ -169,6 +179,7 @@ class KernelLauncher:
         reduction_op: str | None = None,
         eager_fn: Callable[..., torch.Tensor] | None = None,
         is_autotuned: bool = False,
+        sram_autotuner: SRAMAutotuner | None = None,
     ) -> None:
         # FX graph.call_function() uses target.__name__ to generate node names.
         self.__name__ = "fuseml_fused_kernel"
@@ -185,6 +196,7 @@ class KernelLauncher:
         self._group_size_m = group_size_m
         self._reduction_op = reduction_op
         self._is_autotuned = is_autotuned
+        self._sram_autotuner = sram_autotuner
 
         # Pre-compute indices so __call__ does not re-scan the list every time.
         input_names = [d.name for d in input_descriptors]
@@ -469,25 +481,41 @@ class KernelLauncher:
         device = left_t.device
         out_dtype = self._output_descriptor.dtype
 
-        # ── Heuristic launch parameters ──────────────────────────────
-        # When the kernel is autotuned, block sizes, warp counts, and
-        # pipeline stages are embedded in the @triton.autotune configs
-        # and selected automatically at runtime — skip static heuristics.
+        # ── Launch parameter selection ────────────────────────────────
+        # Three paths, in priority order:
+        #   1. @triton.autotune — block sizes / warps / stages are
+        #      managed by the Triton autotuner at runtime.
+        #   2. SRAMAutotuner — AOT dynamic search over all SRAM-safe
+        #      configs, scored against (M, N, K, dtype) and cached.
+        #   3. Static heuristics — legacy path using _select_num_warps /
+        #      _select_num_stages / _enforce_sram_capacity.
         if not self._is_autotuned:
-            num_warps = self._select_num_warps(M, N, K, out_dtype)
-            num_stages = self._select_num_stages(M, N, K, out_dtype)
+            if self._sram_autotuner is not None:
+                # ── AOT SRAM-aware autotuning ─────────────────────────
+                tune_cfg = self._sram_autotuner.select_config(
+                    M, N, K, out_dtype,
+                )
+                block_m = tune_cfg.block_m
+                block_n = tune_cfg.block_n
+                block_k = tune_cfg.block_k
+                num_warps = tune_cfg.num_warps
+                num_stages = tune_cfg.num_stages
+            else:
+                # ── Static heuristic fallback ─────────────────────────
+                num_warps = self._select_num_warps(M, N, K, out_dtype)
+                num_stages = self._select_num_stages(M, N, K, out_dtype)
 
-            # ── SRAM capacity enforcement ─────────────────────────────
-            # Downscale block dims if the output tile exceeds shared memory.
-            block_m, block_n = self._enforce_sram_capacity(
-                self._block_size_m, self._block_size_n, out_dtype,
-            )
-            block_k = self._block_size_k
+                # ── SRAM capacity enforcement ─────────────────────────
+                # Downscale block dims if the output tile exceeds shared memory.
+                block_m, block_n = self._enforce_sram_capacity(
+                    self._block_size_m, self._block_size_n, out_dtype,
+                )
+                block_k = self._block_size_k
 
-            # If SRAM enforcement reduced the tile, compensate with +1
-            # stage to improve latency hiding (more loop iterations).
-            if block_m < self._block_size_m or block_n < self._block_size_n:
-                num_stages = min(num_stages + 1, 4)
+                # If SRAM enforcement reduced the tile, compensate with +1
+                # stage to improve latency hiding (more loop iterations).
+                if block_m < self._block_size_m or block_n < self._block_size_n:
+                    num_stages = min(num_stages + 1, 4)
 
         # ── CUDA stream synchronization ───────────────────────────────
         # Launch on PyTorch's current stream to avoid cross-stream races.
@@ -642,11 +670,12 @@ class KernelLauncher:
         intm_names = [d.name for d in self._intermediate_descriptors]
         reduction = f", reduction={self._reduction_op!r}" if self._reduction_op else ""
         tuning = ", autotuned=True" if self._is_autotuned else ""
+        aot = ", sram_autotuner=True" if self._sram_autotuner is not None else ""
         return (
             f"KernelLauncher("
             f"inputs={in_names}, "
             f"output={self._output_descriptor.name!r}, "
             f"intermediates={intm_names}, "
             f"block=({self._block_size_m},{self._block_size_n},{self._block_size_k})"
-            f"{reduction}{tuning})"
+            f"{reduction}{tuning}{aot})"
         )
