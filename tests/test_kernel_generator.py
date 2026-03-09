@@ -290,3 +290,181 @@ class TestEdgeCases:
         assert "scale_ptr" in code
         assert "bias_ptrs = bias_ptr + offs_n * stride_bias_n" in code
         assert "scale_ptrs = scale_ptr + offs_n * stride_scale_n" in code
+
+
+# ---------------------------------------------------------------------------
+# K-loop: accumulator
+# ---------------------------------------------------------------------------
+
+@pytest.mark.codegen
+class TestKLoopAccumulator:
+    """Verify accumulator initialization in the K-loop."""
+
+    def test_accumulator_init(self, gen, matmul_inputs, output_tensor):
+        code = gen.generate_k_loop(matmul_inputs, output_tensor)
+        assert "acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)" in code
+
+    def test_accumulator_before_loop(self, gen, matmul_inputs, output_tensor):
+        code = gen.generate_k_loop(matmul_inputs, output_tensor)
+        assert code.index("tl.zeros") < code.index("for k in range")
+
+
+# ---------------------------------------------------------------------------
+# K-loop: loop structure
+# ---------------------------------------------------------------------------
+
+@pytest.mark.codegen
+class TestKLoopStructure:
+    """Verify the blocked GEMM loop structure."""
+
+    def test_loop_header(self, gen, matmul_inputs, output_tensor):
+        code = gen.generate_k_loop(matmul_inputs, output_tensor)
+        assert "for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):" in code
+
+    def test_dot_product(self, gen, matmul_inputs, output_tensor):
+        code = gen.generate_k_loop(matmul_inputs, output_tensor)
+        assert "acc += tl.dot(a, b)" in code
+
+    def test_load_left(self, gen, matmul_inputs, output_tensor):
+        code = gen.generate_k_loop(matmul_inputs, output_tensor)
+        assert "a = tl.load(a_ptrs," in code
+
+    def test_load_right(self, gen, matmul_inputs, output_tensor):
+        code = gen.generate_k_loop(matmul_inputs, output_tensor)
+        assert "b = tl.load(b_ptrs," in code
+
+
+# ---------------------------------------------------------------------------
+# K-loop: mask handling
+# ---------------------------------------------------------------------------
+
+@pytest.mark.codegen
+class TestKLoopMasking:
+    """Verify mask handling prevents out-of-bounds reads."""
+
+    def test_k_mask_computed(self, gen, matmul_inputs, output_tensor):
+        code = gen.generate_k_loop(matmul_inputs, output_tensor)
+        assert "k_mask = offs_k < K - k * BLOCK_SIZE_K" in code
+
+    def test_left_mask_broadcast(self, gen, matmul_inputs, output_tensor):
+        """Left operand mask broadcasts along rows: k_mask[None, :]."""
+        code = gen.generate_k_loop(matmul_inputs, output_tensor)
+        assert "mask=k_mask[None, :]" in code
+
+    def test_right_mask_broadcast(self, gen, matmul_inputs, output_tensor):
+        """Right operand mask broadcasts along columns: k_mask[:, None]."""
+        code = gen.generate_k_loop(matmul_inputs, output_tensor)
+        assert "mask=k_mask[:, None]" in code
+
+    def test_other_zero(self, gen, matmul_inputs, output_tensor):
+        """Masked-out elements must be zero to avoid corrupting the dot product."""
+        code = gen.generate_k_loop(matmul_inputs, output_tensor)
+        assert "other=0.0" in code
+
+
+# ---------------------------------------------------------------------------
+# K-loop: pointer advancement
+# ---------------------------------------------------------------------------
+
+@pytest.mark.codegen
+class TestKLoopPointerAdvance:
+    """Verify pointers advance to the next K-block after each iteration."""
+
+    def test_advance_left_ptrs(self, gen, matmul_inputs, output_tensor):
+        code = gen.generate_k_loop(matmul_inputs, output_tensor)
+        assert "a_ptrs += BLOCK_SIZE_K * stride_ak" in code
+
+    def test_advance_right_ptrs(self, gen, matmul_inputs, output_tensor):
+        code = gen.generate_k_loop(matmul_inputs, output_tensor)
+        assert "b_ptrs += BLOCK_SIZE_K * stride_bk" in code
+
+    def test_advance_after_dot(self, gen, matmul_inputs, output_tensor):
+        """Pointer advancement must come after the dot product."""
+        code = gen.generate_k_loop(matmul_inputs, output_tensor)
+        assert code.index("tl.dot") < code.index("a_ptrs += BLOCK_SIZE_K")
+
+
+# ---------------------------------------------------------------------------
+# K-loop: reversed input order
+# ---------------------------------------------------------------------------
+
+@pytest.mark.codegen
+class TestKLoopReversedOrder:
+    """K-loop auto-detects matmul operands regardless of input order."""
+
+    def test_reversed_order_correct_loads(self, gen, output_tensor):
+        b = TensorDescriptor("b", (64, 256), (256, 1), torch.float32)
+        a = TensorDescriptor("a", (128, 64), (64, 1), torch.float32)
+        code = gen.generate_k_loop([b, a], output_tensor)
+        assert "a = tl.load(a_ptrs," in code
+        assert "b = tl.load(b_ptrs," in code
+
+    def test_reversed_order_correct_advance(self, gen, output_tensor):
+        b = TensorDescriptor("b", (64, 256), (256, 1), torch.float32)
+        a = TensorDescriptor("a", (128, 64), (64, 1), torch.float32)
+        code = gen.generate_k_loop([b, a], output_tensor)
+        assert "a_ptrs += BLOCK_SIZE_K * stride_ak" in code
+        assert "b_ptrs += BLOCK_SIZE_K * stride_bk" in code
+
+    def test_reversed_order_correct_dot(self, gen, output_tensor):
+        """dot(left, right) must use the correct operand names after auto-swap."""
+        b = TensorDescriptor("b", (64, 256), (256, 1), torch.float32)
+        a = TensorDescriptor("a", (128, 64), (64, 1), torch.float32)
+        code = gen.generate_k_loop([b, a], output_tensor)
+        assert "acc += tl.dot(a, b)" in code
+
+
+# ---------------------------------------------------------------------------
+# K-loop: edge cases
+# ---------------------------------------------------------------------------
+
+@pytest.mark.codegen
+class TestKLoopEdgeCases:
+    """Error handling and hardware-sympathy comments."""
+
+    def test_raises_on_single_matrix(self, gen, output_tensor):
+        a = TensorDescriptor("a", (128, 64), (64, 1), torch.float32)
+        with pytest.raises(ValueError, match="2 two-dimensional"):
+            gen.generate_k_loop([a], output_tensor)
+
+    def test_raises_on_dimension_mismatch(self, gen, output_tensor):
+        a = TensorDescriptor("a", (128, 64), (64, 1), torch.float32)
+        b = TensorDescriptor("b", (32, 256), (256, 1), torch.float32)
+        with pytest.raises(ValueError, match="Contracting dimension"):
+            gen.generate_k_loop([a, b], output_tensor)
+
+    def test_returns_nonempty_string(self, gen, matmul_inputs, output_tensor):
+        result = gen.generate_k_loop(matmul_inputs, output_tensor)
+        assert isinstance(result, str)
+        assert len(result) > 0
+
+    def test_sram_comment_present(self, gen, matmul_inputs, output_tensor):
+        """Generated code must explain SRAM usage per coding guidelines."""
+        code = gen.generate_k_loop(matmul_inputs, output_tensor)
+        assert "SRAM" in code
+
+    def test_hbm_comment_present(self, gen, matmul_inputs, output_tensor):
+        """Generated code must mention HBM for hardware sympathy."""
+        code = gen.generate_k_loop(matmul_inputs, output_tensor)
+        assert "HBM" in code
+
+    def test_with_bias_ignored(self, gen, output_tensor):
+        """K-loop only involves matmul operands — bias is not loaded."""
+        bias = TensorDescriptor("bias", (256,), (1,), torch.float32)
+        a = TensorDescriptor("a", (128, 64), (64, 1), torch.float32)
+        b = TensorDescriptor("b", (64, 256), (256, 1), torch.float32)
+        code = gen.generate_k_loop([bias, a, b], output_tensor)
+        assert "a = tl.load(a_ptrs," in code
+        assert "b = tl.load(b_ptrs," in code
+        assert "tl.load(bias" not in code
+
+    def test_multichar_tensor_names(self, gen, output_tensor):
+        """Multi-char names use underscore-separated stride params."""
+        left = TensorDescriptor("input", (128, 64), (64, 1), torch.float32)
+        right = TensorDescriptor("weight", (64, 256), (256, 1), torch.float32)
+        code = gen.generate_k_loop([left, right], output_tensor)
+        assert "input = tl.load(input_ptrs," in code
+        assert "weight = tl.load(weight_ptrs," in code
+        assert "input_ptrs += BLOCK_SIZE_K * stride_input_k" in code
+        assert "weight_ptrs += BLOCK_SIZE_K * stride_weight_k" in code
+        assert "acc += tl.dot(input, weight)" in code
