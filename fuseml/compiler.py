@@ -419,6 +419,7 @@ class FuseMLCompiler:
         epilogue = self._generator.generate_epilogue(
             group.fused_nodes, escape_stores, output_descriptor=out_desc,
             all_group_node_ids=all_ids,
+            node_args_snapshot=group.node_args_snapshot,
         )
 
         full_kernel_str = sig + "\n" + kloop + "\n" + epilogue

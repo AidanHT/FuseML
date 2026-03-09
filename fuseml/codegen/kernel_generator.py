@@ -1022,6 +1022,7 @@ class TritonKernelGenerator:
     def _classify_binary_args(
         node: torch.fx.Node,
         node_ids: set[int],
+        saved_args: tuple | None = None,
     ) -> tuple[int | float | None, str | None, torch.fx.Node | None]:
         """Classify arguments of a binary FX node as scalar or external tensor.
 
@@ -1029,12 +1030,18 @@ class TritonKernelGenerator:
         *scalar_value* or *ext_name* is non-``None`` when an external operand
         is found.  If both args are internal to the fusion group, all three
         values are ``None``.
+
+        When *saved_args* is provided (pre-surgery snapshot), it is used
+        instead of ``node.args`` — this is necessary because FX nullifies
+        ``node.args`` when a node is erased during dead code elimination.
         """
+        args = saved_args if saved_args is not None else node.args
+
         scalar_value: int | float | None = None
         ext_name: str | None = None
         ext_node: torch.fx.Node | None = None
 
-        for arg in node.args:
+        for arg in args:
             if isinstance(arg, (int, float)):
                 scalar_value = arg
                 break
@@ -1055,13 +1062,16 @@ class TritonKernelGenerator:
         """
         if ext_node is None:
             return False
-        fake = ext_node.meta.get("val") or ext_node.meta.get("tensor_meta")
+        fake = ext_node.meta.get("val")
+        if fake is None:
+            fake = ext_node.meta.get("tensor_meta")
         return fake is not None and len(fake.shape) == 1
 
     @staticmethod
     def _emit_add(
         node: torch.fx.Node,
         node_ids: set[int],
+        saved_args: tuple | None = None,
     ) -> str:
         """Residual / bias add: load an external tensor tile from HBM, fuse into acc.
 
@@ -1084,7 +1094,7 @@ class TritonKernelGenerator:
         method conservatively falls back to the 2-D residual path.
         """
         scalar_value, residual_name, residual_arg_node = (
-            TritonKernelGenerator._classify_binary_args(node, node_ids)
+            TritonKernelGenerator._classify_binary_args(node, node_ids, saved_args)
         )
 
         if scalar_value is not None:
@@ -1124,6 +1134,7 @@ class TritonKernelGenerator:
     def _emit_mul(
         node: torch.fx.Node,
         node_ids: set[int],
+        saved_args: tuple | None = None,
     ) -> str:
         """Element-wise multiply: scalar, external tensor, or internal operands.
 
@@ -1139,7 +1150,7 @@ class TritonKernelGenerator:
         4. **Both internal** — ``acc = acc * acc`` (square).
         """
         scalar_value, ext_name, ext_node = (
-            TritonKernelGenerator._classify_binary_args(node, node_ids)
+            TritonKernelGenerator._classify_binary_args(node, node_ids, saved_args)
         )
 
         if scalar_value is not None:
