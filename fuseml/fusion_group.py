@@ -7,7 +7,7 @@ that will be replaced by a single Triton kernel during graph surgery.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import List
+from typing import Any, Dict, List
 
 import torch
 
@@ -33,12 +33,19 @@ class FusionGroup:
     output_node : torch.fx.Node
         The final node in the sequence whose result is visible to the rest
         of the graph.  The fused kernel's output replaces this node.
+    output_metadata : dict[str, Any]
+        Tensor metadata (shape, stride, dtype) of the group's output,
+        extracted from ``output_node.meta['tensor_meta']`` by
+        :class:`~fuseml.passes.fusion_pass.FuseMLFusionPass` after shape
+        propagation.  Used downstream for Triton block grid calculation
+        and memory pointer setup.
     """
 
     base_node: torch.fx.Node
     fused_nodes: List[torch.fx.Node] = field(default_factory=list)
     inputs: List[torch.fx.Node] = field(default_factory=list)
     output_node: torch.fx.Node = None  # type: ignore[assignment]
+    output_metadata: Dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         # Default output_node to base_node when the group is a single op.

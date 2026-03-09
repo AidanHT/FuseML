@@ -6,9 +6,10 @@ placeholder function used as a symbolic target for fused kernel nodes.
 
 from __future__ import annotations
 
-from typing import Callable, List, Set
+from typing import Any, Callable, Dict, List, Set, Tuple
 
 import torch
+from torch.fx.passes.shape_prop import ShapeProp
 
 from fuseml._logging import logger
 from fuseml.fusion_group import FusionGroup
@@ -160,10 +161,46 @@ class FuseMLFusionPass:
 
             # Only keep groups that actually fuse something (len > 1).
             if len(group) > 1:
+                group.output_metadata = self._extract_tensor_metadata(
+                    group.output_node
+                )
                 logger.debug("Fusion group found: %s", group)
                 groups.append(group)
 
         return groups
+
+    @staticmethod
+    def _extract_tensor_metadata(node: torch.fx.Node) -> Dict[str, Any]:
+        """Pull shape/stride/dtype from *node*'s ``tensor_meta``.
+
+        Handles three cases:
+        * ``tensor_meta`` is a single ``TensorMetadata`` namedtuple.
+        * ``tensor_meta`` is a sequence of ``TensorMetadata`` (e.g. ops
+          returning multiple tensors) — we take the first element.
+        * ``tensor_meta`` is missing — returns an empty dict.
+        """
+        meta = node.meta.get("tensor_meta")
+        if meta is None:
+            return {}
+
+        # A TensorMetadata namedtuple is itself a tuple subclass, so check
+        # for the expected attributes first to distinguish a single metadata
+        # entry from a sequence of them.
+        if not hasattr(meta, "shape"):
+            # Sequence of TensorMetadata — take the first element.
+            if isinstance(meta, (tuple, list)) and len(meta) > 0:
+                meta = meta[0]
+            else:
+                return {}
+
+        if not hasattr(meta, "shape"):
+            return {}
+
+        return {
+            "shape": tuple(meta.shape),
+            "stride": tuple(meta.stride),
+            "dtype": meta.dtype,
+        }
 
     @staticmethod
     def _collect_external_inputs(
@@ -209,6 +246,12 @@ class FuseMLFusionPass:
                     args=tuple(group.inputs),
                 )
 
+            # Carry forward tensor_meta so downstream passes see shape info.
+            if "tensor_meta" in group.output_node.meta:
+                new_fused_node.meta["tensor_meta"] = group.output_node.meta[
+                    "tensor_meta"
+                ]
+
             # Copy metadata so downstream passes can inspect the group.
             new_fused_node.meta["fusion_group"] = group
             new_fused_node.meta["fused_op_names"] = [
@@ -242,13 +285,24 @@ class FuseMLFusionPass:
     # ------------------------------------------------------------------
     # Public entry point
     # ------------------------------------------------------------------
-    def run(self) -> torch.fx.GraphModule:
+    def run(
+        self,
+        example_inputs: Tuple[torch.Tensor, ...] | None = None,
+    ) -> torch.fx.GraphModule:
         """Execute the full fusion pass and return the optimized graph module.
 
-        Calls :meth:`_find_fusion_groups` to discover candidates, then
-        :meth:`_apply_surgery` to rewrite the graph.  The modified
-        ``GraphModule`` is recompiled before being returned so that its
-        ``forward`` method reflects the new graph topology.
+        When *example_inputs* are provided, PyTorch's :class:`ShapeProp` is
+        executed first so that every node's ``meta['tensor_meta']`` is
+        populated with concrete shape / stride / dtype information.  This
+        metadata is then extracted into each :class:`FusionGroup`'s
+        ``output_metadata`` field for downstream Triton codegen.
+
+        Parameters
+        ----------
+        example_inputs : tuple[torch.Tensor, ...] | None
+            Representative input tensors matching the graph's signature.
+            When ``None``, shape propagation is skipped and
+            ``output_metadata`` will be empty.
 
         Returns
         -------
@@ -256,6 +310,11 @@ class FuseMLFusionPass:
             The same ``graph_module`` passed at construction, modified
             in-place with fused subgraphs replaced by Triton kernel calls.
         """
+        # --- Shape propagation (requires concrete example tensors) ----------
+        if example_inputs is not None:
+            logger.debug("Running ShapeProp with %d example input(s).", len(example_inputs))
+            ShapeProp(self.graph_module).propagate(*example_inputs)
+
         groups = self._find_fusion_groups()
 
         if groups:
