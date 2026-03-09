@@ -491,6 +491,20 @@ class FuseMLFusionPass:
                 propagate_meta=False,
             )
 
+            # --- Patch remaining groups' input lists ----------------------
+            # replace_all_uses_with only updates FX graph args — it does
+            # NOT touch the Python lists in other FusionGroup.inputs.
+            # Without this patch, a later group whose inputs contained
+            # the old output_node would create its placeholder with a
+            # dangling reference, and DCE would remove the current
+            # placeholder (zero graph-level users).
+            for other_group in groups:
+                if other_group is group:
+                    continue
+                for i, inp in enumerate(other_group.inputs):
+                    if inp is group.output_node:
+                        other_group.inputs[i] = new_fused_node
+
             # --- Dangling output guard ------------------------------------
             # If the fusion group is the final computation before the
             # graph's output node, verify the output node's args now

@@ -13,7 +13,11 @@ complete kernel string via ``exec()`` into a live ``@triton.jit`` callable.
 from __future__ import annotations
 
 import hashlib
+import importlib
+import sys
+import tempfile
 from dataclasses import dataclass
+from pathlib import Path
 
 import torch
 
@@ -375,6 +379,26 @@ class TritonKernelGenerator:
             self._section_accumulator(),
             self._section_k_loop(left, right),
         ]
+
+        # After the GEMM loop, load and add any 1-D bias vectors.
+        # addmm computes: bias + left @ right — the bias is broadcast
+        # along the appropriate axis and added to the accumulator.
+        _, vectors = _classify(unique)
+        for v in vectors:
+            dim = _vector_dim(v, left.shape[0], right.shape[-1])
+            if dim == "n":
+                sections.append(
+                    f"\n    # Bias addition — load {v.name} and broadcast along N axis"
+                    f"\n    {v.name} = tl.load({v.name}_ptrs, mask=offs_n < N, other=0.0)"
+                    f"\n    acc = acc + {v.name}[None, :]"
+                )
+            else:
+                sections.append(
+                    f"\n    # Bias addition — load {v.name} and broadcast along M axis"
+                    f"\n    {v.name} = tl.load({v.name}_ptrs, mask=offs_m < M, other=0.0)"
+                    f"\n    acc = acc + {v.name}[:, None]"
+                )
+
         return "\n".join(sections)
 
     def generate_epilogue(
@@ -382,6 +406,7 @@ class TritonKernelGenerator:
         fusion_group_nodes: list[torch.fx.Node],
         escape_stores: dict[int, TensorDescriptor] | None = None,
         output_descriptor: TensorDescriptor | None = None,
+        all_group_node_ids: set[int] | None = None,
     ) -> str:
         """Return Triton source for fused post-GEMM operations on ``acc``.
 
@@ -447,6 +472,12 @@ class TritonKernelGenerator:
             epilogue contains a reduction so that the atomic store can
             reference the correct output pointer name and dtype.  When
             ``None``, the output pointer name defaults to ``"out"``.
+        all_group_node_ids :
+            ``id()`` set of **all** nodes belonging to the fusion group
+            (base node + fused nodes).  Used by binary-op classification
+            to distinguish the GEMM result (already in ``acc``) from
+            truly external tensors.  When ``None``, falls back to
+            ``{id(n) for n in fusion_group_nodes}``.
 
         Returns
         -------
@@ -454,7 +485,7 @@ class TritonKernelGenerator:
             Triton source lines (indented at the kernel body level).
         """
         escape_stores = escape_stores or {}
-        node_ids = {id(n) for n in fusion_group_nodes}
+        node_ids = all_group_node_ids or {id(n) for n in fusion_group_nodes}
         self._last_reduction = None  # reset for this epilogue
 
         out_name = output_descriptor.name if output_descriptor else "out"
@@ -606,13 +637,42 @@ class TritonKernelGenerator:
             cache_key[:12],
         )
 
-        # 3. Compile in an isolated namespace with Triton available
-        namespace: dict[str, object] = {"triton": triton, "tl": tl}
-        exec(full_kernel, namespace)  # noqa: S102
-
-        fn = namespace["fused_kernel"]
+        # 3. Compile by writing to a temporary .py file and importing.
+        #    Triton's @jit decorator requires functions defined in real
+        #    Python files (not exec'd code) for source inspection.
+        fn = self._compile_from_source(full_kernel, cache_key)
         self._kernel_cache[cache_key] = fn
         return fn
+
+    @staticmethod
+    def _compile_from_source(source: str, cache_key: str) -> object:
+        """Write kernel source to a temp file and import the function.
+
+        This avoids ``exec()`` which is incompatible with some Triton
+        builds (notably ``triton-windows``) that inspect the source file
+        of ``@triton.jit``-decorated functions.
+        """
+        # Prepend the required imports so the file is self-contained.
+        full_source = (
+            "import triton\n"
+            "import triton.language as tl\n\n"
+            + source
+        )
+        module_name = f"_fuseml_kernel_{cache_key[:16]}"
+
+        # Write to a temp file that persists for the process lifetime.
+        tmp_dir = Path(tempfile.gettempdir()) / "fuseml_kernels"
+        tmp_dir.mkdir(exist_ok=True)
+        kernel_path = tmp_dir / f"{module_name}.py"
+        kernel_path.write_text(full_source, encoding="utf-8")
+
+        # Import the module.
+        spec = importlib.util.spec_from_file_location(module_name, kernel_path)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        spec.loader.exec_module(module)
+
+        return module.fused_kernel
 
     # ------------------------------------------------------------------
     # Code-section builders (each returns a ready-to-join string)
@@ -934,7 +994,8 @@ class TritonKernelGenerator:
         return "\n".join([
             "    # GeLU activation — fast tanh approximation (all in SRAM registers)",
             "    # Formula: x * 0.5 * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))",
-            "    acc = 0.5 * acc * (1.0 + tl.math.tanh(0.7978845608 * (acc + 0.044715 * acc * acc * acc)))",
+            "    _gelu_inner = 0.7978845608 * (acc + 0.044715 * acc * acc * acc)",
+            "    acc = 0.5 * acc * (1.0 + tl.extra.cuda.libdevice.tanh(_gelu_inner))",
         ])
 
     @staticmethod

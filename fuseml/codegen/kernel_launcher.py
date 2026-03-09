@@ -151,6 +151,8 @@ class KernelLauncher:
         reduction_op: str | None = None,
         eager_fn: Callable[..., torch.Tensor] | None = None,
     ) -> None:
+        # FX graph.call_function() uses target.__name__ to generate node names.
+        self.__name__ = "fuseml_fused_kernel"
         self._kernel_fn = kernel_fn
         self._input_descriptors = input_descriptors
         self._output_descriptor = output_descriptor
@@ -502,10 +504,12 @@ class KernelLauncher:
         #   output strides (m, n)
         #   intermediate strides (m, n) per escape buffer
 
-        # Pointers — after _materialize_if_needed, every data_ptr() is valid.
-        ptr_args: list[int] = [int(t.data_ptr()) for t in input_tensors]
-        ptr_args.append(int(output.data_ptr()))
-        ptr_args.extend(int(t.data_ptr()) for t in intermediate_outputs)
+        # Tensor args — Triton 3.x expects actual torch.Tensor objects as
+        # pointer parameters (not raw data_ptr() ints).  Triton extracts
+        # the device pointer internally from the tensor's storage.
+        tensor_args: list[torch.Tensor] = list(input_tensors)
+        tensor_args.append(output)
+        tensor_args.extend(intermediate_outputs)
 
         # Strides — each input tensor contributes one stride per dimension,
         # in the same axis order as dim_labels used during codegen.  For a
@@ -540,13 +544,13 @@ class KernelLauncher:
             "num_warps": num_warps,
             "num_stages": num_stages,
         }
-        if stream_handle is not None:
-            launch_kwargs["stream"] = stream_handle
+        # Note: Triton 3.x deprecated the ``stream=`` kwarg — the kernel
+        # automatically uses the current CUDA stream.
 
         def _triton_launch() -> torch.Tensor:
             """Closure capturing all launch state for the fallback guard."""
             self._kernel_fn[grid](
-                *ptr_args,
+                *tensor_args,
                 M, N, K,
                 *stride_args,
                 **launch_kwargs,

@@ -24,6 +24,8 @@ from typing import Callable, List
 
 import torch
 import torch.nn as nn
+from functorch.compile import make_boxed_func
+from torch._functorch.aot_autograd import aot_module_simplified
 
 from fuseml._logging import logger
 from fuseml.codegen.kernel_cache import (
@@ -154,22 +156,53 @@ class FuseMLCompiler:
     ) -> Callable[..., torch.Tensor]:
         """Run the full fusion pipeline on *gm* and return its forward method.
 
+        TorchDynamo may deliver a graph with high-level ops (e.g.
+        ``torch.nn.functional.linear``) rather than decomposed ATen ops.
+        We use ``aot_module_simplified`` to lower the graph to ATen level
+        (producing ``aten.addmm.default``, ``aten.gelu.default``, etc.)
+        before running the fusion pipeline.
+
         Parameters
         ----------
         gm:
-            The ``GraphModule`` produced by TorchDynamo containing an FX
-            graph of aten-level operations.
+            The ``GraphModule`` produced by TorchDynamo.
         example_inputs:
-            Representative tensors used during tracing.  Forwarded to
-            ``FuseMLFusionPass`` for shape propagation so that every node's
-            ``tensor_meta`` is populated before codegen.
+            Representative tensors used during tracing.
 
         Returns
         -------
         Callable
-            The (possibly optimised) ``gm.forward``.  When no fusible
-            sequences are detected the original forward is returned
-            unchanged.
+            The (possibly optimised) forward callable.
+        """
+
+        def _aten_compiler(
+            aten_gm: torch.fx.GraphModule,
+            aten_inputs: List[torch.Tensor],
+        ) -> Callable:
+            """Inner compiler that receives the ATen-decomposed graph."""
+            optimised = self._compile_aten_graph(aten_gm, aten_inputs)
+            return make_boxed_func(optimised)
+
+        return aot_module_simplified(
+            gm,
+            example_inputs,
+            fw_compiler=_aten_compiler,
+        )
+
+    # ------------------------------------------------------------------
+    # ATen-level compilation (called after aot_autograd decomposition)
+    # ------------------------------------------------------------------
+
+    def _compile_aten_graph(
+        self,
+        gm: torch.fx.GraphModule,
+        example_inputs: List[torch.Tensor],
+    ) -> Callable[..., torch.Tensor]:
+        """Run the fusion pipeline on an ATen-decomposed graph.
+
+        This is the core compilation logic, now guaranteed to receive
+        ATen-level ops (``aten.addmm.default``, ``aten.gelu.default``,
+        etc.) regardless of the PyTorch version.
         """
         logger.info(
             "Captured FX graph with %d nodes — scanning for fusion candidates …",
@@ -382,8 +415,10 @@ class FuseMLCompiler:
             input_descs, out_desc, intermediate_descs
         )
         kloop = self._generator.generate_k_loop(input_descs, out_desc)
+        all_ids = {id(n) for n in group.all_nodes}
         epilogue = self._generator.generate_epilogue(
-            group.all_nodes, escape_stores, output_descriptor=out_desc,
+            group.fused_nodes, escape_stores, output_descriptor=out_desc,
+            all_group_node_ids=all_ids,
         )
 
         full_kernel_str = sig + "\n" + kloop + "\n" + epilogue

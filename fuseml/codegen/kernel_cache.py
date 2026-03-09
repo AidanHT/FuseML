@@ -137,13 +137,22 @@ class TensorFingerprint:
         Extracts all physical layout properties directly from the tensor's
         ATen storage — shape, stride, storage_offset, pointer alignment,
         and dtype.
+
+        When ``t`` is a ``FakeTensor`` (as produced by ``aot_autograd``),
+        ``.data_ptr()`` is unavailable, so we default to ``aligned=True``
+        (PyTorch allocations are 256-byte aligned in practice).
         """
         stride = _materialize_ints(t.stride())
+        try:
+            aligned = (t.data_ptr() % 16 == 0)
+        except RuntimeError:
+            # FakeTensor / FunctionalTensor — no real storage.
+            aligned = True
         return cls(
             shape=_materialize_ints(t.shape),
             stride=stride,
             storage_offset=_materialize_int(t.storage_offset()),
-            aligned=(t.data_ptr() % 16 == 0),
+            aligned=aligned,
             dtype=str(t.dtype),
             broadcast_dims=tuple(s == 0 for s in stride),
             tensor_subclass=type(t).__name__,
