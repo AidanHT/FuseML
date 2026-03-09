@@ -158,6 +158,7 @@ class TritonKernelGenerator:
         self,
         input_tensors: list[TensorDescriptor],
         output_tensor: TensorDescriptor,
+        intermediate_tensors: list[TensorDescriptor] | None = None,
     ) -> str:
         """Return a Triton kernel source string (no compute loop).
 
@@ -167,10 +168,12 @@ class TritonKernelGenerator:
         2. ``def fused_kernel(...)`` with dynamically generated pointer,
            dimension, stride, and ``tl.constexpr`` block-size parameters.
            Pointers and strides follow the caller-supplied input order.
+           When *intermediate_tensors* are provided, their output pointers
+           and M×N strides are appended after the primary output parameters.
         3. ``tl.program_id`` block-offset computation for the M and N
            dimensions.
-        4. Initial pointer arithmetic for every input tensor and the
-           output tensor, in the caller-supplied order.
+        4. Initial pointer arithmetic for every input tensor, the output
+           tensor, and each intermediate output tensor, in order.
 
         Parameters
         ----------
@@ -182,6 +185,12 @@ class TritonKernelGenerator:
             vectors broadcast along the matching dimension.
         output_tensor :
             Descriptor for the 2-D output tensor.
+        intermediate_tensors :
+            Descriptors for internal nodes whose results escape the fused
+            block (users outside the group).  Each entry receives its own
+            output pointer + M×N strides in the kernel signature and its
+            own ``tl.store`` in the epilogue.  Pass ``None`` or an empty
+            list when no intermediate stores are required.
 
         Raises
         ------
@@ -189,6 +198,7 @@ class TritonKernelGenerator:
             If fewer than two 2-D inputs are provided or the inner
             (contracting) dimensions of the two matrices do not match.
         """
+        intermediate_tensors = intermediate_tensors or []
         unique = _deduplicate(input_tensors)
         matrices, _ = _classify(unique)
 
@@ -203,8 +213,8 @@ class TritonKernelGenerator:
         N = right.shape[1]
 
         logger.debug(
-            "Generating kernel signature — M=%d, N=%d, K=%d, inputs=%s",
-            M, N, K, [t.name for t in unique],
+            "Generating kernel signature — M=%d, N=%d, K=%d, inputs=%s, intermediates=%s",
+            M, N, K, [t.name for t in unique], [t.name for t in intermediate_tensors],
         )
 
         # Map every input tensor to its dimension labels.
@@ -223,7 +233,7 @@ class TritonKernelGenerator:
 
         sections = [
             self._section_decorator(),
-            self._section_function_def(unique, output_tensor, dim_labels),
+            self._section_function_def(unique, output_tensor, dim_labels, intermediate_tensors),
             self._section_docstring(),
             self._section_program_ids(),
             self._section_block_offsets(),
@@ -236,6 +246,9 @@ class TritonKernelGenerator:
             else:
                 sections.append(self._section_vector_ptrs(t, labels[0]))
         sections.append(self._section_output_ptrs(output_tensor))
+        # Pointer arithmetic for each intermediate output (all M x N tiles).
+        for t in intermediate_tensors:
+            sections.append(self._section_output_ptrs(t))
         sections.append(self._section_footer())
 
         return "\n".join(sections)
@@ -298,6 +311,7 @@ class TritonKernelGenerator:
     def generate_epilogue(
         self,
         fusion_group_nodes: list[torch.fx.Node],
+        escape_stores: dict[int, TensorDescriptor] | None = None,
     ) -> str:
         """Return Triton source for fused post-GEMM operations on ``acc``.
 
@@ -312,6 +326,14 @@ class TritonKernelGenerator:
         code; other node types (``placeholder``, ``output``, …) are
         skipped.
 
+        After emitting the register operation for each node, if that node
+        is present in *escape_stores*, an intermediate ``tl.store`` is
+        immediately appended to write the current value of ``acc`` back to
+        HBM.  This ensures that PyTorch Autograd can retrieve the
+        activation during the backward pass even though the value
+        continues to be used (and may be overwritten) by subsequent fused
+        ops in the same kernel.
+
         Supported targets
         -----------------
         * ``torch.ops.aten.relu.default`` — ``tl.where(acc > 0, acc, 0.0)``
@@ -324,12 +346,20 @@ class TritonKernelGenerator:
         fusion_group_nodes :
             Topologically sorted FX nodes representing the fused
             elementwise operations to apply after the GEMM K-loop.
+        escape_stores :
+            Mapping of ``id(node)`` → :class:`TensorDescriptor` for every
+            node inside the group whose output is consumed by a user
+            **outside** the fused block.  After the register op for each
+            such node is emitted, a ``tl.store`` is appended to write
+            ``acc`` to the corresponding HBM pointer.  Pass ``None`` or
+            an empty dict when no intermediate stores are needed.
 
         Returns
         -------
         str
             Triton source lines (indented at the kernel body level).
         """
+        escape_stores = escape_stores or {}
         node_ids = {id(n) for n in fusion_group_nodes}
 
         lines: list[str] = [
@@ -360,6 +390,11 @@ class TritonKernelGenerator:
                 logger.warning(
                     "Unsupported epilogue target: %s — skipped", node.target,
                 )
+
+            # If this node's result is consumed outside the fused block,
+            # flush acc to HBM immediately so Autograd can access it.
+            if id(node) in escape_stores:
+                lines.append(self._section_intermediate_store(escape_stores[id(node)]))
 
         return "\n".join(lines)
 
@@ -442,20 +477,34 @@ class TritonKernelGenerator:
         inputs: list[TensorDescriptor],
         output: TensorDescriptor,
         dim_labels: dict[str, tuple[str, ...]],
+        intermediates: list[TensorDescriptor] | None = None,
     ) -> str:
         """Build ``def fused_kernel(...):``.
 
         Parameter groups, in order:
-        pointers -> dimensions -> strides (each input in caller order,
-        then output) -> constexpr block sizes.
+        pointers (inputs, output, intermediates) -> dimensions -> strides
+        (each input, then output, then each intermediate) -> constexpr
+        block sizes.
+
+        When *intermediates* is non-empty, each escape node contributes an
+        additional ``{name}_ptr`` pointer and ``stride_{name}_m /
+        stride_{name}_n`` parameters placed after the primary output
+        strides and before the ``tl.constexpr`` block sizes.
         """
+        intermediates = intermediates or []
         params: list[str] = []
 
-        # -- Pointers: inputs in caller-supplied order, then output --
-        all_tensors = [*inputs, output]
-        ptr_names = ", ".join(f"{t.name}_ptr" for t in all_tensors)
-        params.append("    # Pointers to input / output tensors")
-        params.append(f"    {ptr_names},")
+        # -- Pointers: inputs in caller-supplied order, then output, then
+        #    intermediate outputs (escape nodes) --
+        primary_ptrs = ", ".join(f"{t.name}_ptr" for t in [*inputs, output])
+        if intermediates:
+            intm_ptrs = ", ".join(f"{t.name}_ptr" for t in intermediates)
+            all_ptrs = f"{primary_ptrs}, {intm_ptrs}"
+            params.append("    # Pointers to input / output / intermediate tensors")
+        else:
+            all_ptrs = primary_ptrs
+            params.append("    # Pointers to input / output tensors")
+        params.append(f"    {all_ptrs},")
 
         # -- Matrix dimensions --
         params.append("    # Matrix dimensions")
@@ -475,6 +524,13 @@ class TritonKernelGenerator:
         s_on = _stride_param(output.name, "n")
         params.append(f"    # Strides for {output.name} (M x N)")
         params.append(f"    {s_om}, {s_on},")
+
+        # -- Strides: intermediate outputs (each M x N), one block each --
+        for t in intermediates:
+            s_im = _stride_param(t.name, "m")
+            s_in = _stride_param(t.name, "n")
+            params.append(f"    # Strides for intermediate output {t.name} (M x N)")
+            params.append(f"    {s_im}, {s_in},")
 
         # -- Constexpr block sizes --
         params.append("    # Block sizes (compile-time constants)")
@@ -783,6 +839,27 @@ class TritonKernelGenerator:
         return "\n".join([
             "    # Element-wise add (both operands already in SRAM)",
             "    acc = acc + acc",
+        ])
+
+    @staticmethod
+    def _section_intermediate_store(tensor: TensorDescriptor) -> str:
+        """Emit a ``tl.store`` for an intermediate (escape) activation.
+
+        Called inside :meth:`generate_epilogue` immediately after the
+        register op for an escape node.  At that point ``acc`` holds the
+        node's result, so we cast and store it to the intermediate HBM
+        pointer before ``acc`` is overwritten by the next fused op.
+
+        The store uses the same 2-D boundary mask as the final store so
+        that out-of-bounds threads never corrupt memory.
+        """
+        n = tensor.name
+        triton_dtype = _TRITON_DTYPE_MAP.get(tensor.dtype, "tl.float32")
+        return "\n".join([
+            f"    # Intermediate store — flush {n} from SRAM to HBM before",
+            f"    # acc is overwritten; required by PyTorch Autograd backward.",
+            f"    tl.store({n}_ptrs, acc.to({triton_dtype}),",
+            f"             mask=(offs_m[:, None] < M) & (offs_n[None, :] < N))",
         ])
 
     @staticmethod

@@ -39,6 +39,12 @@ class FusionGroup:
         :class:`~fuseml.passes.fusion_pass.FuseMLFusionPass` after shape
         propagation.  Used downstream for Triton block grid calculation
         and memory pointer setup.
+    intermediate_outputs : list[torch.fx.Node]
+        Internal nodes whose results are consumed by at least one node
+        **outside** the fused block (escape nodes).  Each entry requires an
+        additional output pointer in the ``@triton.jit`` signature and an
+        intermediate ``tl.store`` in the epilogue to write the activation
+        back to HBM, preserving it for PyTorch Autograd's backward pass.
     """
 
     base_node: torch.fx.Node
@@ -46,6 +52,7 @@ class FusionGroup:
     inputs: List[torch.fx.Node] = field(default_factory=list)
     output_node: torch.fx.Node = None  # type: ignore[assignment]
     output_metadata: Dict[str, Any] = field(default_factory=dict)
+    intermediate_outputs: List[torch.fx.Node] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         # Default output_node to base_node when the group is a single op.

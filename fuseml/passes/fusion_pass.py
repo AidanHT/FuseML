@@ -159,6 +159,22 @@ class FuseMLFusionPass:
 
                 current = successor
 
+            # --- Escape-node analysis -------------------------------------
+            # For every node inside the group (except the final output_node,
+            # which already has a dedicated tl.store), check whether any of
+            # its users live *outside* the fused block.  Such nodes are
+            # "escape nodes": their intermediate activation must be written
+            # back to HBM so that PyTorch Autograd can retrieve it during
+            # the backward pass.
+            group_set = set(group.all_nodes)
+            for n in group.all_nodes:
+                if n is group.output_node:
+                    continue  # handled by the final tl.store
+                for user in n.users:
+                    if user not in group_set:
+                        group.intermediate_outputs.append(n)
+                        break
+
             # Only keep groups that actually fuse something (len > 1).
             if len(group) > 1:
                 group.output_metadata = self._extract_tensor_metadata(
