@@ -1,0 +1,338 @@
+"""Triton kernel code generation — signature and memory addressing skeleton.
+
+Generates the ``@triton.jit`` function header, pointer parameters, stride
+parameters, ``tl.constexpr`` block sizes, ``tl.program_id`` block offsets,
+and initial pointer arithmetic for matmul-based fused kernels.
+
+This module owns **only** the signature and addressing stage.  The
+accumulation loop and store logic are separate concerns added later.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import torch
+
+from fuseml._logging import logger
+
+
+# ---------------------------------------------------------------------------
+# Tensor descriptor
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class TensorDescriptor:
+    """Lightweight metadata describing a tensor for kernel codegen.
+
+    Attributes
+    ----------
+    name  : short identifier used in generated variable names (e.g. ``"a"``,
+            ``"bias"``).
+    shape : concrete shape tuple, e.g. ``(128, 64)``.
+    stride: concrete stride tuple matching *shape*, e.g. ``(64, 1)``.
+    dtype : PyTorch scalar type, e.g. ``torch.float32``.
+    """
+
+    name: str
+    shape: tuple[int, ...]
+    stride: tuple[int, ...]
+    dtype: torch.dtype
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _stride_param(tensor_name: str, dim_label: str) -> str:
+    """Build a stride parameter name.
+
+    Single-char names keep the Triton-tutorial style (``stride_am``),
+    multi-char names insert an underscore for clarity (``stride_bias_n``).
+    """
+    sep = "" if len(tensor_name) == 1 else "_"
+    return f"stride_{tensor_name}{sep}{dim_label}"
+
+
+def _block_const(dim: str) -> str:
+    """Return the ``BLOCK_SIZE_*`` constant for *dim* (e.g. ``"m"`` -> ``"BLOCK_SIZE_M"``)."""
+    return f"BLOCK_SIZE_{dim.upper()}"
+
+
+def _deduplicate(tensors: list[TensorDescriptor]) -> list[TensorDescriptor]:
+    """Remove duplicate descriptors (by name), preserving order."""
+    seen: set[str] = set()
+    out: list[TensorDescriptor] = []
+    for t in tensors:
+        if t.name not in seen:
+            seen.add(t.name)
+            out.append(t)
+    return out
+
+
+def _classify(
+    tensors: list[TensorDescriptor],
+) -> tuple[list[TensorDescriptor], list[TensorDescriptor]]:
+    """Split tensors into 2-D matrices and 1-D vectors."""
+    matrices = [t for t in tensors if len(t.shape) == 2]
+    vectors = [t for t in tensors if len(t.shape) == 1]
+    return matrices, vectors
+
+
+def _vector_dim(tensor: TensorDescriptor, M: int, N: int) -> str:
+    """Decide whether a 1-D tensor broadcasts along ``"n"`` or ``"m"``."""
+    if tensor.shape[0] == N:
+        return "n"
+    if tensor.shape[0] == M:
+        return "m"
+    # Ambiguous — default to n (standard bias convention for addmm).
+    return "n"
+
+
+# ---------------------------------------------------------------------------
+# TritonKernelGenerator
+# ---------------------------------------------------------------------------
+
+class TritonKernelGenerator:
+    """Generates Triton kernel source code from tensor descriptors.
+
+    Current scope: matmul-based fusions (``addmm`` / ``mm`` as the base op)
+    with optional bias and elementwise post-ops.  This first stage produces
+    only the kernel *signature* and *pointer arithmetic*; the accumulation
+    loop and store logic are separate concerns.
+    """
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def generate_signature_and_pointers(
+        self,
+        input_tensors: list[TensorDescriptor],
+        output_tensor: TensorDescriptor,
+    ) -> str:
+        """Return a Triton kernel source string (no compute loop).
+
+        The returned string contains, in order:
+
+        1. ``@triton.jit`` decorator.
+        2. ``def fused_kernel(...)`` with dynamically generated pointer,
+           dimension, stride, and ``tl.constexpr`` block-size parameters.
+        3. ``tl.program_id`` block-offset computation for the M and N
+           dimensions.
+        4. Initial pointer arithmetic for every input tensor and the
+           output tensor.
+
+        Parameters
+        ----------
+        input_tensors :
+            Descriptors for each unique input.  Must include exactly two
+            2-D tensors (the matmul operands A and B); additional 1-D
+            tensors are treated as bias vectors broadcast along the
+            matching dimension.
+        output_tensor :
+            Descriptor for the 2-D output tensor.
+
+        Raises
+        ------
+        ValueError
+            If fewer than two 2-D inputs are provided or the inner
+            (contracting) dimensions of the two matrices do not match.
+        """
+        unique = _deduplicate(input_tensors)
+        matrices, vectors = _classify(unique)
+
+        if len(matrices) < 2:
+            raise ValueError(
+                f"Need >= 2 two-dimensional inputs for matmul, got {len(matrices)}"
+            )
+
+        a, b = matrices[0], matrices[1]
+        M, K_a = a.shape
+        K_b, N = b.shape
+        if K_a != K_b:
+            raise ValueError(
+                f"Contracting dimension mismatch: "
+                f"{a.name}{a.shape} vs {b.name}{b.shape}"
+            )
+
+        logger.debug(
+            "Generating kernel signature — M=%d, N=%d, K=%d, inputs=%s",
+            M, N, K_a, [t.name for t in unique],
+        )
+
+        sections = [
+            self._section_decorator(),
+            self._section_function_def(a, b, vectors, output_tensor),
+            self._section_docstring(),
+            self._section_program_ids(),
+            self._section_block_offsets(),
+            self._section_matrix_ptrs(a, ("m", "k")),
+            self._section_matrix_ptrs(b, ("k", "n")),
+        ]
+        for v in vectors:
+            sections.append(self._section_vector_ptrs(v, M, N))
+        sections.append(self._section_output_ptrs(output_tensor))
+        sections.append(self._section_footer())
+
+        return "\n".join(sections)
+
+    # ------------------------------------------------------------------
+    # Code-section builders (each returns a ready-to-join string)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _section_decorator() -> str:
+        return "@triton.jit"
+
+    @staticmethod
+    def _section_function_def(
+        a: TensorDescriptor,
+        b: TensorDescriptor,
+        vectors: list[TensorDescriptor],
+        output: TensorDescriptor,
+    ) -> str:
+        """Build ``def fused_kernel(...):``.
+
+        Parameter groups, in order:
+        pointers -> dimensions -> strides (A, B, vectors, output) -> constexpr.
+        """
+        params: list[str] = []
+
+        # -- Pointers --
+        all_tensors = [a, b, *vectors, output]
+        ptr_names = ", ".join(f"{t.name}_ptr" for t in all_tensors)
+        params.append("    # Pointers to input / output tensors")
+        params.append(f"    {ptr_names},")
+
+        # -- Matrix dimensions --
+        params.append("    # Matrix dimensions")
+        params.append("    M, N, K,")
+
+        # -- Strides: A (M x K) --
+        s_am = _stride_param(a.name, "m")
+        s_ak = _stride_param(a.name, "k")
+        params.append(f"    # Strides for {a.name} (M x K)")
+        params.append(f"    {s_am}, {s_ak},")
+
+        # -- Strides: B (K x N) --
+        s_bk = _stride_param(b.name, "k")
+        s_bn = _stride_param(b.name, "n")
+        params.append(f"    # Strides for {b.name} (K x N)")
+        params.append(f"    {s_bk}, {s_bn},")
+
+        # -- Strides: vectors --
+        for v in vectors:
+            dim = _vector_dim(v, a.shape[0], b.shape[1])
+            sv = _stride_param(v.name, dim)
+            params.append(f"    # Stride for {v.name} ({v.shape[0]},)")
+            params.append(f"    {sv},")
+
+        # -- Strides: output (M x N) --
+        s_om = _stride_param(output.name, "m")
+        s_on = _stride_param(output.name, "n")
+        params.append(f"    # Strides for {output.name} (M x N)")
+        params.append(f"    {s_om}, {s_on},")
+
+        # -- Constexpr block sizes --
+        params.append("    # Block sizes (compile-time constants)")
+        params.append("    BLOCK_SIZE_M: tl.constexpr,")
+        params.append("    BLOCK_SIZE_N: tl.constexpr,")
+        params.append("    BLOCK_SIZE_K: tl.constexpr,")
+
+        body = "\n".join(params)
+        return f"def fused_kernel(\n{body}\n):"
+
+    @staticmethod
+    def _section_docstring() -> str:
+        return '    """Auto-generated fused kernel — signature and pointer skeleton."""'
+
+    @staticmethod
+    def _section_program_ids() -> str:
+        return "\n".join([
+            "    # -----------------------------------------------------------",
+            "    # Block index — each program instance owns one (M, N) tile",
+            "    # -----------------------------------------------------------",
+            "    pid_m = tl.program_id(0)",
+            "    pid_n = tl.program_id(1)",
+        ])
+
+    @staticmethod
+    def _section_block_offsets() -> str:
+        return "\n".join([
+            "",
+            "    # -----------------------------------------------------------",
+            "    # Block offsets — row, col, and reduction-axis index ranges",
+            "    # -----------------------------------------------------------",
+            "    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)",
+            "    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)",
+            "    offs_k = tl.arange(0, BLOCK_SIZE_K)",
+        ])
+
+    @staticmethod
+    def _section_matrix_ptrs(
+        tensor: TensorDescriptor,
+        dim_labels: tuple[str, str],
+    ) -> str:
+        """Pointer arithmetic for a 2-D matrix tile.
+
+        Loads a ``(BLOCK_SIZE_{d0}, BLOCK_SIZE_{d1})`` tile from global memory
+        into SRAM.  The stride-based addressing allows non-contiguous layouts.
+        """
+        n = tensor.name
+        d0, d1 = dim_labels
+        s0 = _stride_param(n, d0)
+        s1 = _stride_param(n, d1)
+        blk0 = _block_const(d0)
+        blk1 = _block_const(d1)
+        return "\n".join([
+            "",
+            "    # -----------------------------------------------------------",
+            f"    # Pointer arithmetic for {n} — loads a ({blk0}, {blk1}) tile",
+            f"    # {n}_ptrs[i, j] = {n}_ptr + offs_{d0}[i]*{s0} + offs_{d1}[j]*{s1}",
+            "    # -----------------------------------------------------------",
+            (
+                f"    {n}_ptrs = {n}_ptr + "
+                f"(offs_{d0}[:, None] * {s0} + offs_{d1}[None, :] * {s1})"
+            ),
+        ])
+
+    @staticmethod
+    def _section_vector_ptrs(
+        tensor: TensorDescriptor,
+        M: int,
+        N: int,
+    ) -> str:
+        """Pointer arithmetic for a 1-D vector (bias), broadcast along one dim."""
+        n = tensor.name
+        dim = _vector_dim(tensor, M, N)
+        sv = _stride_param(n, dim)
+        return "\n".join([
+            "",
+            "    # -----------------------------------------------------------",
+            f"    # Pointer arithmetic for {n} — 1-D, broadcast along {dim} axis",
+            "    # -----------------------------------------------------------",
+            f"    {n}_ptrs = {n}_ptr + offs_{dim} * {sv}",
+        ])
+
+    @staticmethod
+    def _section_output_ptrs(tensor: TensorDescriptor) -> str:
+        """Pointer arithmetic for the 2-D output tile (M x N)."""
+        n = tensor.name
+        sm = _stride_param(n, "m")
+        sn = _stride_param(n, "n")
+        return "\n".join([
+            "",
+            "    # -----------------------------------------------------------",
+            f"    # Pointer arithmetic for output {n} (M x N)",
+            f"    # {n}_ptrs[i, j] = {n}_ptr + offs_m[i]*{sm} + offs_n[j]*{sn}",
+            "    # -----------------------------------------------------------",
+            (
+                f"    {n}_ptrs = {n}_ptr + "
+                f"(offs_m[:, None] * {sm} + offs_n[None, :] * {sn})"
+            ),
+        ])
+
+    @staticmethod
+    def _section_footer() -> str:
+        return "\n    # --- Compute loop and store logic to be generated separately ---"
