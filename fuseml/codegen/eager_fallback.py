@@ -6,18 +6,27 @@ errors, ``triton.CompilationError``, CUDA out-of-memory during
 intermediate allocations, or hardware-specific compilation timeouts —
 the guard:
 
-1. **Restores clean state** by synchronising the CUDA device so that no
-   partially written data remains in the pre-allocated output tensor.
-   A fresh output is then produced by the eager fallback, guaranteeing
-   that downstream consumers never observe corrupted memory.
+1. **Snapshots inputs** before the Triton launch via ``.clone()`` so
+   the fallback always operates on pristine data, even if the kernel
+   wrote in-place over input memory before failing (strict buffer
+   isolation).
 
-2. **Logs the failure** with the kernel signature so operators can
+2. **Restores clean state** by synchronising the CUDA device so that no
+   partially written data remains in the pre-allocated output tensor.
+
+3. **Frees corrupted buffers** by resizing the pre-allocated output and
+   intermediate tensors' storage to zero, releasing GPU memory
+   immediately.  On OOM errors, ``torch.cuda.empty_cache()`` is called
+   to defragment the CUDA allocator before the fallback allocates.
+
+4. **Logs the failure** with the kernel signature so operators can
    diagnose which fused group triggered the fallback without sifting
    through stack traces.
 
-3. **Routes the exact inputs** through the original, unfused PyTorch
-   ``fx.Graph`` node sequence (provided as *eager_fn*), producing a
-   mathematically equivalent result via ATen eager execution.
+5. **Routes the snapshotted inputs** through the original, unfused
+   PyTorch ``fx.Graph`` node sequence (provided as *eager_fn*),
+   producing a mathematically equivalent result via ATen eager
+   execution.
 
 Because floating-point math is *not* associative in limited precision
 (``(a + b) + c ≠ a + (b + c)``), the Triton kernel and the eager
@@ -86,6 +95,8 @@ class EagerFallbackGuard:
         self,
         triton_launch_fn: Callable[[], torch.Tensor],
         input_tensors: tuple[torch.Tensor, ...],
+        *,
+        triton_buffers: list[torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """Try the Triton path; fall back to eager on recoverable failure.
 
@@ -98,6 +109,11 @@ class EagerFallbackGuard:
         input_tensors :
             The original input tensors, passed through to *eager_fn*
             if the Triton path fails.
+        triton_buffers :
+            Optional list of pre-allocated output tensors (primary
+            output + intermediate escape buffers) that the Triton
+            kernel writes to.  On failure these are explicitly freed
+            to reclaim GPU memory before the eager fallback allocates.
 
         Returns
         -------
@@ -105,13 +121,24 @@ class EagerFallbackGuard:
             The kernel output — either from Triton (fast path) or from
             eager PyTorch execution (fallback path).
         """
+        # ── Strict buffer isolation ──────────────────────────────────
+        # Clone inputs before the Triton launch so the fallback always
+        # operates on pristine data.  If the Triton kernel writes
+        # in-place over input memory (aliased pointers, in-place ops
+        # like add_) and then fails mid-execution, the originals may
+        # contain partial garbage.  The snapshots guarantee the eager
+        # path sees untouched tensors regardless of kernel behaviour.
+        input_snapshots = tuple(t.clone() for t in input_tensors)
+
         try:
             output = triton_launch_fn()
             return output
         except Exception as exc:
             if not self._is_recoverable(exc):
                 raise
-            return self._handle_failure(exc, input_tensors)
+            return self._handle_failure(
+                exc, input_snapshots, triton_buffers=triton_buffers,
+            )
 
     # ------------------------------------------------------------------
     # Internals
@@ -138,12 +165,25 @@ class EagerFallbackGuard:
             return True
         return False
 
+    @staticmethod
+    def _is_oom_error(exc: BaseException) -> bool:
+        """Detect CUDA out-of-memory errors from exception message.
+
+        PyTorch's CUDA OOM errors are ``RuntimeError`` instances with
+        recognisable messages.  We match conservatively so the guard
+        can trigger ``torch.cuda.empty_cache()`` to defragment the
+        CUDA allocator before the eager fallback allocates its output.
+        """
+        return "out of memory" in str(exc).lower()
+
     def _handle_failure(
         self,
         exc: BaseException,
-        input_tensors: tuple[torch.Tensor, ...],
+        input_snapshots: tuple[torch.Tensor, ...],
+        *,
+        triton_buffers: list[torch.Tensor] | None = None,
     ) -> torch.Tensor:
-        """Log the failure, restore clean CUDA state, run eager fallback."""
+        """Log failure, free corrupted buffers, restore state, run eager."""
         self._fallback_count += 1
 
         logger.warning(
@@ -156,15 +196,21 @@ class EagerFallbackGuard:
         )
 
         # ── Clean state restoration ──────────────────────────────────
-        # If the Triton kernel failed mid-execution (e.g. CUDA OOM
-        # during an intermediate allocation), the pre-allocated output
-        # tensor may contain partially written garbage.  Synchronising
-        # the device ensures all pending CUDA work completes (or errors
-        # out) so the stream is in a known-good state before we produce
-        # a fresh output through the eager path.
-        self._synchronize_device(input_tensors)
+        # Synchronise the device so all pending CUDA work completes
+        # (or errors out) before we touch any tensor data.
+        self._synchronize_device(input_snapshots)
 
-        return self._execute_eager_fallback(input_tensors)
+        # ── Garbage collection: free corrupted output buffers ────────
+        # The pre-allocated output and intermediate tensors may contain
+        # partial garbage from the failed kernel.  Free their storage
+        # immediately so the eager fallback has maximum GPU headroom.
+        # On OOM errors, also defragment the CUDA allocator.
+        self._discard_corrupted_buffers(
+            triton_buffers,
+            force_cache_clear=self._is_oom_error(exc),
+        )
+
+        return self._execute_eager_fallback(input_snapshots)
 
     @staticmethod
     def _synchronize_device(
@@ -183,6 +229,40 @@ class EagerFallbackGuard:
             if t.device.type == "cuda":
                 torch.cuda.synchronize(t.device)
                 return  # all tensors should be on the same device
+
+    @staticmethod
+    def _discard_corrupted_buffers(
+        triton_buffers: list[torch.Tensor] | None,
+        *,
+        force_cache_clear: bool = False,
+    ) -> None:
+        """Free pre-allocated output buffers that may contain partial garbage.
+
+        Resizes each buffer's underlying storage to zero, immediately
+        releasing GPU (or CPU) memory.  The tensors become unusable
+        after this call — which is the intent, as they contained
+        corrupted partial writes from the failed kernel.
+
+        When *force_cache_clear* is ``True`` (i.e. on OOM errors),
+        ``torch.cuda.empty_cache()`` is called to defragment the CUDA
+        memory allocator, maximising available headroom for the eager
+        fallback's allocations.
+        """
+        if triton_buffers is None:
+            return
+
+        has_cuda = False
+        for t in triton_buffers:
+            if t.device.type == "cuda":
+                has_cuda = True
+            # Resize storage to 0 → immediate memory release.
+            # The tensor becomes unusable, but it contained corrupted
+            # partial writes from the failed kernel — exactly what
+            # we want to discard.
+            t.untyped_storage().resize_(0)
+
+        if force_cache_clear and has_cuda:
+            torch.cuda.empty_cache()
 
     def _execute_eager_fallback(
         self,

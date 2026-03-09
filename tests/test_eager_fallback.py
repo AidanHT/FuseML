@@ -148,6 +148,234 @@ class TestEagerFallbackGuardUnit:
 
 
 # ---------------------------------------------------------------------------
+# Buffer isolation — input snapshots prevent in-place corruption
+# ---------------------------------------------------------------------------
+
+@pytest.mark.fallback
+class TestBufferIsolation:
+    """Verify that input snapshots protect the eager fallback from corruption.
+
+    If the Triton kernel writes in-place over input memory (aliased
+    pointers, in-place ops like add_) before failing, the fallback must
+    still receive pristine, uncorrupted inputs.
+    """
+
+    def test_inputs_cloned_before_triton_launch(self):
+        """Fallback uses cloned inputs, not originals that kernel may have corrupted."""
+        a = torch.randn(4, 4)
+        b = torch.randn(4, 4)
+        a_original = a.clone()
+        b_original = b.clone()
+
+        def triton_that_corrupts_inputs():
+            # Simulate in-place corruption of input memory
+            a.mul_(0.0)  # Zeroes out 'a' in-place
+            b.fill_(float("nan"))  # Poisons 'b'
+            raise RuntimeError("CUDA error after in-place corruption")
+
+        guard = EagerFallbackGuard(_simple_eager_matmul, "corrupt_input_kernel")
+        result = guard.execute(triton_that_corrupts_inputs, (a, b))
+
+        # The fallback result must use the ORIGINAL (pre-corruption) values.
+        expected = a_original @ b_original
+        torch.testing.assert_close(result, expected)
+
+    def test_snapshot_not_affected_by_kernel_mutation(self):
+        """Even if the kernel mutates the input tensor, snapshots are independent."""
+        x = torch.ones(3, 3)
+        captured_snapshots = []
+
+        def eager_fn(a):
+            captured_snapshots.append(a.clone())
+            return a * 2
+
+        def triton_that_mutates():
+            x.zero_()  # Corrupt original
+            raise RuntimeError("fail after mutation")
+
+        guard = EagerFallbackGuard(eager_fn, "mutate_kernel")
+        result = guard.execute(triton_that_mutates, (x,))
+
+        # The eager_fn received a snapshot taken BEFORE the mutation
+        assert len(captured_snapshots) == 1
+        torch.testing.assert_close(captured_snapshots[0], torch.ones(3, 3))
+
+    def test_fp16_input_isolation(self):
+        """Buffer isolation works correctly for FP16 tensors."""
+        a = torch.randn(4, 4, dtype=torch.float16)
+        b = torch.randn(4, 4, dtype=torch.float16)
+        expected = a @ b
+
+        def triton_corrupts_fp16():
+            a.fill_(float("inf"))
+            raise RuntimeError("FP16 kernel failure")
+
+        guard = EagerFallbackGuard(_simple_eager_matmul, "fp16_isolation")
+        result = guard.execute(triton_corrupts_fp16, (a, b))
+        torch.testing.assert_close(result, expected, atol=1e-3, rtol=1e-2)
+
+    def test_happy_path_returns_triton_output_not_snapshot(self):
+        """On success, the Triton output is returned — not a snapshot."""
+        expected = torch.randn(4, 4)
+
+        def triton_fn():
+            return expected
+
+        guard = EagerFallbackGuard(_simple_eager_matmul, "happy_kernel")
+        result = guard.execute(triton_fn, (torch.randn(4, 4), torch.randn(4, 4)))
+        assert result is expected
+
+    def test_inplace_add_corruption_isolated(self):
+        """In-place add_ on input before failure doesn't poison fallback."""
+        a = torch.randn(4, 4)
+        b = torch.randn(4, 4)
+        a_original = a.clone()
+
+        def triton_inplace_add():
+            a.add_(1000.0)  # In-place add_ — corrupts 'a'
+            raise RuntimeError("kernel failure after add_")
+
+        guard = EagerFallbackGuard(_simple_eager_matmul, "inplace_add_kernel")
+        result = guard.execute(triton_inplace_add, (a, b))
+        expected = a_original @ b
+        torch.testing.assert_close(result, expected)
+
+
+# ---------------------------------------------------------------------------
+# Garbage collection — corrupted buffer cleanup and OOM handling
+# ---------------------------------------------------------------------------
+
+@pytest.mark.fallback
+class TestGarbageCollectionOnFailure:
+    """Verify corrupted output buffers are freed and OOM triggers cache clearing."""
+
+    def test_corrupted_output_storage_freed(self):
+        """triton_buffers have their storage resized to 0 on failure."""
+        corrupted_output = torch.randn(8, 8)
+        intermediate = torch.randn(8, 8)
+
+        assert corrupted_output.untyped_storage().size() > 0
+        assert intermediate.untyped_storage().size() > 0
+
+        def failing_triton():
+            raise RuntimeError("kernel crash")
+
+        guard = EagerFallbackGuard(_simple_eager_matmul, "gc_kernel")
+        a, b = torch.randn(8, 8), torch.randn(8, 8)
+        guard.execute(
+            failing_triton, (a, b),
+            triton_buffers=[corrupted_output, intermediate],
+        )
+
+        # Both buffers should have their storage freed
+        assert corrupted_output.untyped_storage().size() == 0
+        assert intermediate.untyped_storage().size() == 0
+
+    def test_no_crash_when_triton_buffers_is_none(self):
+        """execute works fine without triton_buffers (backward compat)."""
+        guard = EagerFallbackGuard(_simple_eager_matmul, "no_buffers")
+        a, b = torch.randn(4, 4), torch.randn(4, 4)
+        result = guard.execute(
+            lambda: (_ for _ in ()).throw(RuntimeError("fail")),
+            (a, b),
+        )
+        expected = a @ b
+        torch.testing.assert_close(result, expected)
+
+    def test_discard_corrupted_buffers_frees_storage(self):
+        """_discard_corrupted_buffers resizes storage to 0."""
+        t1 = torch.randn(4, 4)
+        t2 = torch.randn(8, 8)
+
+        EagerFallbackGuard._discard_corrupted_buffers([t1, t2])
+
+        assert t1.untyped_storage().size() == 0
+        assert t2.untyped_storage().size() == 0
+
+    def test_discard_corrupted_buffers_noop_when_none(self):
+        """_discard_corrupted_buffers is a no-op when triton_buffers is None."""
+        # Should not raise
+        EagerFallbackGuard._discard_corrupted_buffers(None)
+
+    def test_discard_corrupted_buffers_empty_list(self):
+        """_discard_corrupted_buffers handles empty list gracefully."""
+        EagerFallbackGuard._discard_corrupted_buffers([])
+
+    def test_double_discard_is_safe(self):
+        """Calling _discard_corrupted_buffers twice on same tensors is a no-op."""
+        t = torch.randn(4, 4)
+        buffers = [t]
+        EagerFallbackGuard._discard_corrupted_buffers(buffers)
+        assert t.untyped_storage().size() == 0
+        # Second call should not raise — resize_(0) on zero storage is fine
+        EagerFallbackGuard._discard_corrupted_buffers(buffers)
+
+    def test_combined_isolation_and_gc(self):
+        """Input isolation and buffer garbage collection work together."""
+        a = torch.randn(4, 4)
+        b = torch.randn(4, 4)
+        a_original = a.clone()
+        b_original = b.clone()
+        corrupted_output = torch.randn(4, 4)
+
+        def triton_corrupts_everything():
+            a.zero_()
+            corrupted_output[:2, :] = 999.0
+            raise RuntimeError("CUDA out of memory")
+
+        guard = EagerFallbackGuard(_simple_eager_matmul, "combined_kernel")
+        result = guard.execute(
+            triton_corrupts_everything, (a, b),
+            triton_buffers=[corrupted_output],
+        )
+
+        # Fallback used pristine snapshots
+        expected = a_original @ b_original
+        torch.testing.assert_close(result, expected)
+        # Corrupted output buffer was freed
+        assert corrupted_output.untyped_storage().size() == 0
+
+
+# ---------------------------------------------------------------------------
+# OOM detection — _is_oom_error
+# ---------------------------------------------------------------------------
+
+@pytest.mark.fallback
+class TestIsOomError:
+    """Verify _is_oom_error correctly detects CUDA OOM messages."""
+
+    def test_standard_cuda_oom_message(self):
+        assert EagerFallbackGuard._is_oom_error(
+            RuntimeError("CUDA out of memory. Tried to allocate 2.00 GiB")
+        )
+
+    def test_generic_out_of_memory(self):
+        assert EagerFallbackGuard._is_oom_error(
+            RuntimeError("out of memory")
+        )
+
+    def test_case_insensitive(self):
+        assert EagerFallbackGuard._is_oom_error(
+            RuntimeError("Out Of Memory on device 0")
+        )
+
+    def test_ptx_failure_is_not_oom(self):
+        assert not EagerFallbackGuard._is_oom_error(
+            RuntimeError("PTX assembly failure")
+        )
+
+    def test_driver_error_is_not_oom(self):
+        assert not EagerFallbackGuard._is_oom_error(
+            RuntimeError("invalid device ordinal")
+        )
+
+    def test_allocation_failed_without_oom_wording(self):
+        assert not EagerFallbackGuard._is_oom_error(
+            RuntimeError("memory allocation failed")
+        )
+
+
+# ---------------------------------------------------------------------------
 # _is_triton_compilation_error — dynamic check
 # ---------------------------------------------------------------------------
 
@@ -352,6 +580,114 @@ class TestKernelLauncherFallbackIntegration:
         launcher(a, b)
         launcher(a, b)
         assert launcher._fallback_guard.fallback_count == 2
+
+
+# ---------------------------------------------------------------------------
+# KernelLauncher integration — buffer isolation and garbage collection
+# ---------------------------------------------------------------------------
+
+@pytest.mark.fallback
+class TestKernelLauncherBufferIsolationIntegration:
+    """Verify KernelLauncher passes triton_buffers and input isolation works."""
+
+    @pytest.fixture(autouse=True)
+    def _inject_mock_triton(self, monkeypatch):
+        mock_triton = types.ModuleType("triton")
+        mock_triton.cdiv = lambda a, b: (a + b - 1) // b
+        monkeypatch.setitem(sys.modules, "triton", mock_triton)
+
+    def test_fallback_returns_correct_result_despite_kernel_failure(
+        self, input_descs, output_desc,
+    ):
+        """Fallback produces correct output even when kernel fails."""
+        failing_fn = _MockKernelFn(side_effect=RuntimeError("CUDA OOM"))
+        launcher = KernelLauncher(
+            failing_fn, input_descs, output_desc, [], "a", "b",
+            eager_fn=_simple_eager_matmul,
+        )
+        a = torch.randn(128, 64)
+        b = torch.randn(64, 256)
+        result = launcher(a, b)
+        expected = a @ b
+        # a and b were not corrupted by the mock kernel, so originals
+        # and snapshots are identical — result should match exactly.
+        torch.testing.assert_close(result, expected)
+
+    def test_fallback_with_intermediates(self, input_descs, output_desc):
+        """Intermediate descriptors are included in triton_buffers."""
+        failing_fn = _MockKernelFn(side_effect=RuntimeError("kernel fail"))
+        intermediate_descs = [
+            TensorDescriptor(
+                name="escape_0", shape=(128, 256),
+                stride=(256, 1), dtype=torch.float32,
+            ),
+        ]
+        launcher = KernelLauncher(
+            failing_fn, input_descs, output_desc,
+            intermediate_descs, "a", "b",
+            eager_fn=_simple_eager_matmul,
+        )
+        a = torch.randn(128, 64)
+        b = torch.randn(64, 256)
+        result = launcher(a, b)
+        expected = a @ b
+        torch.testing.assert_close(result, expected)
+
+    def test_discard_called_on_oom(self, input_descs, output_desc, monkeypatch):
+        """On OOM, _discard_corrupted_buffers is called with force_cache_clear."""
+        failing_fn = _MockKernelFn(
+            side_effect=RuntimeError("CUDA out of memory"),
+        )
+        discard_kwargs = []
+        original_discard = EagerFallbackGuard._discard_corrupted_buffers
+
+        @staticmethod
+        def spy_discard(triton_buffers, *, force_cache_clear=False):
+            discard_kwargs.append({
+                "buffer_count": len(triton_buffers) if triton_buffers else 0,
+                "force_cache_clear": force_cache_clear,
+            })
+            original_discard(triton_buffers, force_cache_clear=force_cache_clear)
+
+        monkeypatch.setattr(
+            EagerFallbackGuard, "_discard_corrupted_buffers", spy_discard,
+        )
+        launcher = KernelLauncher(
+            failing_fn, input_descs, output_desc, [], "a", "b",
+            eager_fn=_simple_eager_matmul,
+        )
+        launcher(torch.randn(128, 64), torch.randn(64, 256))
+
+        assert len(discard_kwargs) == 1
+        assert discard_kwargs[0]["buffer_count"] == 1  # output tensor
+        assert discard_kwargs[0]["force_cache_clear"] is True
+
+    def test_non_oom_error_does_not_force_cache_clear(
+        self, input_descs, output_desc, monkeypatch,
+    ):
+        """Non-OOM RuntimeError discards buffers but without cache clearing."""
+        failing_fn = _MockKernelFn(
+            side_effect=RuntimeError("PTX assembly failure"),
+        )
+        discard_kwargs = []
+        original_discard = EagerFallbackGuard._discard_corrupted_buffers
+
+        @staticmethod
+        def spy_discard(triton_buffers, *, force_cache_clear=False):
+            discard_kwargs.append({"force_cache_clear": force_cache_clear})
+            original_discard(triton_buffers, force_cache_clear=force_cache_clear)
+
+        monkeypatch.setattr(
+            EagerFallbackGuard, "_discard_corrupted_buffers", spy_discard,
+        )
+        launcher = KernelLauncher(
+            failing_fn, input_descs, output_desc, [], "a", "b",
+            eager_fn=_simple_eager_matmul,
+        )
+        launcher(torch.randn(128, 64), torch.randn(64, 256))
+
+        assert len(discard_kwargs) == 1
+        assert discard_kwargs[0]["force_cache_clear"] is False
 
 
 # ---------------------------------------------------------------------------

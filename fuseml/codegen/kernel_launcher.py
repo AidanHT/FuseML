@@ -566,12 +566,18 @@ class KernelLauncher:
         # When a fallback guard is configured, wrap the Triton launch
         # so that CompilationError / RuntimeError (CUDA OOM, PTX
         # failures) are caught and the inputs are re-routed through
-        # the original unfused PyTorch execution path.  The guard
-        # synchronises the CUDA device to prevent corrupted partial
-        # writes from reaching downstream consumers.
+        # the original unfused PyTorch execution path.  The guard:
+        #   1. Snapshots inputs (clone) before the launch so the
+        #      fallback always operates on pristine, uncorrupted data.
+        #   2. Frees the pre-allocated output + intermediate buffers
+        #      on failure (resizes storage to 0) to reclaim GPU memory.
+        #   3. Calls torch.cuda.empty_cache() on OOM to defragment
+        #      the allocator before the eager fallback allocates.
         if self._fallback_guard is not None:
             return self._fallback_guard.execute(
-                _triton_launch, input_tensors,
+                _triton_launch,
+                input_tensors,
+                triton_buffers=[output] + intermediate_outputs,
             )
 
         return _triton_launch()
