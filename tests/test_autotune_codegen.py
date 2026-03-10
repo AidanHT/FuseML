@@ -125,19 +125,19 @@ class TestAutotuneConstants:
         assert _AUTOTUNE_SRAM_BUDGET_BYTES == 100 * 1024
 
     def test_block_m_choices(self):
-        assert _AUTOTUNE_BLOCK_M_CHOICES == (32, 64, 128, 256)
+        assert _AUTOTUNE_BLOCK_M_CHOICES == (64, 128, 256)
 
     def test_block_n_choices(self):
-        assert _AUTOTUNE_BLOCK_N_CHOICES == (32, 64, 128, 256)
+        assert _AUTOTUNE_BLOCK_N_CHOICES == (64, 128, 256)
 
     def test_block_k_choices(self):
-        assert _AUTOTUNE_BLOCK_K_CHOICES == (32, 64, 128)
+        assert _AUTOTUNE_BLOCK_K_CHOICES == (32, 64)
 
     def test_num_warps_choices(self):
         assert _AUTOTUNE_NUM_WARPS_CHOICES == (4, 8, 16)
 
     def test_num_stages_choices(self):
-        assert _AUTOTUNE_NUM_STAGES_CHOICES == (2, 3, 4, 5)
+        assert _AUTOTUNE_NUM_STAGES_CHOICES == (2, 3, 4)
 
     def test_reduction_num_warps_includes_16(self):
         assert 16 in _AUTOTUNE_REDUCTION_NUM_WARPS_CHOICES
@@ -148,7 +148,7 @@ class TestAutotuneConstants:
             assert w in _AUTOTUNE_REDUCTION_NUM_WARPS_CHOICES
 
     def test_group_size_m_choices(self):
-        assert _AUTOTUNE_GROUP_SIZE_M_CHOICES == (4, 8, 16)
+        assert _AUTOTUNE_GROUP_SIZE_M_CHOICES == (8,)
 
     def test_dtype_bytes_fp32(self):
         assert _DTYPE_BYTES[torch.float32] == 4

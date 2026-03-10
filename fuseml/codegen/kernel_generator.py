@@ -101,9 +101,9 @@ _AUTOTUNE_SRAM_BUDGET_BYTES: int = _DEFAULT_SRAM_BUDGET_BYTES
 # through large tiles (256) for data reuse on high-end desktop GPUs.
 # SRAM pruning + heuristic filtering keeps the effective config count
 # manageable (target < 100 surviving configs).
-_AUTOTUNE_BLOCK_M_CHOICES: tuple[int, ...] = (32, 64, 128, 256)
-_AUTOTUNE_BLOCK_N_CHOICES: tuple[int, ...] = (32, 64, 128, 256)
-_AUTOTUNE_BLOCK_K_CHOICES: tuple[int, ...] = (32, 64, 128)
+_AUTOTUNE_BLOCK_M_CHOICES: tuple[int, ...] = (64, 128, 256)
+_AUTOTUNE_BLOCK_N_CHOICES: tuple[int, ...] = (64, 128, 256)
+_AUTOTUNE_BLOCK_K_CHOICES: tuple[int, ...] = (32, 64)
 
 # Standard warp counts and software-pipelining depths.
 # Ada uses cp.async (not TMA) for async global→shared copies.  Higher
@@ -111,16 +111,18 @@ _AUTOTUNE_BLOCK_K_CHOICES: tuple[int, ...] = (32, 64, 128)
 # cp.async copies with Tensor Core compute, but increase register
 # pressure.  The autotuner selects the optimal balance at runtime.
 _AUTOTUNE_NUM_WARPS_CHOICES: tuple[int, ...] = (4, 8, 16)
-_AUTOTUNE_NUM_STAGES_CHOICES: tuple[int, ...] = (2, 3, 4, 5)
+_AUTOTUNE_NUM_STAGES_CHOICES: tuple[int, ...] = (2, 3, 4)
 
 # Reduction-specialised warp counts — higher counts saturate the SMs
 # during tl.atomic_add / tl.atomic_max cross-thread synchronisation.
 _AUTOTUNE_REDUCTION_NUM_WARPS_CHOICES: tuple[int, ...] = (2, 4, 8, 16)
 
-# L2 swizzle group width candidates — controls how many M-blocks are
-# grouped in the 1-D → 2-D block-index mapping.  Different values suit
-# different matrix aspect ratios.
-_AUTOTUNE_GROUP_SIZE_M_CHOICES: tuple[int, ...] = (4, 8, 16)
+# L2 swizzle group width — 8 is the standard value from the Triton GEMM
+# tutorial and works well across Ampere / Ada Lovelace architectures.
+# Keeping a single value avoids a 3x config explosion with minimal
+# impact on search quality (GROUP_SIZE_M has the smallest perf effect
+# of all autotune knobs).
+_AUTOTUNE_GROUP_SIZE_M_CHOICES: tuple[int, ...] = (8,)
 
 
 # ---------------------------------------------------------------------------
@@ -421,7 +423,8 @@ class TritonKernelGenerator:
         """Remove configs that are obviously sub-optimal via cheap heuristics.
 
         Applied after SRAM pruning to keep the surviving config count
-        under ~100, limiting first-run Triton JIT compilation time.
+        manageable (target ~50-80), limiting first-run Triton JIT
+        compilation time which is critical on laptop GPUs.
 
         Rules:
         * 16 warps only make sense with large tiles (area >= 16384).
@@ -429,12 +432,21 @@ class TritonKernelGenerator:
         * BLOCK_K=128 with num_stages > 2 almost always exceeds SRAM
           for useful spatial tile sizes — any that survived SRAM pruning
           are likely tiny spatial tiles where BLOCK_K=128 is overkill.
+        * Asymmetric tiles (M/N ratio > 4x) rarely win for square-ish
+          matmuls and bloat the search space.
+        * num_stages=5 only helps with deep K-loops and large tiles.
+        * 4 warps with very large tiles underutilise the SM.
         """
         survivors: list[dict] = []
         for cfg in configs:
             tile_area = cfg["BLOCK_SIZE_M"] * cfg["BLOCK_SIZE_N"]
+            bm, bn = cfg["BLOCK_SIZE_M"], cfg["BLOCK_SIZE_N"]
+
             # 16 warps are wasted on small tiles.
             if cfg["num_warps"] == 16 and tile_area < 16384:
+                continue
+            # 4 warps underutilise large tiles.
+            if cfg["num_warps"] == 4 and tile_area > 16384:
                 continue
             # BLOCK_K=128 + deep pipelining is almost never SRAM-safe
             # for useful spatial tiles; skip to avoid compiling duds.
@@ -442,6 +454,15 @@ class TritonKernelGenerator:
                 continue
             # GROUP_SIZE_M=16 is excessive for tiny output tiles.
             if cfg["GROUP_SIZE_M"] == 16 and tile_area < 4096:
+                continue
+            # Highly asymmetric tiles (>4x ratio) are rarely optimal.
+            if bm > 4 * bn or bn > 4 * bm:
+                continue
+            # num_stages=5 only worthwhile for large tiles with
+            # moderate BLOCK_K (deep K-loop benefits from pipelining).
+            if cfg["num_stages"] == 5 and (
+                tile_area < 4096 or cfg["BLOCK_SIZE_K"] >= 128
+            ):
                 continue
             survivors.append(cfg)
         logger.debug(

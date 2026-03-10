@@ -344,6 +344,11 @@ class FuseMLFusionPass:
         ShapeProp) and delegates to
         :func:`~fuseml.passes.topology.is_compute_bound_gemm`.
 
+        Before calling the cost model, counts the number of downstream
+        absorbable ops (elementwise post-ops like gelu, add, relu) to
+        estimate the total HBM savings from fusion — each fused op
+        eliminates one M×N read+write round-trip.
+
         For ``aten.addmm(bias, input, weight)``:
         - ``input`` has shape (M, K)
         - ``weight`` has shape (K, N)
@@ -389,7 +394,23 @@ class FuseMLFusionPass:
         out_meta = node.meta.get("tensor_meta")
         dtype = out_meta.dtype if out_meta is not None and hasattr(out_meta, "dtype") else torch.float32
 
-        return is_compute_bound_gemm(M, N, K, dtype)
+        # Count downstream absorbable ops to estimate fusion savings.
+        # Each fused epilogue op eliminates one M×N HBM round-trip.
+        num_epilogue_ops = 0
+        current = node
+        while len(current.users) == 1:
+            successor = next(iter(current.users))
+            role = classify_node(successor)
+            if role in (NodeRole.ABSORBABLE, NodeRole.INPLACE):
+                num_epilogue_ops += 1
+                current = successor
+            elif role is NodeRole.REDUCTION:
+                num_epilogue_ops += 1
+                break
+            else:
+                break
+
+        return is_compute_bound_gemm(M, N, K, dtype, num_epilogue_ops)
 
     @staticmethod
     def _collect_external_inputs(

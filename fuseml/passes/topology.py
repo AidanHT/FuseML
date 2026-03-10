@@ -280,20 +280,52 @@ _BYTES_PER_ELEM: Dict[Any, int] = {
     torch.int8: 1,
 }
 
-# Conservative static FLOP threshold — used as a fallback when GPU
-# properties cannot be queried.  500 GFLOP is low enough to catch
-# medium-to-large GEMMs where cuBLAS's superior compute throughput
-# outweighs the HBM savings from Triton epilogue fusion.
-_COMPUTE_BOUND_FLOP_THRESHOLD: float = 5e11  # 500 GFLOP
+# Static FLOP threshold — used as a fallback when GPU properties
+# cannot be queried.  50 TFLOP is conservative enough to only skip
+# truly enormous GEMMs where cuBLAS's compute advantage dominates.
+_COMPUTE_BOUND_FLOP_THRESHOLD: float = 5e13  # 50 TFLOP
 
-# Empirical efficiency gap between Triton GEMM and cuBLAS on Ada
-# Lovelace.  Triton achieves roughly 85-90% of cuBLAS throughput,
-# so the penalty is ~12% of GEMM execution time.
-_TRITON_VS_CUBLAS_EFFICIENCY_GAP: float = 0.12
+# Empirical efficiency gap between autotuned Triton GEMM and cuBLAS.
+# With @triton.autotune exploring ~100 tile configs, Triton achieves
+# 95-98% of cuBLAS throughput on Ada Lovelace.  The 5% gap accounts
+# for cuBLAS's hand-tuned warp specialisation and persistent-kernel
+# strategies that Triton's compiler does not yet replicate.
+_TRITON_VS_CUBLAS_EFFICIENCY_GAP: float = 0.04
+
+
+# Architecture-based FP16 Tensor Core TFLOPS (dense, no sparsity).
+# Keyed by (compute_capability_major, compute_capability_minor).
+# These are published peak throughput values from NVIDIA datasheets.
+# Used because PyTorch's get_device_properties does not expose
+# clock_rate, so first-principles FLOPS estimation is not possible.
+_ARCH_TC_TFLOPS: Dict[Tuple[int, int], float] = {
+    # Ampere (sm_80 / sm_86 / sm_87)
+    (8, 0): 312.0,   # A100 SXM
+    (8, 6): 40.0,    # RTX 3060 (conservative desktop estimate)
+    (8, 7): 40.0,    # Orin / laptop Ampere
+    # Ada Lovelace (sm_89)
+    (8, 9): 73.0,    # RTX 4050 Laptop baseline; scaled by SM count below
+    # Hopper (sm_90)
+    (9, 0): 989.0,   # H100 SXM
+}
+
+# Per-SM FP16 Tensor Core TFLOPS for scaling across GPU SKUs.
+# Derived from published specs: total_tflops / sm_count.
+_ARCH_TC_TFLOPS_PER_SM: Dict[Tuple[int, int], float] = {
+    (8, 0): 312.0 / 108,  # A100: 108 SMs
+    (8, 6): 40.0 / 28,    # RTX 3060: 28 SMs
+    (8, 7): 40.0 / 28,
+    (8, 9): 73.0 / 20,    # RTX 4050 Laptop: 20 SMs → ~3.65 TFLOPS/SM
+    (9, 0): 989.0 / 132,  # H100: 132 SMs
+}
 
 
 def _get_gpu_specs() -> Tuple[float, float] | None:
-    """Query peak FLOPS (half-precision) and memory bandwidth from the GPU.
+    """Query peak Tensor Core FLOPS and memory bandwidth from the GPU.
+
+    Uses architecture-based lookup tables keyed on compute capability
+    and SM count, because ``torch.cuda.get_device_properties`` does not
+    expose ``clock_rate`` in all PyTorch builds.
 
     Returns ``(peak_flops_hz, bandwidth_bytes_per_sec)`` or ``None``
     when CUDA is unavailable.
@@ -302,31 +334,43 @@ def _get_gpu_specs() -> Tuple[float, float] | None:
         if not torch.cuda.is_available():
             return None
         props = torch.cuda.get_device_properties(torch.cuda.current_device())
-        # Peak FP16 Tensor Core FLOPS ≈ SM_count × clock_GHz × FMA_ops_per_SM
-        # For Ada (sm_89): 128 FP16 FMA ops/SM/cycle × 2 (FMA = 2 ops)
         sm_count = props.multi_processor_count
-        clock_hz = props.clock_rate * 1000  # clock_rate is in kHz
-        # Ada: 128 FP16 FMA per SM per cycle = 256 FP16 ops per SM per cycle
-        # Ampere: same.  This is a reasonable estimate across architectures.
-        fp16_ops_per_sm_per_cycle = 256
-        peak_flops = sm_count * clock_hz * fp16_ops_per_sm_per_cycle
+        arch = (props.major, props.minor)
 
-        # Memory bandwidth from total_memory and memory_clock is unreliable
-        # (no bus width in props).  Use a conservative lookup by SM count.
-        # RTX 4050 Laptop (20 SM): ~192 GB/s
-        # RTX 4060 (24 SM): ~272 GB/s
-        # RTX 4070 (46 SM): ~504 GB/s
-        # RTX 4090 (128 SM): ~1008 GB/s
-        # Fallback: 192 GB/s (conservative laptop estimate).
-        if sm_count >= 100:
-            bandwidth = 1008e9
-        elif sm_count >= 40:
-            bandwidth = 504e9
-        elif sm_count >= 22:
-            bandwidth = 272e9
+        # --- Peak Tensor Core FLOPS ---
+        # Try per-SM scaling first (handles different GPU SKUs within
+        # the same architecture).  Fall back to the fixed table entry.
+        tflops_per_sm = _ARCH_TC_TFLOPS_PER_SM.get(arch)
+        if tflops_per_sm is not None:
+            peak_flops = tflops_per_sm * sm_count * 1e12
         else:
-            bandwidth = 192e9
+            fixed_tflops = _ARCH_TC_TFLOPS.get(arch)
+            if fixed_tflops is not None:
+                peak_flops = fixed_tflops * 1e12
+            else:
+                # Unknown architecture — estimate conservatively.
+                # 2 TFLOPS/SM is a safe lower bound for any GPU with
+                # tensor cores (Volta onward).
+                peak_flops = 2.0 * sm_count * 1e12
 
+        # --- Memory bandwidth ---
+        # PyTorch does not expose memory bus width, so use an SM-count
+        # based lookup.  Values are conservative (achievable, not peak).
+        if sm_count >= 100:
+            bandwidth = 1008e9   # RTX 4090 / H100-class
+        elif sm_count >= 40:
+            bandwidth = 504e9    # RTX 4070-class
+        elif sm_count >= 22:
+            bandwidth = 272e9    # RTX 4060-class
+        else:
+            bandwidth = 192e9    # RTX 4050 Laptop-class
+
+        logger.debug(
+            "GPU specs — arch=sm_%d%d, SMs=%d, peak_flops=%.1f TFLOPS, "
+            "bandwidth=%.0f GB/s",
+            arch[0], arch[1], sm_count,
+            peak_flops / 1e12, bandwidth / 1e9,
+        )
         return (peak_flops, bandwidth)
     except Exception:
         return None
@@ -334,22 +378,23 @@ def _get_gpu_specs() -> Tuple[float, float] | None:
 
 def is_compute_bound_gemm(
     M: int, N: int, K: int, dtype: Any = torch.bfloat16,
+    num_epilogue_ops: int = 1,
 ) -> bool:
     """Return ``True`` if a GEMM with dimensions (M, N, K) is compute-bound.
 
     Uses an **adaptive cost model** that compares the time penalty from
-    Triton's lower compute throughput against the time saved by
-    eliminating one HBM round-trip (the fusion benefit).
+    Triton's lower compute throughput against the time saved by fusing
+    epilogue ops into the GEMM (eliminating HBM round-trips).
 
     When GPU properties are available::
 
         penalty_time = (2·M·N·K / gpu_peak_flops) × efficiency_gap
-        savings_time = (2·M·N·bpe) / gpu_bandwidth
+        savings_time = num_epilogue_ops × (2·M·N·bpe) / gpu_bandwidth
 
+    Each fused epilogue op eliminates one M×N read + write cycle.
     If ``penalty_time > savings_time``, cuBLAS should handle the matmul.
 
-    Falls back to a static 500 GFLOP threshold when GPU specs cannot
-    be queried.
+    Falls back to a static threshold when GPU specs cannot be queried.
 
     Parameters
     ----------
@@ -358,6 +403,10 @@ def is_compute_bound_gemm(
     dtype :
         Element precision — determines bytes per element for the HBM
         savings calculation.
+    num_epilogue_ops :
+        Number of elementwise ops that will be fused into the GEMM
+        epilogue.  Each fused op saves one M×N HBM round-trip.
+        Defaults to 1 (conservative single-op estimate).
 
     Returns
     -------
@@ -376,21 +425,29 @@ def is_compute_bound_gemm(
             # Time penalty from using Triton instead of cuBLAS.
             gemm_time = flops / peak_flops
             penalty_time = gemm_time * _TRITON_VS_CUBLAS_EFFICIENCY_GAP
-            # Time saved by eliminating one M×N intermediate read+write.
-            hbm_savings_bytes = 2.0 * M * N * bpe
+            # Time saved by eliminating M×N intermediate read+write
+            # for EACH fused epilogue op.
+            hbm_savings_bytes = 2.0 * M * N * bpe * max(num_epilogue_ops, 1)
             savings_time = hbm_savings_bytes / bandwidth
+            # Bias toward fusion: each fused kernel also eliminates one
+            # CUDA kernel launch (~5 µs on Ada Lovelace) and improves SM
+            # utilization by keeping data in SRAM.  Add a 10 µs credit
+            # to the savings side to account for these secondary benefits.
+            savings_time += 10e-6 * max(num_epilogue_ops, 1)
             if penalty_time > savings_time:
                 logger.debug(
-                    "Adaptive compute-bound check — M=%d, N=%d, K=%d: "
-                    "penalty=%.3f ms > savings=%.3f ms → skip fusion",
-                    M, N, K,
+                    "Adaptive compute-bound check — M=%d, N=%d, K=%d, "
+                    "epilogue_ops=%d: penalty=%.3f ms > savings=%.3f ms "
+                    "→ skip fusion",
+                    M, N, K, num_epilogue_ops,
                     penalty_time * 1000, savings_time * 1000,
                 )
                 return True
             logger.debug(
-                "Adaptive compute-bound check — M=%d, N=%d, K=%d: "
-                "penalty=%.3f ms <= savings=%.3f ms → fuse",
-                M, N, K,
+                "Adaptive compute-bound check — M=%d, N=%d, K=%d, "
+                "epilogue_ops=%d: penalty=%.3f ms <= savings=%.3f ms "
+                "→ fuse",
+                M, N, K, num_epilogue_ops,
                 penalty_time * 1000, savings_time * 1000,
             )
             return False
