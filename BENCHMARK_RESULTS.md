@@ -39,7 +39,13 @@ FuseML achieves up to **21% latency reduction** and **47% HBM traffic eliminatio
 
 ![HBM Traffic](docs/images/hbm_traffic.png)
 
-*FuseML reduces HBM traffic by 47-53% across all presets through kernel fusion, translating to lower memory bandwidth requirements and energy consumption.*
+*FuseML reduces absolute HBM traffic through kernel fusion, translating to lower memory bandwidth requirements and energy consumption.*
+
+### HBM Traffic Savings
+
+![HBM Saved Percentage](docs/images/hbm_saved_percentage.png)
+
+*FuseML reduces HBM traffic by 35-47% across memory-bound and compute-bound presets, with the largest savings on memory-bound workloads.*
 
 ### Kernel Count Reduction
 
