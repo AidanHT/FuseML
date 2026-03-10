@@ -588,9 +588,15 @@ class FuseMLFusionPass:
         """
         graph = self.graph_module.graph
 
+        # Build topo-index once before the surgery loop — avoids
+        # O(groups * nodes) repeated dict construction.
+        topo_index: Dict[torch.fx.Node, int] = {
+            n: i for i, n in enumerate(graph.nodes)
+        }
+
         for group in groups:
             # --- Phase 0: Validate insertion topology ---------------------
-            self._validate_insertion_topology(group)
+            self._validate_insertion_topology(group, topo_index)
 
             # --- Phase 1: Insert placeholder node after the output --------
             with graph.inserting_after(group.output_node):
@@ -661,35 +667,19 @@ class FuseMLFusionPass:
                         graph_node.args = new_args
                     break
 
-        # --- Cleanup: rigorous dead code elimination -----------------------
-        # Phase 1: Standard DCE removes nodes with zero users.
-        graph.eliminate_dead_code()
-
-        # Phase 2: Sweep orphaned get_attr nodes that may persist after
-        # standard DCE (e.g. a weight get_attr whose sole consumer was a
-        # now-dead transpose node).  Iterate in reverse topological order
-        # so that dependents are erased before their dependencies — this
-        # prevents erase_node from raising on nodes that still have users
-        # within the orphaned set.
+        # --- Cleanup: dead code elimination ----------------------------------
+        # Single reverse sweep removes orphaned get_attr and call_function
+        # nodes (e.g. weight get_attrs, aten.t transposes) that standard
+        # DCE may miss.  Reverse topological order ensures dependents are
+        # erased before their dependencies.
         for n in reversed(list(graph.nodes)):
-            if n.op == "get_attr" and len(n.users) == 0:
-                logger.debug("Removing orphaned get_attr node: %s", n.name)
+            if len(n.users) == 0 and n.op in ("get_attr", "call_function"):
+                if n.op == "call_function" and n.target is fuseml_fused_kernel_placeholder:
+                    continue  # keep newly inserted placeholders
+                logger.debug("Removing orphaned %s node: %s", n.op, n.name)
                 graph.erase_node(n)
 
-        # Phase 3: Sweep orphaned call_function intermediates (e.g. aten.t
-        # that only fed fused nodes).  Skip placeholder nodes — they are
-        # the newly inserted targets.  Reverse order for the same
-        # dependency-safety reason as Phase 2.
-        for n in reversed(list(graph.nodes)):
-            if (
-                n.op == "call_function"
-                and len(n.users) == 0
-                and n.target is not fuseml_fused_kernel_placeholder
-            ):
-                logger.debug("Removing orphaned call_function: %s", n.name)
-                graph.erase_node(n)
-
-        # Phase 4: Final DCE to catch cascading orphans from phases 2-3.
+        # Final DCE catches any cascading orphans from the sweep above.
         graph.eliminate_dead_code()
 
         # --- Post-surgery validation --------------------------------------
@@ -815,7 +805,10 @@ class FuseMLFusionPass:
     # Surgery helpers — topology validation
     # ------------------------------------------------------------------
     @staticmethod
-    def _validate_insertion_topology(group: FusionGroup) -> None:
+    def _validate_insertion_topology(
+        group: FusionGroup,
+        topo_index: Dict[torch.fx.Node, int] | None = None,
+    ) -> None:
         """Verify all group inputs precede the output_node topologically.
 
         The fused placeholder is inserted immediately after the group's
@@ -831,15 +824,22 @@ class FuseMLFusionPass:
         guard catches any graph corruption that would silently produce
         incorrect rewiring.
 
+        Parameters
+        ----------
+        group : FusionGroup
+            The fusion group to validate.
+        topo_index : dict or None
+            Pre-computed ``{node: position}`` mapping.  When ``None``,
+            built on the fly (backward-compatible but slower).
+
         Raises
         ------
         RuntimeError
             If an input appears after the insertion point.
         """
-        graph = group.base_node.graph
-        topo_index: Dict[torch.fx.Node, int] = {
-            n: i for i, n in enumerate(graph.nodes)
-        }
+        if topo_index is None:
+            graph = group.base_node.graph
+            topo_index = {n: i for i, n in enumerate(graph.nodes)}
 
         output_pos = topo_index.get(group.output_node)
         if output_pos is None:

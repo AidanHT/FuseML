@@ -211,7 +211,7 @@ class FuseMLCompiler:
 
         logger.info(
             "Captured FX graph with %d nodes — scanning for fusion candidates …",
-            len(list(gm.graph.nodes)),
+            sum(1 for _ in gm.graph.nodes),
         )
 
         # ── Step 0: validate for data-dependent control flow ──────────

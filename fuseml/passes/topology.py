@@ -320,6 +320,9 @@ _ARCH_TC_TFLOPS_PER_SM: Dict[Tuple[int, int], float] = {
 }
 
 
+_cached_gpu_specs: Tuple[float, float] | None | bool = False  # False = not yet queried
+
+
 def _get_gpu_specs() -> Tuple[float, float] | None:
     """Query peak Tensor Core FLOPS and memory bandwidth from the GPU.
 
@@ -329,7 +332,13 @@ def _get_gpu_specs() -> Tuple[float, float] | None:
 
     Returns ``(peak_flops_hz, bandwidth_bytes_per_sec)`` or ``None``
     when CUDA is unavailable.
+
+    The result is cached after the first call — GPU specs do not change
+    during a process lifetime.
     """
+    global _cached_gpu_specs
+    if _cached_gpu_specs is not False:
+        return _cached_gpu_specs  # type: ignore[return-value]
     try:
         if not torch.cuda.is_available():
             return None
@@ -371,8 +380,10 @@ def _get_gpu_specs() -> Tuple[float, float] | None:
             arch[0], arch[1], sm_count,
             peak_flops / 1e12, bandwidth / 1e9,
         )
-        return (peak_flops, bandwidth)
+        _cached_gpu_specs = (peak_flops, bandwidth)
+        return _cached_gpu_specs
     except Exception:
+        _cached_gpu_specs = None
         return None
 
 

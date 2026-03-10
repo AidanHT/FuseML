@@ -1056,10 +1056,10 @@ class TestStoreSection:
         code = gen._section_store(output_tensor)
         assert "mask=(offs_m[:, None] < M) & (offs_n[None, :] < N)" in code
 
-    def test_store_unconditional_cast_fp32(self, gen, output_tensor):
-        """fp32 output — unconditional cast to tl.float32 (identity, zero cost)."""
+    def test_store_skips_identity_cast_fp32(self, gen, output_tensor):
+        """fp32 output — identity cast is skipped (no redundant PTX instruction)."""
         code = gen._section_store(output_tensor)
-        assert "acc = acc.to(tl.float32)" in code
+        assert "acc = acc.to(tl.float32)" not in code
 
     def test_store_cast_fp16(self, gen):
         """fp32 accumulator → fp16 output requires explicit cast."""

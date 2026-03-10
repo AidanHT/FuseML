@@ -125,19 +125,19 @@ class TestAutotuneConstants:
         assert _AUTOTUNE_SRAM_BUDGET_BYTES == 100 * 1024
 
     def test_block_m_choices(self):
-        assert _AUTOTUNE_BLOCK_M_CHOICES == (64, 128, 256)
+        assert _AUTOTUNE_BLOCK_M_CHOICES == (32, 64, 128, 256)
 
     def test_block_n_choices(self):
-        assert _AUTOTUNE_BLOCK_N_CHOICES == (64, 128, 256)
+        assert _AUTOTUNE_BLOCK_N_CHOICES == (32, 64, 128, 256)
 
     def test_block_k_choices(self):
         assert _AUTOTUNE_BLOCK_K_CHOICES == (32, 64)
 
     def test_num_warps_choices(self):
-        assert _AUTOTUNE_NUM_WARPS_CHOICES == (4, 8, 16)
+        assert _AUTOTUNE_NUM_WARPS_CHOICES == (2, 4, 8, 16)
 
     def test_num_stages_choices(self):
-        assert _AUTOTUNE_NUM_STAGES_CHOICES == (2, 3, 4)
+        assert _AUTOTUNE_NUM_STAGES_CHOICES == (2, 3, 4, 5)
 
     def test_reduction_num_warps_includes_16(self):
         assert 16 in _AUTOTUNE_REDUCTION_NUM_WARPS_CHOICES
@@ -230,10 +230,10 @@ class TestBuildAutotuneConfigs:
         assert len(configs) == expected
 
     def test_reduction_config_count(self):
-        """Reduction configs use expanded warp choices → more configs."""
+        """Reduction configs use same or expanded warp choices."""
         standard = TritonKernelGenerator._build_autotune_configs(torch.float32, False)
         reduction = TritonKernelGenerator._build_autotune_configs(torch.float32, True)
-        assert len(reduction) > len(standard)
+        assert len(reduction) >= len(standard)
 
     def test_reduction_configs_include_16_warps(self):
         """At least one reduction config should have num_warps=16."""
@@ -489,9 +489,9 @@ class TestGenerateAutotuneConfigs:
         standard = gen.generate_autotune_configs(matmul_inputs_fp32, output_fp32, False)
         reduction = gen.generate_autotune_configs(matmul_inputs_fp32, output_fp32, True)
         assert "num_warps=16" in reduction
-        # Reduction includes num_warps=2 which standard does not.
+        # Both standard and reduction now include num_warps=2 for small tiles.
         assert "num_warps=2" in reduction
-        assert "num_warps=2" not in standard
+        assert "num_warps=2" in standard
 
     def test_fp16_generates_configs(self, gen, matmul_inputs_fp16, output_fp16):
         """FP16 inputs should generate valid autotune configs."""
@@ -589,13 +589,13 @@ class TestReductionSpecialisation:
         warp_counts = {c["num_warps"] for c in configs}
         assert 16 in warp_counts
 
-    def test_standard_configs_lack_2_warps(self):
-        """Standard (non-reduction) configs must NOT include num_warps=2."""
+    def test_standard_configs_include_2_warps(self):
+        """Standard (non-reduction) configs now include num_warps=2 for small tiles."""
         configs = TritonKernelGenerator._build_autotune_configs(
             torch.float32, has_reduction=False,
         )
         warp_counts = {c["num_warps"] for c in configs}
-        assert 2 not in warp_counts
+        assert 2 in warp_counts
 
     def test_reduction_still_includes_lower_warps(self):
         """Reduction configs should still include 4 and 8 warps."""

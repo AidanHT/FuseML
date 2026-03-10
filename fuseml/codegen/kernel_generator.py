@@ -76,24 +76,37 @@ _DTYPE_BYTES: dict[torch.dtype, int] = {
 _DEFAULT_SRAM_BUDGET_BYTES: int = 100 * 1024
 
 
+_cached_sram_budget: int | None = None
+
+
 def _get_sram_budget() -> int:
     """Query the GPU's actual shared memory capacity, with a static fallback.
 
     Uses ``torch.cuda.get_device_properties`` to read the hardware's
     maximum configurable shared memory per block (``max_shared_memory_per_block``).
     Falls back to 100 KB when no CUDA device is available.
+
+    The result is cached after the first successful query — GPU SRAM
+    capacity does not change during a process lifetime.
     """
+    global _cached_sram_budget
+    if _cached_sram_budget is not None:
+        return _cached_sram_budget
     try:
         if torch.cuda.is_available():
             props = torch.cuda.get_device_properties(torch.cuda.current_device())
             budget = getattr(props, "max_shared_memory_per_block", 0)
             if budget > 0:
+                _cached_sram_budget = budget
                 return budget
     except Exception:
         pass
+    _cached_sram_budget = _DEFAULT_SRAM_BUDGET_BYTES
     return _DEFAULT_SRAM_BUDGET_BYTES
 
 
+# Backward-compatible alias — used as default parameter in _prune_configs_by_sram.
+# Prefer _get_sram_budget() for runtime queries (returns actual GPU capacity).
 _AUTOTUNE_SRAM_BUDGET_BYTES: int = _DEFAULT_SRAM_BUDGET_BYTES
 
 # Candidate tile dimensions for autotune config generation.
@@ -101,8 +114,8 @@ _AUTOTUNE_SRAM_BUDGET_BYTES: int = _DEFAULT_SRAM_BUDGET_BYTES
 # through large tiles (256) for data reuse on high-end desktop GPUs.
 # SRAM pruning + heuristic filtering keeps the effective config count
 # manageable (target < 100 surviving configs).
-_AUTOTUNE_BLOCK_M_CHOICES: tuple[int, ...] = (64, 128, 256)
-_AUTOTUNE_BLOCK_N_CHOICES: tuple[int, ...] = (64, 128, 256)
+_AUTOTUNE_BLOCK_M_CHOICES: tuple[int, ...] = (32, 64, 128, 256)
+_AUTOTUNE_BLOCK_N_CHOICES: tuple[int, ...] = (32, 64, 128, 256)
 _AUTOTUNE_BLOCK_K_CHOICES: tuple[int, ...] = (32, 64)
 
 # Standard warp counts and software-pipelining depths.
@@ -110,8 +123,8 @@ _AUTOTUNE_BLOCK_K_CHOICES: tuple[int, ...] = (32, 64)
 # stage counts (up to 5) improve latency hiding by overlapping more
 # cp.async copies with Tensor Core compute, but increase register
 # pressure.  The autotuner selects the optimal balance at runtime.
-_AUTOTUNE_NUM_WARPS_CHOICES: tuple[int, ...] = (4, 8, 16)
-_AUTOTUNE_NUM_STAGES_CHOICES: tuple[int, ...] = (2, 3, 4)
+_AUTOTUNE_NUM_WARPS_CHOICES: tuple[int, ...] = (2, 4, 8, 16)
+_AUTOTUNE_NUM_STAGES_CHOICES: tuple[int, ...] = (2, 3, 4, 5)
 
 # Reduction-specialised warp counts — higher counts saturate the SMs
 # during tl.atomic_add / tl.atomic_max cross-thread synchronisation.
@@ -321,6 +334,14 @@ class TritonKernelGenerator:
     skip ``exec()`` entirely and return the previously compiled callable.
     """
 
+    # Epilogue dispatch table — maps ATen targets to (tag, method, ...).
+    # "simple" emitters take (self,) only.
+    # "binary" emitters take (self, node, node_ids, saved_args).
+    # "reduction" emitters take (self, axis, out_name, triton_dtype) + op name.
+    # Built as a class attribute using lambdas that defer method resolution
+    # to avoid forward-reference issues.
+    _EPILOGUE_DISPATCH: dict = {}  # populated after class body
+
     def __init__(self) -> None:
         self._kernel_cache: dict[str, object] = {}
         self._last_reduction: ReductionInfo | None = None
@@ -355,11 +376,19 @@ class TritonKernelGenerator:
     def _build_autotune_configs(
         dtype: torch.dtype,
         has_reduction: bool = False,
+        M: int | None = None,
+        N: int | None = None,
+        K: int | None = None,
     ) -> list[dict]:
-        """Generate the full Cartesian product of candidate autotune configs.
+        """Generate a problem-aware Cartesian product of candidate autotune configs.
 
         Each config is a dict with keys ``BLOCK_SIZE_M``, ``BLOCK_SIZE_N``,
         ``BLOCK_SIZE_K``, ``GROUP_SIZE_M``, ``num_warps``, ``num_stages``.
+
+        When *M*, *N*, *K* are provided, the block-size choices are narrowed
+        to avoid generating configs that are obviously too large or too small
+        for the actual problem dimensions, reducing first-run Triton JIT
+        compilation time.
 
         When *has_reduction* is ``True``, the warp-count candidates are
         expanded to include higher values (up to 16) that better saturate
@@ -370,10 +399,29 @@ class TritonKernelGenerator:
             if has_reduction
             else _AUTOTUNE_NUM_WARPS_CHOICES
         )
+
+        # Narrow block-size choices based on actual problem dimensions.
+        # For small dimensions, skip tiles larger than 2x the dimension
+        # (massive padding waste).  For large dimensions, skip tiny tiles
+        # (launch overhead dominates).
+        def _filter_block_choices(
+            choices: tuple[int, ...], dim: int | None,
+        ) -> tuple[int, ...]:
+            if dim is None:
+                return choices
+            # Keep tiles up to 2x the dimension (some padding is acceptable
+            # for alignment but 4x+ is pure waste).
+            filtered = tuple(c for c in choices if c <= max(dim * 2, 64))
+            return filtered if filtered else (min(choices),)
+
+        bm_choices = _filter_block_choices(_AUTOTUNE_BLOCK_M_CHOICES, M)
+        bn_choices = _filter_block_choices(_AUTOTUNE_BLOCK_N_CHOICES, N)
+        bk_choices = _filter_block_choices(_AUTOTUNE_BLOCK_K_CHOICES, K)
+
         configs: list[dict] = []
-        for bm in _AUTOTUNE_BLOCK_M_CHOICES:
-            for bn in _AUTOTUNE_BLOCK_N_CHOICES:
-                for bk in _AUTOTUNE_BLOCK_K_CHOICES:
+        for bm in bm_choices:
+            for bn in bn_choices:
+                for bk in bk_choices:
                     for gsm in _AUTOTUNE_GROUP_SIZE_M_CHOICES:
                         for nw in warp_choices:
                             for ns in _AUTOTUNE_NUM_STAGES_CHOICES:
@@ -423,27 +471,34 @@ class TritonKernelGenerator:
         """Remove configs that are obviously sub-optimal via cheap heuristics.
 
         Applied after SRAM pruning to keep the surviving config count
-        manageable (target ~50-80), limiting first-run Triton JIT
+        manageable (target ~30-60), limiting first-run Triton JIT
         compilation time which is critical on laptop GPUs.
 
         Rules:
+        * 2 warps only make sense with tiny tiles (area < 4096).
         * 16 warps only make sense with large tiles (area >= 16384).
+        * 4 warps underutilise very large tiles.
+        * 8 warps are excessive for tiny tiles.
         * GROUP_SIZE_M=16 is wasteful with very small spatial tiles.
-        * BLOCK_K=128 with num_stages > 2 almost always exceeds SRAM
-          for useful spatial tile sizes — any that survived SRAM pruning
-          are likely tiny spatial tiles where BLOCK_K=128 is overkill.
+        * BLOCK_K=128 + deep pipelining is almost never SRAM-safe
+          for useful spatial tile sizes.
         * Asymmetric tiles (M/N ratio > 4x) rarely win for square-ish
           matmuls and bloat the search space.
         * num_stages=5 only helps with deep K-loops and large tiles.
-        * 4 warps with very large tiles underutilise the SM.
         """
         survivors: list[dict] = []
         for cfg in configs:
             tile_area = cfg["BLOCK_SIZE_M"] * cfg["BLOCK_SIZE_N"]
             bm, bn = cfg["BLOCK_SIZE_M"], cfg["BLOCK_SIZE_N"]
 
+            # 2 warps are only useful for tiny tiles.
+            if cfg["num_warps"] == 2 and tile_area >= 4096:
+                continue
             # 16 warps are wasted on small tiles.
             if cfg["num_warps"] == 16 and tile_area < 16384:
+                continue
+            # 8 warps are excessive for tiny tiles.
+            if cfg["num_warps"] == 8 and tile_area < 2048:
                 continue
             # 4 warps underutilise large tiles.
             if cfg["num_warps"] == 4 and tile_area > 16384:
@@ -549,13 +604,22 @@ class TritonKernelGenerator:
 
         # Use the left operand's dtype for SRAM estimation — the K-loop
         # loads A and B tiles into shared memory at their native precision.
+        # Also extract M, N, K for problem-aware config narrowing.
+        M_dim: int | None = None
+        N_dim: int | None = None
+        K_dim: int | None = None
         if len(matrices) >= 2:
-            left, _ = _identify_matmul_operands(matrices)
+            left, right = _identify_matmul_operands(matrices)
             operand_dtype = left.dtype
+            M_dim = left.shape[0]
+            K_dim = left.shape[1]
+            N_dim = right.shape[1]
         else:
             operand_dtype = output_tensor.dtype
 
-        all_configs = self._build_autotune_configs(operand_dtype, has_reduction)
+        all_configs = self._build_autotune_configs(
+            operand_dtype, has_reduction, M=M_dim, N=N_dim, K=K_dim,
+        )
         pruned = self._prune_configs_by_sram(
             all_configs, operand_dtype, sram_budget=_get_sram_budget(),
         )
@@ -908,46 +972,21 @@ class TritonKernelGenerator:
                     "    # no temporary SRAM buffer allocated (zero extra memory traffic)"
                 )
 
-            if node.target in (
-                torch.ops.aten.relu.default,
-                torch.ops.aten.relu_.default,
-            ):
-                lines.append(self._emit_relu())
-            elif node.target == torch.ops.aten.gelu.default:
-                lines.append(self._emit_gelu())
-            elif node.target in (
-                torch.ops.aten.sigmoid.default,
-                torch.ops.aten.sigmoid_.default,
-            ):
-                lines.append(self._emit_sigmoid())
-            elif node.target in (
-                torch.ops.aten.add.Tensor,
-                torch.ops.aten.add_.Tensor,
-            ):
-                lines.append(self._emit_add(node, node_ids, saved_args))
-            elif node.target in (
-                torch.ops.aten.mul.Tensor,
-                torch.ops.aten.mul_.Tensor,
-            ):
-                lines.append(self._emit_mul(node, node_ids, saved_args))
-            # ----- Reduction operators — cross-thread synchronization -----
-            elif node.target == torch.ops.aten.sum.dim_IntList:
-                axis, keepdim = self._determine_reduction_axis(node)
-                self._last_reduction = ReductionInfo(axis=axis, op="sum", keepdim=keepdim)
-                lines.append(self._emit_sum(axis, out_name, triton_dtype))
-            elif node.target == torch.ops.aten.amax.default:
-                axis, keepdim = self._determine_reduction_axis(node)
-                self._last_reduction = ReductionInfo(axis=axis, op="max", keepdim=keepdim)
-                lines.append(self._emit_max(axis, out_name, triton_dtype))
-            elif node.target == torch.ops.aten.mean.dim:
-                axis, keepdim = self._determine_reduction_axis(node)
-                self._last_reduction = ReductionInfo(axis=axis, op="mean", keepdim=keepdim)
-                lines.append(self._emit_mean(axis, out_name, triton_dtype))
-            # ----- Transparent view/metadata ops (no Triton code needed) --
-            # Shape-preserving view/reshape/unsqueeze ops absorbed during
-            # pattern matching.  acc remains in SRAM registers unchanged;
-            # stride transformation is handled at the store boundary via
-            # runtime stride parameters passed to tl.store.
+            # Dispatch via dict lookup — O(1) instead of sequential if/elif.
+            # All emitters are @staticmethod — no self parameter needed.
+            emitter = self._EPILOGUE_DISPATCH.get(node.target)
+            if emitter is not None:
+                tag = emitter[0]
+                if tag == "simple":
+                    lines.append(emitter[1]())
+                elif tag == "binary":
+                    lines.append(emitter[1](node, node_ids, saved_args))
+                elif tag == "reduction":
+                    axis, keepdim = self._determine_reduction_axis(node)
+                    self._last_reduction = ReductionInfo(
+                        axis=axis, op=emitter[2], keepdim=keepdim,
+                    )
+                    lines.append(emitter[1](axis, out_name, triton_dtype))
             elif node.target in TRANSPARENT_OPS:
                 lines.append(
                     f"    # (no-op) Transparent view/metadata: "
@@ -1483,12 +1522,11 @@ class TritonKernelGenerator:
                 f"    acc = tl.where(acc < -{_FP16_MAX}, -{_FP16_MAX}, acc)",
             ])
 
-        # Unconditional cast: the accumulator is always tl.float32.
-        # For fp32 outputs this is an identity cast (zero runtime cost);
-        # for fp16/bf16 outputs it narrows the result to the target dtype.
-        # Keeping the cast unconditional makes the dtype contract explicit
-        # and ensures correctness survives future dtype changes.
-        lines.append(f"    acc = acc.to({triton_dtype})")
+        # Cast accumulator (always tl.float32) to the output dtype.
+        # Skip the no-op identity cast for FP32 outputs to avoid emitting
+        # a redundant PTX instruction.
+        if output.dtype != torch.float32:
+            lines.append(f"    acc = acc.to({triton_dtype})")
 
         lines.append(
             f"    tl.store({n}_ptrs, acc, "
@@ -1930,3 +1968,21 @@ class TritonKernelGenerator:
     @staticmethod
     def _section_footer() -> str:
         return "\n    # --- Compute loop and store logic to be generated separately ---"
+
+
+# Populate the epilogue dispatch table after the class body so that
+# method references are available.  Format: target -> (tag, method, ...).
+TritonKernelGenerator._EPILOGUE_DISPATCH = {
+    torch.ops.aten.relu.default:        ("simple", TritonKernelGenerator._emit_relu),
+    torch.ops.aten.relu_.default:       ("simple", TritonKernelGenerator._emit_relu),
+    torch.ops.aten.gelu.default:        ("simple", TritonKernelGenerator._emit_gelu),
+    torch.ops.aten.sigmoid.default:     ("simple", TritonKernelGenerator._emit_sigmoid),
+    torch.ops.aten.sigmoid_.default:    ("simple", TritonKernelGenerator._emit_sigmoid),
+    torch.ops.aten.add.Tensor:          ("binary", TritonKernelGenerator._emit_add),
+    torch.ops.aten.add_.Tensor:         ("binary", TritonKernelGenerator._emit_add),
+    torch.ops.aten.mul.Tensor:          ("binary", TritonKernelGenerator._emit_mul),
+    torch.ops.aten.mul_.Tensor:         ("binary", TritonKernelGenerator._emit_mul),
+    torch.ops.aten.sum.dim_IntList:     ("reduction", TritonKernelGenerator._emit_sum, "sum"),
+    torch.ops.aten.amax.default:        ("reduction", TritonKernelGenerator._emit_max, "max"),
+    torch.ops.aten.mean.dim:            ("reduction", TritonKernelGenerator._emit_mean, "mean"),
+}

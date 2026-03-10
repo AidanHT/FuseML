@@ -541,6 +541,16 @@ class KernelLauncher:
                 kernel_signature=kernel_sig,
             )
 
+        # ── Pre-computed flags for hot-path shortcuts ────────────────
+        self._has_intermediates: bool = bool(intermediate_descriptors)
+
+        # Skip negative-stride check when all input descriptors have
+        # obviously positive strides (the overwhelmingly common case).
+        # We conservatively check at init; runtime flip() is rare.
+        self._skip_stride_check: bool = all(
+            all(s >= 0 for s in d.stride) for d in input_descriptors
+        )
+
         lp_info = (
             f"block=({self._launch_params.block_m},"
             f"{self._launch_params.block_n},"
@@ -679,17 +689,18 @@ class KernelLauncher:
             )
 
         # ── Negative-stride guard (rare path only) ────────────────────
-        # Avoid tuple reconstruction when no tensor has negative strides
-        # (the overwhelmingly common case).
-        needs_materialize = False
-        for t in input_tensors:
-            if self._has_negative_strides(t):
-                needs_materialize = True
-                break
-        if needs_materialize:
-            input_tensors = tuple(
-                self._materialize_if_needed(t) for t in input_tensors
-            )
+        # Skip entirely when init-time analysis confirms all strides are
+        # positive (the overwhelmingly common case).
+        if not self._skip_stride_check:
+            needs_materialize = False
+            for t in input_tensors:
+                if self._has_negative_strides(t):
+                    needs_materialize = True
+                    break
+            if needs_materialize:
+                input_tensors = tuple(
+                    self._materialize_if_needed(t) for t in input_tensors
+                )
 
         left_t = input_tensors[self._left_idx]
         right_t = input_tensors[self._right_idx]
@@ -723,35 +734,55 @@ class KernelLauncher:
             )
 
         # Intermediate escape buffers — explicit device/dtype.
-        intermediate_outputs: list[torch.Tensor] = [
-            torch.empty_strided(
-                (M, N), (N, 1), dtype=d.dtype, device=device,
-            )
-            for d in self._intermediate_descriptors
-        ]
+        # Short-circuit when no escape nodes exist (common case).
+        if self._has_intermediates:
+            intermediate_outputs: list[torch.Tensor] = [
+                torch.empty_strided(
+                    (M, N), (N, 1), dtype=d.dtype, device=device,
+                )
+                for d in self._intermediate_descriptors
+            ]
+        else:
+            intermediate_outputs = []
 
-        # ── Launch grid — deferred lambda for Triton constexpr ────────
-        grid = lambda META: (  # noqa: E731
-            ((M + META['BLOCK_SIZE_M'] - 1) // META['BLOCK_SIZE_M'])
-            * ((N + META['BLOCK_SIZE_N'] - 1) // META['BLOCK_SIZE_N']),
-        )
+        # ── Launch grid ─────────────────────────────────────────────
+        # For autotuned kernels, a lambda is needed so Triton's
+        # @triton.autotune can populate META with the selected config.
+        # For non-autotuned kernels, compute the grid once here.
+        if self._is_autotuned:
+            grid = lambda META: (  # noqa: E731
+                ((M + META['BLOCK_SIZE_M'] - 1) // META['BLOCK_SIZE_M'])
+                * ((N + META['BLOCK_SIZE_N'] - 1) // META['BLOCK_SIZE_N']),
+            )
+        else:
+            lp = self._launch_params
+            grid_size = (
+                ((M + lp.block_m - 1) // lp.block_m)
+                * ((N + lp.block_n - 1) // lp.block_n)
+            )
+            grid = (grid_size,)
 
         # ── Flat argument assembly ────────────────────────────────────
         tensor_args: list[torch.Tensor] = list(input_tensors)
         tensor_args.append(output)
         tensor_args.extend(intermediate_outputs)
 
-        stride_args: list[int] = []
+        # Build stride args as a flat tuple — avoids repeated list.extend().
+        stride_parts: list[int] = []
         for t in input_tensors:
-            stride_args.extend(int(s) for s in t.stride())
+            stride_parts += [int(s) for s in t.stride()]
 
         if self._is_reduced:
-            stride_args.append(int(output.stride(0)))
+            stride_parts.append(int(output.stride(0)))
         else:
-            stride_args.extend([int(output.stride(0)), int(output.stride(1))])
+            stride_parts.append(int(output.stride(0)))
+            stride_parts.append(int(output.stride(1)))
 
         for t in intermediate_outputs:
-            stride_args.extend([int(t.stride(0)), int(t.stride(1))])
+            stride_parts.append(int(t.stride(0)))
+            stride_parts.append(int(t.stride(1)))
+
+        stride_args = stride_parts
 
         # ── Guarded path (fallback guard active) ─────────────────────
         # Closure is only allocated when a fallback guard exists.

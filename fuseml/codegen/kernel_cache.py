@@ -29,7 +29,7 @@ miscalculations when tensors are views, slices, or non-contiguously strided.
 
 from __future__ import annotations
 
-import hashlib
+
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -280,29 +280,21 @@ class KernelCacheKey:
     device_capability: Tuple[int, int]
 
     def __hash__(self) -> int:
-        """SHA-256 based deterministic hash over all fields.
+        """Fast hash using Python's built-in hash over all fields.
 
-        Constructs a canonical byte representation from:
-
-        1. The canonicalized ``op_chain`` tuple.
-        2. A sorted tuple of :class:`TensorFingerprint` dataclasses
-           (order-invariant against graph node renamings).
-        3. Output shapes and dtypes.
-        4. GPU device capability.
-
-        Returns a 64-bit signed integer derived from the first 8 bytes of
-        the SHA-256 digest.  Deterministic across Python sessions.
+        Input fingerprints are sorted for order-invariance against graph
+        node renamings.  Python's 64-bit hash is sufficient for in-memory
+        caches with at most ~100 entries (birthday collision probability
+        is negligible).
         """
         sorted_fps = tuple(sorted(self.input_fingerprints))
-        canonical = repr((
+        return hash((
             self.op_chain,
             sorted_fps,
             self.output_shapes,
             self.output_dtypes,
             self.device_capability,
         ))
-        digest = hashlib.sha256(canonical.encode("utf-8")).digest()
-        return int.from_bytes(digest[:8], byteorder="little", signed=True)
 
     def __eq__(self, other: object) -> bool:
         """Field-by-field equality with sorted input fingerprints — ensures
@@ -393,6 +385,9 @@ class KernelCache:
 # Device capability helper
 # ---------------------------------------------------------------------------
 
+_cached_device_capability: Tuple[int, int] | None = None
+
+
 def _get_device_capability(
     tensor_map: Dict[str, torch.Tensor],
 ) -> Tuple[int, int]:
@@ -400,10 +395,17 @@ def _get_device_capability(
 
     Returns ``(0, 0)`` for CPU-only configurations where no CUDA tensor
     is available.
+
+    The result is cached after the first successful CUDA query — device
+    capability does not change during a process lifetime.
     """
+    global _cached_device_capability
+    if _cached_device_capability is not None:
+        return _cached_device_capability
     for t in tensor_map.values():
         if isinstance(t, torch.Tensor) and t.is_cuda:
-            return torch.cuda.get_device_capability(t.device)
+            _cached_device_capability = torch.cuda.get_device_capability(t.device)
+            return _cached_device_capability
     return (0, 0)
 
 

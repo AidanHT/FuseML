@@ -431,12 +431,12 @@ class TestSafeDowncasting:
         assert "tl.where" not in code
         assert "acc = acc.to(tl.bfloat16)" in code
 
-    def test_fp32_no_saturation(self, gen, output_fp32):
-        """FP32→FP32 is identity — no saturation needed."""
+    def test_fp32_no_saturation_no_cast(self, gen, output_fp32):
+        """FP32→FP32 is identity — no saturation or cast needed."""
         code = gen._section_store(output_fp32)
         assert "65504" not in code
         assert "tl.where" not in code
-        assert "acc = acc.to(tl.float32)" in code
+        assert "acc = acc.to(tl.float32)" not in code
 
     def test_store_mask_still_present(self, gen, output_fp16):
         """2-D boundary mask must still guard the tl.store after saturation."""
