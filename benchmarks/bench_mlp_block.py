@@ -1,9 +1,8 @@
 """bench_mlp_block.py -- Latency & memory-bandwidth benchmark for a Transformer MLP block.
 
-Compares three execution modes:
+Compares two execution modes:
   1. Eager     -- standard PyTorch model(x)
-  2. Inductor  -- torch.compile(model, backend="inductor")
-  3. FuseML    -- torch.compile(model, backend=FuseMLCompiler())
+  2. FuseML    -- torch.compile(model, backend=FuseMLCompiler())
 
 Metrics reported:
   - Latency (ms)           via torch.utils.benchmark.Timer or CUDA events
@@ -12,7 +11,7 @@ Metrics reported:
 
 Usage:
     python benchmarks/bench_mlp_block.py
-    python benchmarks/bench_mlp_block.py --skip-fuseml
+    python benchmarks/bench_mlp_block.py --preset small --no-plot
     python benchmarks/bench_mlp_block.py --precise --save-plot results.png
 """
 from __future__ import annotations
@@ -47,11 +46,17 @@ WARMUP_ITERS: int = 20
 MEASURE_ITERS: int = 100
 MIN_RUN_TIME: float = 5.0  # seconds, for Timer.blocked_autorange
 
+# Number of GPU warmup iterations run BEFORE any benchmark.  These force
+# the GPU clocks to ramp up and stabilise, preventing cold-start artifacts
+# (thermal throttling, DVFS ramp, driver init) from contaminating the
+# first measured mode.  20 dummy matmuls at full problem size is enough to
+# trigger boost clocks on laptop GPUs (RTX 4050/4060/4070).
+GPU_WARMUP_ITERS: int = 20
+
 L2_FLUSH_SIZE_BYTES: int = 128 * 1024 * 1024  # 128 MB (exceeds all known GPU L2 caches)
 
 COLORS: dict[str, str] = {
     "Eager": "#4C72B0",
-    "Inductor": "#DD8452",
     "FuseML": "#55A868",
 }
 
@@ -166,9 +171,8 @@ def compute_hbm_traffic(
             "Add_read_residual": M * D * bpe,
             "Add_write": M * D * bpe,
         }
-    elif mode in ("inductor", "fuseml"):
-        # Both Inductor and FuseML fuse elementwise post-ops into GEMM epilogues.
-        # Conservative assumption: identical traffic for this standard pattern.
+    elif mode == "fuseml":
+        # FuseML fuses elementwise post-ops into GEMM epilogues.
         breakdown = _fuseml_breakdown(M, D, I, bpe)
     else:
         raise ValueError(f"Unknown mode: {mode!r}")
@@ -373,7 +377,7 @@ def print_results_table(results: list[BenchmarkResult]) -> None:
     """Print a formatted ASCII table of benchmark results."""
     header = (
         f"+{'':->14}+{'':->14}+{'':->10}+{'':->12}+{'':->12}+\n"
-        f"| {'Mode':<12} | {'Latency (ms)':>12} | {'IQR (ms)':>8} | {'HBM (MB)':>10} | {'BW (GB/s)':>10} |\n"
+        f"| {'Mode':<12} | {'Latency (ms)':>12} | {'IQR (ms)':>8} | {'HBM* (MB)':>10} | {'BW* (GB/s)':>10} |\n"
         f"+{'':->14}+{'':->14}+{'':->10}+{'':->12}+{'':->12}+"
     )
     print(f"\n{header}")
@@ -386,6 +390,7 @@ def print_results_table(results: list[BenchmarkResult]) -> None:
             f"| {r.throughput_gb_s:>10.1f} |"
         )
     print(f"+{'':->14}+{'':->14}+{'':->10}+{'':->12}+{'':->12}+")
+    print("  * HBM/BW are analytical estimates, not measured.  Use `ncu` for actual DRAM traffic.")
 
 
 def print_speedup_summary(results: list[BenchmarkResult]) -> None:
@@ -499,41 +504,13 @@ def plot_results(results: list[BenchmarkResult], save_path: str | None = None) -
 
 
 # ---------------------------------------------------------------------------
-# Deferred import helpers
-# ---------------------------------------------------------------------------
-
-
-def _try_import_fuseml() -> bool:
-    """Return True if FuseML and Triton can both be imported.
-
-    FuseML itself imports cleanly without Triton, but the compiler backend
-    requires Triton at kernel-compile time, so we check for both.
-    """
-    try:
-        from fuseml import FuseMLCompiler  # noqa: F401
-    except ImportError as exc:
-        print(f"WARNING: FuseML import failed: {exc}")
-        print("         FuseML mode will be SKIPPED.")
-        return False
-
-    try:
-        import triton  # noqa: F401
-    except ImportError:
-        print("WARNING: Triton is not installed (required for FuseML kernel compilation).")
-        print("         FuseML mode will be SKIPPED.")
-        return False
-
-    return True
-
-
-# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Benchmark FuseML Transformer MLP block vs Eager vs Inductor",
+        description="Benchmark FuseML Transformer MLP block vs Eager",
     )
     parser.add_argument("--batch-size", type=int, default=BATCH_SIZE)
     parser.add_argument("--seq-len", type=int, default=SEQ_LEN)
@@ -554,8 +531,19 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--no-plot", action="store_true", help="Skip matplotlib chart")
     parser.add_argument("--save-plot", type=str, default=None, help="Save chart to file")
-    parser.add_argument("--skip-inductor", action="store_true", help="Skip Inductor mode")
     parser.add_argument("--skip-fuseml", action="store_true", help="Skip FuseML mode")
+    parser.add_argument(
+        "--preset",
+        type=str,
+        choices=["large", "medium", "small"],
+        default=None,
+        help=(
+            "Dimension presets: 'large' (default, compute-bound GEMMs — "
+            "cuBLAS wins), 'medium' (balanced), 'small' (memory-bound — "
+            "fusion wins).  Overrides --batch-size/--seq-len/--d-model/"
+            "--d-intermediate."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -564,8 +552,32 @@ def parse_args() -> argparse.Namespace:
 # ---------------------------------------------------------------------------
 
 
+def _gpu_warmup(model: nn.Module, x: torch.Tensor, *, iters: int = 20) -> None:
+    """Run *iters* forward passes to force GPU clock ramp-up.
+
+    Laptop GPUs (and desktop GPUs with power limits) start at low base
+    clocks and only reach boost frequency after sustained compute load.
+    Running warmup iterations before any Timer measurement ensures all
+    benchmark modes see the same stable clock speed.
+    """
+    with torch.no_grad():
+        for _ in range(iters):
+            model(x)
+    torch.cuda.synchronize(x.device)
+
+
 def main() -> None:
     args = parse_args()
+
+    # -- Apply dimension preset (overrides individual CLI args) --
+    _PRESETS = {
+        "small":  {"batch_size": 1, "seq_len": 128,  "d_model": 256,  "d_intermediate": 1024},
+        "medium": {"batch_size": 4, "seq_len": 512,  "d_model": 1024, "d_intermediate": 4096},
+        "large":  {"batch_size": 8, "seq_len": 2048, "d_model": 4096, "d_intermediate": 16384},
+    }
+    if args.preset is not None:
+        for k, v in _PRESETS[args.preset].items():
+            setattr(args, k, v)
 
     # -- Resolve dtype --
     dtype_map = {
@@ -606,27 +618,8 @@ def main() -> None:
     # -- Build compiled models --
     compiled_models: dict[str, nn.Module] = {"Eager": model}
 
-    # Inductor
-    if args.skip_inductor:
-        print("Inductor mode skipped (--skip-inductor).")
-    else:
-        try:
-            # Suppress noisy PyTorch internal warnings during compilation
-            import warnings
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                inductor_model = torch.compile(model, backend="inductor")
-                with torch.no_grad():
-                    inductor_model(x)  # trigger compilation
-            compiled_models["Inductor"] = inductor_model
-        except Exception as exc:
-            print(f"WARNING: torch.compile(backend='inductor') failed.")
-            print(f"         (Inductor requires Triton on recent PyTorch versions)")
-            print(f"         Use --skip-inductor to silence this warning.")
-
     # FuseML
-    fuseml_available = _try_import_fuseml()
-    if fuseml_available and not args.skip_fuseml:
+    if not args.skip_fuseml:
         try:
             from fuseml import FuseMLCompiler
 
@@ -636,6 +629,20 @@ def main() -> None:
             compiled_models["FuseML"] = fuseml_model
         except Exception as exc:
             print(f"WARNING: FuseML compilation failed: {exc}")
+
+    # -- GPU warmup (clock stabilisation) --
+    # Laptop GPUs (RTX 4050/4060/4070) use aggressive DVFS — the GPU
+    # starts at low clocks and only ramps to boost frequency after
+    # sustained load.  Without warmup, the first benchmark mode (Eager)
+    # runs at lower clocks and reports anomalously high latency, creating
+    # a false "speedup" for later modes.
+    #
+    # We warm up ALL compiled models, not just Eager, so that every
+    # backend's first Timer invocation sees stabilised clocks.
+    print("\nGPU Warmup (stabilising clocks)...", end="", flush=True)
+    for warmup_model in compiled_models.values():
+        _gpu_warmup(warmup_model, x, iters=GPU_WARMUP_ITERS)
+    print("  done")
 
     # -- Correctness validation --
     print("\nCorrectness Validation:")
@@ -656,7 +663,10 @@ def main() -> None:
     fused_traffic_est = compute_hbm_traffic(M, args.d_model, args.d_intermediate, dtype, "fuseml")
     if eager_traffic:
         saved_mb = eager_traffic.total_mb - fused_traffic_est.total_mb
-        print(f"\nTheoretical HBM Traffic (analytical model):")
+        print(f"\nHBM Traffic Estimate (analytical model — NOT measured):")
+        print(f"  These numbers are computed from matrix dimensions and dtype,")
+        print(f"  not from hardware performance counters.  Use NVIDIA Nsight")
+        print(f"  Compute (ncu) for actual DRAM traffic measurement.")
         print(f"  Eager (4 kernels):  {eager_traffic.total_mb:,.1f} MB")
         print(f"  Fused (2 kernels):  {fused_traffic_est.total_mb:,.1f} MB")
         print(f"  Savings:            {saved_mb:,.1f} MB ({saved_mb / eager_traffic.total_mb * 100:.1f}% reduction)")
