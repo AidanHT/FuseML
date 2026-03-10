@@ -1,5 +1,12 @@
-"""Triton code generation package."""
+"""Code generation package — Triton kernels and cuBLAS epilogue fusion."""
 
+from fuseml.codegen.cublas_epilogue import (
+    CublasEpilogueLauncher,
+    CublasEpiloguePattern,
+    CublasResidualLauncher,
+    cublas_epilogue_available,
+    match_cublas_epilogue,
+)
 from fuseml.codegen.eager_fallback import EagerFallbackGuard
 from fuseml.codegen.kernel_cache import (
     KernelCache,
@@ -27,6 +34,8 @@ from fuseml.codegen.sram_autotuner import (
 )
 
 __all__ = [
+    "CublasEpilogueLauncher",
+    "CublasEpiloguePattern",
     "EagerFallbackGuard",
     "KernelCache",
     "KernelCacheKey",
@@ -41,6 +50,7 @@ __all__ = [
     "build_cache_key",
     "build_op_chain",
     "compute_launch_params",
+    "cublas_epilogue_available",
     "compute_sram_bytes",
     "generate_sram_safe_configs",
     "next_power_of_2",

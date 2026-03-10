@@ -28,6 +28,11 @@ from functorch.compile import make_boxed_func
 from torch._functorch.aot_autograd import aot_module_simplified
 
 from fuseml._logging import logger
+from fuseml.codegen.cublas_epilogue import (
+    CublasEpilogueLauncher,
+    CublasResidualLauncher,
+    match_cublas_epilogue,
+)
 from fuseml.codegen.kernel_cache import (
     KernelCache,
     KernelCacheKey,
@@ -157,6 +162,8 @@ class FuseMLCompiler:
     def __init__(self, registry: SupportedOpsRegistry | None = None) -> None:
         self.registry: SupportedOpsRegistry = registry or build_default_registry()
         self.fusion_candidates: List[torch.fx.Node] = []
+        self.fusion_applied: bool = False
+        self.fusion_strategy: str = "none"
         self._generator = TritonKernelGenerator()
         self._cache = KernelCache()
 
@@ -214,6 +221,7 @@ class FuseMLCompiler:
             # WITHOUT the aot_module_simplified wrapper.  This eliminates
             # the per-invocation overhead of AOT Autograd's functionalization
             # layer, ensuring the no-fusion path matches eager speed.
+            self.fusion_applied = False
             logger.info(
                 "Bypassing AOT decomposition — %s", exc,
             )
@@ -266,15 +274,15 @@ class FuseMLCompiler:
                     found += 1
                 if is_trigger(node):
                     has_any_trigger = True
-                    # Early compute-bound check using metadata from
-                    # torch.compile's abstract interpretation (node.meta["val"]).
-                    # If ALL triggers are compute-bound, we can skip the
-                    # fusion pass entirely — cuBLAS handles everything
-                    # faster and the graph analysis would be wasted work.
                     if not FuseMLFusionPass._is_compute_bound_trigger(
                         node, min_penalty=100e-6,
                     ):
-                        has_fusible_trigger = True
+                        has_fusible_trigger = True  # Triton-fusible
+                    elif (
+                        node.meta.get("fusion_candidate", False)
+                        and match_cublas_epilogue(node) is not None
+                    ):
+                        has_fusible_trigger = True  # cuBLAS-epilogue-fusible
 
         if not has_any_trigger:
             raise _NoFusionPossible("no trigger ops in graph")
@@ -315,6 +323,8 @@ class FuseMLCompiler:
             if isinstance(inp, torch.Tensor):
                 tensor_map[node.name] = inp
 
+        strategies_used: set[str] = set()
+
         for placeholder_node in nodes_to_process:
             group: FusionGroup | None = placeholder_node.meta.get("fusion_group")
             if group is None:
@@ -324,17 +334,46 @@ class FuseMLCompiler:
                 )
                 continue
 
-            # ── Enrich tensor_map with resolved parameters ────────────
-            # param_bindings carries live nn.Parameter / buffer tensors
-            # resolved from get_attr nodes.  Adding them to tensor_map
-            # allows build_cache_key() to compute accurate fingerprints
-            # for parameter tensors that may lack FX node metadata.
+            # ── cuBLAS epilogue path — no Triton codegen needed ───────
+            if group.fusion_strategy == "cublas_epilogue":
+                launcher_fn = self._build_cublas_launcher(group)
+                if launcher_fn is None:
+                    logger.warning(
+                        "Could not build CublasEpilogueLauncher for %s "
+                        "— keeping placeholder.",
+                        placeholder_node.name,
+                    )
+                    continue
+
+                with gm.graph.inserting_after(placeholder_node):
+                    new_node = gm.graph.call_function(
+                        launcher_fn,
+                        args=placeholder_node.args,
+                    )
+                if "tensor_meta" in placeholder_node.meta:
+                    new_node.meta["tensor_meta"] = placeholder_node.meta["tensor_meta"]
+
+                placeholder_node.replace_all_uses_with(new_node)
+                gm.graph.erase_node(placeholder_node)
+                strategies_used.add("cublas_epilogue")
+
+                logger.debug(
+                    "Replaced placeholder %s with CublasEpilogueLauncher "
+                    "node %s.",
+                    placeholder_node.name,
+                    new_node.name,
+                )
+                continue
+
+            # ── Triton path (existing) ────────────────────────────────
+
+            # Enrich tensor_map with resolved parameters.
             if group.param_bindings:
                 for attr_name, param_tensor in group.param_bindings.items():
                     if isinstance(param_tensor, torch.Tensor):
                         tensor_map[attr_name] = param_tensor
 
-            # ── Cache lookup ───────────────────────────────────────────
+            # Cache lookup.
             cache_key = build_cache_key(group, tensor_map)
             launcher: KernelLauncher | None = None
             if cache_key is not None:
@@ -352,18 +391,17 @@ class FuseMLCompiler:
                 )
                 continue
 
-            # Replace the placeholder with a call_function to the launcher.
             with gm.graph.inserting_after(placeholder_node):
                 new_node = gm.graph.call_function(
                     launcher,
                     args=placeholder_node.args,
                 )
-            # Copy tensor_meta so downstream passes see shape info.
             if "tensor_meta" in placeholder_node.meta:
                 new_node.meta["tensor_meta"] = placeholder_node.meta["tensor_meta"]
 
             placeholder_node.replace_all_uses_with(new_node)
             gm.graph.erase_node(placeholder_node)
+            strategies_used.add("triton")
 
             logger.debug(
                 "Replaced placeholder %s with KernelLauncher node %s.",
@@ -374,9 +412,20 @@ class FuseMLCompiler:
         gm.graph.eliminate_dead_code()
         gm.recompile()
 
+        self.fusion_applied = True
+        if strategies_used == {"cublas_epilogue"}:
+            self.fusion_strategy = "cublas_epilogue"
+        elif "cublas_epilogue" in strategies_used and "triton" in strategies_used:
+            self.fusion_strategy = "mixed"
+        elif "triton" in strategies_used:
+            self.fusion_strategy = "triton"
+        else:
+            self.fusion_strategy = "none"
         logger.info(
-            "Kernel substitution complete — %d launcher(s) inserted.",
+            "Kernel substitution complete — %d launcher(s) inserted "
+            "(strategy: %s).",
             len(nodes_to_process),
+            self.fusion_strategy,
         )
 
         return gm.forward
@@ -525,6 +574,51 @@ class FuseMLCompiler:
             reduction_op=reduction_op,
             reduction_axis=reduction_axis,
         )
+
+        logger.info("Built %r for group %s.", launcher, group)
+        return launcher
+
+    # ------------------------------------------------------------------
+    # cuBLAS epilogue launcher construction
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _build_cublas_launcher(
+        group: FusionGroup,
+    ) -> CublasEpilogueLauncher | CublasResidualLauncher | None:
+        """Build a cuBLAS epilogue launcher for a cuBLAS epilogue group.
+
+        Dispatches based on the pattern's ``epilogue_type``:
+        - ``GELU_BIAS`` / ``RELU_BIAS`` → :class:`CublasEpilogueLauncher`
+        - ``BIAS_RESIDUAL`` → :class:`CublasResidualLauncher`
+
+        Returns ``None`` if the group lacks a valid ``cublas_pattern``.
+        """
+        pattern = group.cublas_pattern
+        if pattern is None:
+            return None
+
+        if pattern.epilogue_type == "BIAS_RESIDUAL":
+            if len(group.inputs) < 4:
+                logger.warning(
+                    "BIAS_RESIDUAL group %s has %d inputs (expected 4) "
+                    "— skipping.",
+                    group, len(group.inputs),
+                )
+                return None
+            launcher = CublasResidualLauncher()
+        else:
+            if len(group.inputs) < 3:
+                logger.warning(
+                    "cuBLAS epilogue group %s has %d inputs (expected 3) "
+                    "— skipping.",
+                    group, len(group.inputs),
+                )
+                return None
+            launcher = CublasEpilogueLauncher(
+                use_gelu=pattern.use_gelu,
+                epilogue_type=pattern.epilogue_type,
+            )
 
         logger.info("Built %r for group %s.", launcher, group)
         return launcher

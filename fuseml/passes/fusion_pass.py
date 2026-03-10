@@ -13,6 +13,7 @@ import torch
 from torch.fx.passes.shape_prop import ShapeProp
 
 from fuseml._logging import logger
+from fuseml.codegen.cublas_epilogue import match_cublas_epilogue
 from fuseml.codegen.kernel_cache import _materialize_ints
 from fuseml.fusion_group import FusionGroup
 from fuseml.passes.graph_cut import (
@@ -137,13 +138,55 @@ class FuseMLFusionPass:
             # --- Compute-bound GEMM check --------------------------------
             # For large matmuls where compute throughput (not memory
             # bandwidth) is the bottleneck, cuBLAS significantly
-            # outperforms custom Triton GEMM kernels.  Skip fusion so
-            # eager cuBLAS handles the matmul and the elementwise
-            # post-ops run as separate (cheap) CUDA kernels.
+            # outperforms custom Triton GEMM kernels.  Instead of
+            # skipping entirely, try cuBLAS epilogue fusion (cublasLt)
+            # which fuses activations like GeLU/ReLU into the cuBLAS
+            # matmul kernel — getting both cuBLAS speed AND fusion.
             if self._is_compute_bound_trigger(node):
+                epilogue_pattern = match_cublas_epilogue(node)
+                if epilogue_pattern is not None:
+                    group = FusionGroup(
+                        base_node=node,
+                        fusion_strategy="cublas_epilogue",
+                        cublas_pattern=epilogue_pattern,
+                    )
+                    consumed.add(node)
+
+                    group_node_set: Set[torch.fx.Node] = {node}
+                    self._collect_external_inputs(node, group_node_set, group)
+
+                    for ep_node in epilogue_pattern.absorbed_nodes:
+                        group.fused_nodes.append(ep_node)
+                        consumed.add(ep_node)
+                        group_node_set.add(ep_node)
+                        self._collect_external_inputs(
+                            ep_node, group_node_set, group,
+                        )
+
+                    group.output_node = epilogue_pattern.output_node
+
+                    self._resolve_get_attr_bindings(group)
+
+                    group.output_metadata = self._extract_tensor_metadata(
+                        group.output_node,
+                    )
+                    for n in group.all_nodes:
+                        group.node_args_snapshot[n.name] = tuple(n.args)
+
+                    logger.debug(
+                        "Compute-bound GEMM %s → cuBLAS epilogue fusion "
+                        "(%s), absorbing %d epilogue op(s).",
+                        node.name,
+                        epilogue_pattern.epilogue_type,
+                        len(epilogue_pattern.absorbed_nodes),
+                    )
+                    groups.append(group)
+                    continue
+
                 logger.debug(
                     "Skipping compute-bound GEMM trigger %s — "
-                    "cuBLAS will outperform custom Triton kernel.",
+                    "no cublasLt epilogue pattern matched, "
+                    "cuBLAS eager preferred.",
                     node.name,
                 )
                 continue
@@ -966,8 +1009,13 @@ class FuseMLFusionPass:
         # If an unsupported op slipped through pattern matching, the group
         # is split so that compilable prefixes are preserved and the rest
         # falls back to native PyTorch execution.
+        # cuBLAS epilogue groups bypass Triton validation — their ops are
+        # handled by cublasLt, not Triton codegen.
         validated: List[FusionGroup] = []
         for group in groups:
+            if group.fusion_strategy == "cublas_epilogue":
+                validated.append(group)
+                continue
             segments = split_fusion_group(group)
             for seg in segments:
                 if seg.kind == "fused" and seg.group is not None:

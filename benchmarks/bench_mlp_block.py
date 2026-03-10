@@ -127,6 +127,31 @@ def _fuseml_breakdown(M: int, D: int, I: int, bpe: int) -> dict[str, int]:
     }
 
 
+def _cublas_epilogue_breakdown(M: int, D: int, I: int, bpe: int) -> dict[str, int]:
+    """HBM traffic for full cuBLAS epilogue fusion (2 kernels).
+
+    Kernel 1: cublasLt(addmm + GeLU) — reads inputs, writes GeLU output
+    directly.  No intermediate M×I write+read for standalone GeLU.
+
+    Kernel 2: cublasLt(addmm + bias + residual) — reads inputs + residual,
+    writes final output.  No separate add kernel — the residual is fused
+    via cublasLt's BIAS_POINTER epilogue with beta=1, C=residual.
+    """
+    return {
+        # Kernel 1: cublasLt(addmm + GeLU fused)
+        "K1_read_x": M * D * bpe,
+        "K1_read_W1": D * I * bpe,
+        "K1_read_bias1": I * bpe,
+        "K1_write_gelu_out": M * I * bpe,
+        # Kernel 2: cublasLt(addmm + bias + residual fused)
+        "K2_read_gelu_out": M * I * bpe,
+        "K2_read_W2": I * D * bpe,
+        "K2_read_bias2": D * bpe,
+        "K2_read_residual": M * D * bpe,
+        "K2_write_final": M * D * bpe,
+    }
+
+
 def compute_hbm_traffic(
     M: int,
     d_model: int,
@@ -175,6 +200,10 @@ def compute_hbm_traffic(
     elif mode == "fuseml":
         # FuseML fuses elementwise post-ops into GEMM epilogues.
         breakdown = _fuseml_breakdown(M, D, I, bpe)
+    elif mode == "cublas_epilogue":
+        # cuBLAS epilogue: GeLU fused into first GEMM via cublasLt,
+        # second GEMM + residual add run as separate kernels.
+        breakdown = _cublas_epilogue_breakdown(M, D, I, bpe)
     else:
         raise ValueError(f"Unknown mode: {mode!r}")
 
@@ -312,32 +341,51 @@ def benchmark_mode(
 
 
 def _bench_timer(label: str, model: nn.Module, x: torch.Tensor) -> tuple[float, float]:
-    """Steady-state measurement via ``torch.utils.benchmark.Timer``.
+    """Steady-state measurement via CUDA events.
 
-    Uses ``torch.no_grad()`` to match the compilation context and prevent
-    TorchDynamo from triggering a guard-mismatch recompilation that would
-    produce different fusion results.
+    Uses per-iteration CUDA event timing instead of
+    ``torch.utils.benchmark.Timer`` to avoid TorchDynamo recompilation
+    triggered by Timer's internal ``exec()`` creating new code objects.
+
+    Runs enough iterations to fill at least ``MIN_RUN_TIME`` seconds,
+    then reports the median latency with IQR.
     """
-    timer = Timer(
-        stmt="with torch.no_grad(): model(x)",
-        globals={"model": model, "x": x, "torch": torch},
-        num_threads=1,
-        label="MLP Block",
-        sub_label=label,
-    )
+    device = x.device
+
     print(
-        f"    [timer] blocked_autorange  (min {MIN_RUN_TIME:.0f}s, "
-        f"outlier rejection enabled)...",
+        f"    [cuda-events] min {MIN_RUN_TIME:.0f}s, "
+        f"outlier rejection enabled...",
         end="",
         flush=True,
     )
+
+    latencies_ms: list[float] = []
     t0 = time.perf_counter()
-    measurement = timer.blocked_autorange(min_run_time=MIN_RUN_TIME)
-    elapsed = time.perf_counter() - t0
-    total_iters = measurement.number_per_run * len(measurement.times)
+
+    while True:
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+
+        start_event.record()
+        with torch.no_grad():
+            model(x)
+        end_event.record()
+
+        torch.cuda.synchronize(device)
+        latencies_ms.append(start_event.elapsed_time(end_event))
+
+        elapsed = time.perf_counter() - t0
+        if elapsed >= MIN_RUN_TIME and len(latencies_ms) >= 5:
+            break
+
+    total_iters = len(latencies_ms)
     print(f"  done  ({elapsed:.1f}s elapsed, {total_iters} iters)")
-    latency_ms = measurement.median * 1e3
-    iqr_ms = measurement.iqr * 1e3
+
+    t = torch.tensor(latencies_ms)
+    latency_ms = t.median().item()
+    q1 = t.quantile(0.25).item()
+    q3 = t.quantile(0.75).item()
+    iqr_ms = q3 - q1
     return latency_ms, iqr_ms
 
 
@@ -659,11 +707,13 @@ def main() -> None:
     compiled_models: dict[str, nn.Module] = {"Eager": model}
 
     # FuseML
+    fuseml_compiler = None
     if not args.skip_fuseml:
         try:
             from fuseml import FuseMLCompiler
 
-            fuseml_model = torch.compile(model, backend=FuseMLCompiler())
+            fuseml_compiler = FuseMLCompiler()
+            fuseml_model = torch.compile(model, backend=fuseml_compiler)
             print("\nTriggering FuseML compilation (first forward pass)...", end="", flush=True)
             t0 = time.perf_counter()
             with torch.no_grad():
@@ -699,9 +749,21 @@ def main() -> None:
         print("  (no compiled backends available -- skipping)")
 
     # -- Compute HBM traffic estimates --
+    # Select the HBM model based on the compiler's actual fusion strategy:
+    # - No fusion applied → use eager traffic model
+    # - cuBLAS epilogue fusion → GeLU fused, residual add separate
+    # - Triton / mixed → full fusion traffic model
     traffic: dict[str, HBMTrafficEstimate] = {}
     for mode_name in compiled_models:
-        mode_key = mode_name.lower()
+        if mode_name == "FuseML" and fuseml_compiler is not None:
+            if not fuseml_compiler.fusion_applied:
+                mode_key = "eager"
+            elif fuseml_compiler.fusion_strategy == "cublas_epilogue":
+                mode_key = "cublas_epilogue"
+            else:
+                mode_key = "fuseml"
+        else:
+            mode_key = mode_name.lower()
         traffic[mode_name] = compute_hbm_traffic(M, args.d_model, args.d_intermediate, dtype, mode_key)
 
     # -- Print HBM traffic breakdown (always shown, even with only Eager) --

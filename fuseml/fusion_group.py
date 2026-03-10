@@ -1,7 +1,10 @@
 """FusionGroup — data structure for a single fused operator sequence.
 
-A FusionGroup represents a contiguous subgraph of memory-bound FX nodes
-that will be replaced by a single Triton kernel during graph surgery.
+A FusionGroup represents a contiguous subgraph of FX nodes that will be
+replaced by a single fused kernel during graph surgery.  The kernel may
+be a Triton-generated GEMM+epilogue (for memory-bound GEMMs) or a
+cuBLAS GEMM with cublasLt epilogue fusion (for compute-bound GEMMs
+with fusible activations like GeLU/ReLU).
 """
 
 from __future__ import annotations
@@ -14,9 +17,9 @@ import torch
 
 @dataclass
 class FusionGroup:
-    """A contiguous sequence of memory-bound FX nodes identified for fusion.
+    """A contiguous sequence of FX nodes identified for fusion.
 
-    Represents a subgraph that will be replaced by a single Triton kernel.
+    Represents a subgraph that will be replaced by a single kernel.
     All nodes between *base_node* and *output_node* are absorbed into the
     group, and the generated kernel only reads from *inputs* and writes
     the result of *output_node* — eliminating intermediate HBM round-trips.
@@ -29,7 +32,7 @@ class FusionGroup:
         All subsequently absorbed nodes, **excluding** *base_node* itself.
     inputs : list[torch.fx.Node]
         External dependencies — nodes consumed by the group but produced
-        outside of it.  These become the Triton kernel's input pointers.
+        outside of it.  These become the kernel's input pointers.
     output_node : torch.fx.Node
         The final node in the sequence whose result is visible to the rest
         of the graph.  The fused kernel's output replaces this node.
@@ -53,6 +56,19 @@ class FusionGroup:
         :meth:`~fuseml.passes.fusion_pass.FuseMLFusionPass._resolve_get_attr_bindings`
         so that downstream codegen and the compiler can access live parameter
         data without relying on potentially incomplete FX node metadata.
+    fusion_strategy : str
+        Execution backend for this group:
+
+        - ``"triton"`` (default) — custom Triton GEMM+epilogue kernel.
+        - ``"cublas_epilogue"`` — cuBLAS GEMM with cublasLt epilogue
+          fusion (GELU/ReLU fused into the matmul write-back).
+
+        The compiler dispatches to different launcher constructors based
+        on this field.
+    cublas_pattern : CublasEpiloguePattern | None
+        When ``fusion_strategy == "cublas_epilogue"``, stores the matched
+        pattern (epilogue type, absorbed nodes, etc.).  ``None`` for
+        Triton-fused groups.
     """
 
     base_node: torch.fx.Node
@@ -65,6 +81,8 @@ class FusionGroup:
         default_factory=dict,
     )
     node_args_snapshot: Dict[str, tuple] = field(default_factory=dict)
+    fusion_strategy: str = "triton"
+    cublas_pattern: Any = None
 
     def __post_init__(self) -> None:
         # Default output_node to base_node when the group is a single op.

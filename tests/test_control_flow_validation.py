@@ -361,9 +361,10 @@ class TestCompilerFallback:
 
     def test_clean_model_compiles_normally(self):
         """Clean model with small test matrices raises _NoFusionPossible
-        (all triggers compute-bound at small sizes).  This is expected —
-        the caller (__call__) catches it to bypass AOT."""
-        model = CleanLinearReLU()
+        (all triggers compute-bound at small sizes, successor is not a
+        cublasLt-fusible activation).  This is expected — the caller
+        (__call__) catches it to bypass AOT."""
+        model = nn.Sequential(nn.Linear(64, 64), nn.Sigmoid())
         gm = trace_no_grad(model, torch.randn(2, 64))
         compiler = FuseMLCompiler()
         with pytest.raises(_NoFusionPossible):

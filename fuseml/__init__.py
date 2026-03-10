@@ -5,6 +5,13 @@ Public API re-exports for convenient access::
     from fuseml import FuseMLFusionPass, FusionGroup, SupportedOpsRegistry
 """
 
+from fuseml.codegen.cublas_epilogue import (
+    CublasEpilogueLauncher,
+    CublasEpiloguePattern,
+    CublasResidualLauncher,
+    cublas_epilogue_available,
+    match_cublas_epilogue,
+)
 from fuseml.codegen.eager_fallback import EagerFallbackGuard
 from fuseml.codegen.kernel_cache import (
     KernelCache,
@@ -50,6 +57,9 @@ from fuseml.passes.topology import (
 from fuseml.registry import SupportedOpsRegistry, build_default_registry
 
 __all__ = [
+    "CublasEpilogueLauncher",
+    "CublasEpiloguePattern",
+    "CublasResidualLauncher",
     "EagerFallbackGuard",
     "ControlFlowError",
     "FuseMLCompiler",
@@ -73,9 +83,11 @@ __all__ = [
     "build_op_signature",
     "canonicalize_target",
     "classify_node",
+    "cublas_epilogue_available",
     "fuseml_fused_kernel_placeholder",
     "is_safe_inplace",
     "is_trigger",
+    "match_cublas_epilogue",
     "next_power_of_2",
     "resolve_to_defining_node",
     "split_fusion_group",

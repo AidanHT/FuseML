@@ -233,14 +233,17 @@ class TestFuseMLCompilerCallNoFusion:
         with pytest.raises(_NoFusionPossible):
             compiler._compile_aten_graph(gm, [torch.randn(2, 64)])
 
-    def test_empty_registry_returns_forward(self):
-        """With an empty registry, all triggers are compute-bound — raises _NoFusionPossible."""
-        model = nn.Sequential(nn.Linear(64, 64), nn.ReLU())
+    def test_compute_bound_no_epilogue_returns_forward(self):
+        """Compute-bound GEMM without a fusible cublasLt epilogue — raises _NoFusionPossible.
+
+        When the GEMM is compute-bound (min_penalty makes tiny GEMMs
+        appear compute-bound) and the successor is not a cublasLt-fusible
+        activation (GeLU/ReLU), neither Triton nor cuBLAS epilogue fusion
+        is profitable, so the compiler should bypass AOT.
+        """
+        model = nn.Sequential(nn.Linear(64, 64), nn.Sigmoid())
         gm = trace_no_grad(model, torch.randn(2, 64))
-        empty_reg = SupportedOpsRegistry()
-        compiler = FuseMLCompiler(registry=empty_reg)
-        # _compile_aten_graph raises _NoFusionPossible when no fusion is
-        # profitable — the caller (__call__) catches it to bypass AOT.
+        compiler = FuseMLCompiler()
         with pytest.raises(_NoFusionPossible):
             compiler._compile_aten_graph(gm, [torch.randn(2, 64)])
 
