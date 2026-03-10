@@ -29,6 +29,7 @@ from fuseml.passes.topology import (
     TRIGGER_OPS,
     NodeRole,
     classify_node,
+    is_compute_bound_gemm,
     is_trigger,
     resolve_to_defining_node,
     symint_safe_eq,
@@ -131,6 +132,20 @@ class FuseMLFusionPass:
             if not is_trigger(node):
                 continue
             if node in consumed:
+                continue
+
+            # --- Compute-bound GEMM check --------------------------------
+            # For large matmuls where compute throughput (not memory
+            # bandwidth) is the bottleneck, cuBLAS significantly
+            # outperforms custom Triton GEMM kernels.  Skip fusion so
+            # eager cuBLAS handles the matmul and the elementwise
+            # post-ops run as separate (cheap) CUDA kernels.
+            if self._is_compute_bound_trigger(node):
+                logger.debug(
+                    "Skipping compute-bound GEMM trigger %s — "
+                    "cuBLAS will outperform custom Triton kernel.",
+                    node.name,
+                )
                 continue
 
             group = FusionGroup(base_node=node)
@@ -320,6 +335,61 @@ class FuseMLFusionPass:
             "stride": _materialize_ints(meta.stride),
             "dtype": meta.dtype,
         }
+
+    @staticmethod
+    def _is_compute_bound_trigger(node: torch.fx.Node) -> bool:
+        """Return ``True`` if the addmm trigger node has compute-bound dims.
+
+        Extracts M, N, K from the node's tensor metadata (populated by
+        ShapeProp) and delegates to
+        :func:`~fuseml.passes.topology.is_compute_bound_gemm`.
+
+        For ``aten.addmm(bias, input, weight)``:
+        - ``input`` has shape (M, K)
+        - ``weight`` has shape (K, N)
+
+        Returns ``False`` (conservative — proceed with fusion) when
+        metadata is unavailable.
+        """
+        # addmm args: (bias, input, weight)
+        if len(node.args) < 3:
+            return False
+
+        input_node = node.args[1]
+        weight_node = node.args[2]
+
+        # Try tensor_meta first, then val (FakeTensor).
+        def _get_shape(n: Any) -> Tuple | None:
+            if not isinstance(n, torch.fx.Node):
+                return None
+            meta = n.meta.get("tensor_meta")
+            if meta is not None and hasattr(meta, "shape"):
+                return meta.shape
+            val = n.meta.get("val")
+            if val is not None and hasattr(val, "shape"):
+                return val.shape
+            return None
+
+        input_shape = _get_shape(input_node)
+        weight_shape = _get_shape(weight_node)
+
+        if input_shape is None or weight_shape is None:
+            return False
+        if len(input_shape) < 2 or len(weight_shape) < 2:
+            return False
+
+        try:
+            M = int(input_shape[-2])
+            K = int(input_shape[-1])
+            N = int(weight_shape[-1])
+        except (TypeError, ValueError):
+            return False
+
+        # Determine dtype from the output node's metadata.
+        out_meta = node.meta.get("tensor_meta")
+        dtype = out_meta.dtype if out_meta is not None and hasattr(out_meta, "dtype") else torch.float32
+
+        return is_compute_bound_gemm(M, N, K, dtype)
 
     @staticmethod
     def _collect_external_inputs(

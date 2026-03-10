@@ -692,27 +692,12 @@ class TritonKernelGenerator:
                     f"\n    acc = acc + {v.name}[:, None]"
                 )
 
-        # ── Epilogue downcast ────────────────────────────────────────
-        # Narrow the fp32 accumulator to the output dtype before the
-        # epilogue post-ops begin.  For bf16/fp16 targets this means the
-        # fused elementwise operations (ReLU, GeLU, add, …) execute at
-        # the target precision, maximising Ada Tensor Core throughput.
-        # For fp32 targets this section is omitted (identity cast).
-        if output_tensor.dtype != torch.float32:
-            triton_out = _TRITON_DTYPE_MAP.get(output_tensor.dtype, "tl.float32")
-            # FP16 saturating clamp before the narrowing cast — prevents
-            # large fp32 accumulator values from overflowing to ±inf.
-            if output_tensor.dtype == torch.float16:
-                sections.append(
-                    f"\n    # FP16 safe downcast — saturate to ±{_FP16_MAX}"
-                    f"\n    acc = tl.where(acc > {_FP16_MAX}, {_FP16_MAX}, acc)"
-                    f"\n    acc = tl.where(acc < -{_FP16_MAX}, -{_FP16_MAX}, acc)"
-                )
-            sections.append(
-                f"\n    # Epilogue downcast — narrow fp32 accumulator to {triton_out}"
-                f"\n    # so fused post-ops run at output precision (throughput > precision)"
-                f"\n    acc = acc.to({triton_out})"
-            )
+        # ── Epilogue precision note ─────────────────────────────────
+        # The accumulator stays in FP32 through the entire epilogue so
+        # that fused post-ops (GeLU, ReLU, add, …) execute at full
+        # precision.  The narrowing cast to the output dtype happens
+        # once in _section_store() right before tl.store, avoiding
+        # double-cast and preserving numerical accuracy.
 
         return "\n".join(sections)
 
@@ -1438,33 +1423,24 @@ class TritonKernelGenerator:
 
     @staticmethod
     def _emit_gelu() -> str:
-        """GeLU: fast-math polynomial approximation for Ada Lovelace.
+        """GeLU activation via ``tl.math.tanh`` (hardware libdevice intrinsic).
 
         Matches PyTorch's ``gelu(approximate='tanh')`` formula::
 
             x * 0.5 * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x³)))
 
-        Instead of calling ``libdevice.tanh`` (which compiles to a slow
-        multi-instruction sequence), we use a Padé(3,2) rational polynomial
-        approximation for ``tanh``::
-
-            tanh(x) ≈ x · (27 + x²) / (27 + 9·x²)
-
-        This is accurate to ~1e-4 for |x| < 3.5, which covers 99.9% of
-        GeLU's inner range after the sqrt(2/π) scaling.  The approximation
-        uses only multiply-add instructions — no transcendentals — and maps
-        directly to Ada's FP32/BF16 fused multiply-add units.
+        Uses ``tl.math.tanh`` which maps to a single-instruction
+        ``libdevice`` call on Ada Lovelace — faster and more accurate
+        than a polynomial approximation.  The accumulator stays in FP32
+        through the entire computation for maximum precision.
 
         All arithmetic stays in SRAM registers — no HBM round-trip.
         """
         return "\n".join([
-            "    # GeLU activation — fast-math Padé polynomial (all in SRAM registers)",
-            "    # Formula: x * 0.5 * (1 + tanh_approx(sqrt(2/pi) * (x + 0.044715 * x^3)))",
-            "    # tanh(z) ≈ z * (27 + z²) / (27 + 9*z²) — Padé(3,2) rational approx",
-            "    _gelu_inner = 0.7978845608 * (acc + 0.044715 * acc * acc * acc)",
-            "    _inner_sq = _gelu_inner * _gelu_inner",
-            "    _tanh_approx = _gelu_inner * (27.0 + _inner_sq) / (27.0 + 9.0 * _inner_sq)",
-            "    acc = 0.5 * acc * (1.0 + _tanh_approx)",
+            "    # GeLU activation — tl.math.tanh intrinsic (all in SRAM registers)",
+            "    # Formula: x * 0.5 * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))",
+            "    _gelu_inner = 0.7978845608028654 * (acc + 0.044715 * acc * acc * acc)",
+            "    acc = 0.5 * acc * (1.0 + tl.math.tanh(_gelu_inner))",
         ])
 
     @staticmethod

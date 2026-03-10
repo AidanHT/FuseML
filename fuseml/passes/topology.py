@@ -265,6 +265,66 @@ def symint_safe_len(shape: Any) -> int | None:
         return None
 
 
+# ---------------------------------------------------------------------------
+# Compute-bound GEMM detection
+# ---------------------------------------------------------------------------
+
+# Bytes-per-element for arithmetic intensity calculation.
+_BYTES_PER_ELEM: Dict[Any, int] = {
+    torch.float32: 4,
+    torch.float16: 2,
+    torch.bfloat16: 2,
+    torch.int8: 1,
+}
+
+# Arithmetic intensity threshold above which a GEMM is compute-bound.
+# For BF16 on Ada Lovelace: peak compute ~110 TFLOPS, peak BW ~256 GB/s,
+# ridge point = 110e12 / 256e9 ≈ 430 FLOP/byte.  In practice, cuBLAS
+# outperforms custom Triton GEMM at intensities above ~50 FLOP/byte.
+_COMPUTE_BOUND_INTENSITY_THRESHOLD: float = 50.0
+
+
+def is_compute_bound_gemm(
+    M: int, N: int, K: int, dtype: Any = torch.bfloat16,
+) -> bool:
+    """Return ``True`` if a GEMM with dimensions (M, N, K) is compute-bound.
+
+    Computes the arithmetic intensity (FLOP / byte of HBM traffic) and
+    compares against a threshold.  When the intensity exceeds the
+    threshold, cuBLAS will outperform a custom Triton GEMM kernel because
+    the bottleneck is compute throughput (where cuBLAS excels with
+    CUTLASS-optimized tiles, persistent kernels, and split-K), not
+    memory bandwidth (where fusion eliminates redundant HBM traffic).
+
+    The arithmetic intensity formula::
+
+        intensity = 2·M·N·K / ((M·K + K·N + M·N) · bytes_per_element)
+
+    This measures FLOPs per byte of data moved for a single GEMM
+    (reading A, B, writing C).
+
+    Parameters
+    ----------
+    M, N, K :
+        Matrix dimensions.
+    dtype :
+        Element precision (determines bytes per element).
+
+    Returns
+    -------
+    bool
+        ``True`` when the GEMM is compute-bound and cuBLAS should be
+        preferred over a custom Triton fused kernel.
+    """
+    bpe = _BYTES_PER_ELEM.get(dtype, 4)
+    flops = 2.0 * M * N * K
+    bytes_moved = (M * K + K * N + M * N) * bpe
+    if bytes_moved == 0:
+        return False
+    intensity = flops / bytes_moved
+    return intensity > _COMPUTE_BOUND_INTENSITY_THRESHOLD
+
+
 def symint_safe_materialize(vals: Any) -> Tuple[int, ...] | None:
     """Attempt to materialize a shape/stride tuple to concrete ints.
 

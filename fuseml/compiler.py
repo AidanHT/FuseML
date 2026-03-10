@@ -207,6 +207,10 @@ class FuseMLCompiler:
         ATen-level ops (``aten.addmm.default``, ``aten.gelu.default``,
         etc.) regardless of the PyTorch version.
         """
+        # Clear per-compilation state to avoid stale references when
+        # TorchDynamo triggers recompilation (e.g. different grad context).
+        self.fusion_candidates = []
+
         logger.info(
             "Captured FX graph with %d nodes — scanning for fusion candidates …",
             len(list(gm.graph.nodes)),

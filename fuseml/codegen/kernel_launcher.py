@@ -59,8 +59,8 @@ from fuseml.codegen.sram_autotuner import SRAMAutotuner
 # Default block sizes — tune per-GPU architecture; 64/64/32 is a safe start
 # for Ampere/Ada.  These are passed as tl.constexpr at launch time.
 # ---------------------------------------------------------------------------
-_DEFAULT_BLOCK_SIZE_M: int = 64
-_DEFAULT_BLOCK_SIZE_N: int = 64
+_DEFAULT_BLOCK_SIZE_M: int = 128
+_DEFAULT_BLOCK_SIZE_N: int = 128
 _DEFAULT_BLOCK_SIZE_K: int = 32
 
 # Default L2 swizzle group width — controls how many M-blocks are grouped
@@ -132,21 +132,25 @@ class LaunchParams:
 # ---------------------------------------------------------------------------
 
 def _select_num_warps(
-    M: int, N: int, K: int, dtype: torch.dtype,
+    block_m: int, block_n: int, dtype: torch.dtype,
 ) -> int:
-    """Choose ``num_warps`` based on precision and tile size.
+    """Choose ``num_warps`` based on precision and **tile** (block) size.
 
     Heuristic rationale:
 
     * **Half-precision (FP16 / BF16)** kernels benefit from tensor-core
-      throughput which is 2× that of FP32.  More warps (8) keep the
+      throughput which is 2x that of FP32.  More warps (8) keep the
       tensor-core pipeline saturated and hide global-memory latency.
     * **FP32** has lower ALU throughput per SM; fewer warps (4) reduce
       register pressure and avoid occupancy cliffs.
-    * **Very small problems** (tile area < 1024 elements) get only 2
-      warps to avoid scheduling overhead exceeding useful compute.
+    * **Very small tiles** (area < 1024 elements) get only 2 warps to
+      avoid scheduling overhead exceeding useful compute.
+
+    Note: ``block_m`` and ``block_n`` are the tile dimensions (not the
+    full matrix dimensions) so the heuristic correctly adapts to the
+    actual per-SM workload.
     """
-    tile_area = M * N
+    tile_area = block_m * block_n
     if tile_area < 1024:
         return 2
     is_half = dtype in (torch.float16, torch.bfloat16)
@@ -276,13 +280,15 @@ def compute_launch_params(
         )
 
     # Static heuristic path
-    num_warps = _select_num_warps(M, N, K, dtype)
     num_stages = _select_num_stages(M, N, K, dtype)
 
     orig_block_m, orig_block_n = block_m, block_n
     block_m, block_n = _enforce_sram_capacity(
         block_m, block_n, dtype, sram_budget_bytes,
     )
+
+    # Select num_warps based on final (post-SRAM-enforcement) tile dims.
+    num_warps = _select_num_warps(block_m, block_n, dtype)
 
     # Compensate for SRAM-induced tile shrinkage with deeper pipelining.
     if block_m < orig_block_m or block_n < orig_block_n:
