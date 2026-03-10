@@ -292,10 +292,15 @@ def benchmark_mode(
 
 
 def _bench_timer(label: str, model: nn.Module, x: torch.Tensor) -> tuple[float, float]:
-    """Steady-state measurement via ``torch.utils.benchmark.Timer``."""
+    """Steady-state measurement via ``torch.utils.benchmark.Timer``.
+
+    Uses ``torch.no_grad()`` to match the compilation context and prevent
+    TorchDynamo from triggering a guard-mismatch recompilation that would
+    produce different fusion results.
+    """
     timer = Timer(
-        stmt="model(x)",
-        globals={"model": model, "x": x},
+        stmt="with torch.no_grad(): model(x)",
+        globals={"model": model, "x": x, "torch": torch},
         num_threads=1,
         label="MLP Block",
         sub_label=label,
