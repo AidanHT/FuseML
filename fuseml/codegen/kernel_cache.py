@@ -2,7 +2,7 @@
 
 Prevents redundant kernel compilation by uniquely identifying each fused
 kernel configuration through its operator topology, tensor memory layout,
-storage offsets, pointer alignment, data types, and device.
+storage offsets, pointer alignment, data types, and GPU compute capability.
 
 The cache key accounts for PyTorch's underlying C++ ATen tensor
 representations to prevent out-of-bounds memory accesses and silent
@@ -22,10 +22,14 @@ miscalculations when tensors are views, slices, or non-contiguously strided.
   aligned configurations map to kernels using wide vectorised loads, while
   misaligned configurations map to a safe variant that avoids GPU memory
   faults from over-wide vector instructions.
+* ``device_capability`` captures ``torch.cuda.get_device_capability()``
+  (e.g., ``(8, 0)`` for A100 vs ``(8, 9)`` for Ada Lovelace) to ensure
+  optimal ``BLOCK_SIZE`` and ``num_warps`` selection per GPU architecture.
 """
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -65,13 +69,15 @@ class TensorFingerprint:
     Captures every property of a tensor's ATen storage representation that
     affects Triton kernel correctness:
 
-    - **shape** and **stride**: determine pointer arithmetic and tile bounds.
+    - **shape** and **stride**: determine pointer arithmetic and tile bounds
+      (vital for boundary-masked offset calculations ``offs_m``, ``offs_n``,
+      ``offs_k``).
     - **storage_offset**: the offset (in elements) from the storage base
       pointer.  Triton kernels must add this to their base pointers to
-      avoid reading/writing the wrong memory region.
+      avoid reading/writing the wrong memory region (handles view ancestry).
     - **aligned**: whether ``data_ptr() % 16 == 0``.  Misaligned pointers
-      prevent the use of vectorised loads (e.g., ``tl.load`` with wide
-      vector widths), which would cause GPU memory faults.
+      prevent the use of vectorised ``tl.load`` instructions, which would
+      cause GPU memory faults.
     - **dtype**: the scalar type, stored as a string for deterministic
       hashing across sessions.
     - **broadcast_dims**: a boolean tuple recording which dimensions have
@@ -79,10 +85,9 @@ class TensorFingerprint:
       A ``torch.Tensor`` produced by ``.expand()`` has stride 0 on the
       expanded axis; this must be part of the cache key so that kernels
       compiled for one broadcast pattern are never dispatched on another.
-    - **tensor_subclass**: the type name of the tensor (e.g. ``"Tensor"``
-      or ``"Parameter"``).  ``nn.Parameter`` and ``torch.Tensor`` behave
-      differently in autograd lifecycle; mixing them in the cache can
-      cause lifecycle scoping bugs.
+
+    No FX node references, parameter names, or symbolic variables are
+    stored — only physical memory layout properties.
     """
 
     shape: Tuple[int, ...]
@@ -91,7 +96,6 @@ class TensorFingerprint:
     aligned: bool
     dtype: str  # str(torch.dtype) for deterministic hashing
     broadcast_dims: Tuple[bool, ...] = ()
-    tensor_subclass: str = "Tensor"
 
     # ── Deterministic hash and equality ────────────────────────────────
 
@@ -110,7 +114,6 @@ class TensorFingerprint:
             self.aligned,
             self.dtype,
             self.broadcast_dims,
-            self.tensor_subclass,
         ))
 
     def __eq__(self, other: object) -> bool:
@@ -125,7 +128,23 @@ class TensorFingerprint:
             and self.aligned == other.aligned
             and self.dtype == other.dtype
             and self.broadcast_dims == other.broadcast_dims
-            and self.tensor_subclass == other.tensor_subclass
+        )
+
+    def __lt__(self, other: object) -> bool:
+        """Total ordering for deterministic sorting of fingerprint tuples.
+
+        Required so that :class:`KernelCacheKey` can sort its input
+        fingerprints before hashing, making the cache key immune to
+        graph node reorderings introduced by AOT Autograd.
+        """
+        if not isinstance(other, TensorFingerprint):
+            return NotImplemented
+        return (
+            self.shape, self.stride, self.storage_offset,
+            self.aligned, self.dtype, self.broadcast_dims,
+        ) < (
+            other.shape, other.stride, other.storage_offset,
+            other.aligned, other.dtype, other.broadcast_dims,
         )
 
     # ── Factory methods ────────────────────────────────────────────────
@@ -155,7 +174,6 @@ class TensorFingerprint:
             aligned=aligned,
             dtype=str(t.dtype),
             broadcast_dims=tuple(s == 0 for s in stride),
-            tensor_subclass=type(t).__name__,
         )
 
     @classmethod
@@ -226,69 +244,78 @@ class KernelCacheKey:
 
     Deterministically hashes the full tensor configuration — operator
     topology, physical memory layout, storage offsets, pointer alignment,
-    data types, and device — so that kernels compiled for one configuration
-    are never dispatched on a different one, preventing out-of-bounds
-    memory accesses and silent miscalculations.
+    data types, and GPU compute capability — so that kernels compiled for
+    one configuration are never dispatched on a different one, preventing
+    out-of-bounds memory accesses and silent miscalculations.
+
+    The ``__hash__`` method uses SHA-256 over a canonical byte
+    representation of all fields, ensuring deterministic, collision-
+    resistant hashing that is immune to FX graph node renamings.  Input
+    fingerprints are sorted before hashing to guarantee order-invariance
+    against tracing artifacts.
 
     Attributes
     ----------
     op_chain :
-        Stable string encoding the fused operator sequence, e.g.
-        ``"aten.addmm.default->aten.gelu.default->aten.add.Tensor"``.
+        Canonicalized operator sequence as a tuple of strings, e.g.
+        ``("aten.addmm.default", "aten.gelu.default")``.
     input_fingerprints :
-        Ordered tuple of :class:`TensorFingerprint` objects, one per
-        kernel input tensor.
-    output_shape :
-        Shape of the kernel's primary output tensor.
-    output_dtype :
-        String representation of the output ``torch.dtype``.
-    device :
-        String representation of the target ``torch.device``.
+        Tuple of :class:`TensorFingerprint` objects, one per kernel input
+        tensor.  Sorted during hashing and equality comparison for
+        determinism against graph node reorderings.
+    output_shapes :
+        Shapes of the kernel's output tensor(s).
+    output_dtypes :
+        String representations of the output ``torch.dtype``\\(s).
+    device_capability :
+        GPU compute capability from ``torch.cuda.get_device_capability()``,
+        e.g. ``(8, 0)`` for A100 or ``(8, 9)`` for Ada Lovelace.
+        ``(0, 0)`` for CPU-only configurations.
     """
 
-    op_chain: str
+    op_chain: Tuple[str, ...]
     input_fingerprints: Tuple[TensorFingerprint, ...]
-    output_shape: Tuple[int, ...]
-    output_dtype: str
-    device: str
+    output_shapes: Tuple[Tuple[int, ...], ...]
+    output_dtypes: Tuple[str, ...]
+    device_capability: Tuple[int, int]
 
     def __hash__(self) -> int:
-        """Deterministic hash over all fields.
+        """SHA-256 based deterministic hash over all fields.
 
-        Flattens every constituent value into a single tuple of Python
-        primitives (int, str, bool, tuple-of-int) and hashes the result.
-        This avoids relying on auto-generated hashing of nested frozen
-        dataclasses and makes the hash strategy explicit and auditable.
+        Constructs a canonical byte representation from:
 
-        Deterministic within a Python session — sufficient for an in-memory
-        cache.  Cross-session determinism is unnecessary because the cache
-        is not persisted to disk.
+        1. The canonicalized ``op_chain`` tuple.
+        2. A sorted tuple of :class:`TensorFingerprint` dataclasses
+           (order-invariant against graph node renamings).
+        3. Output shapes and dtypes.
+        4. GPU device capability.
+
+        Returns a 64-bit signed integer derived from the first 8 bytes of
+        the SHA-256 digest.  Deterministic across Python sessions.
         """
-        parts: List[Any] = [self.op_chain]
-        for fp in self.input_fingerprints:
-            parts.append(fp.shape)
-            parts.append(fp.stride)
-            parts.append(fp.storage_offset)
-            parts.append(fp.aligned)
-            parts.append(fp.dtype)
-            parts.append(fp.broadcast_dims)
-            parts.append(fp.tensor_subclass)
-        parts.append(self.output_shape)
-        parts.append(self.output_dtype)
-        parts.append(self.device)
-        return hash(tuple(parts))
+        sorted_fps = tuple(sorted(self.input_fingerprints))
+        canonical = repr((
+            self.op_chain,
+            sorted_fps,
+            self.output_shapes,
+            self.output_dtypes,
+            self.device_capability,
+        ))
+        digest = hashlib.sha256(canonical.encode("utf-8")).digest()
+        return int.from_bytes(digest[:8], byteorder="little", signed=True)
 
     def __eq__(self, other: object) -> bool:
-        """Field-by-field equality — ensures cache lookups never conflate
-        two distinct kernel configurations."""
+        """Field-by-field equality with sorted input fingerprints — ensures
+        cache lookups never conflate two distinct kernel configurations
+        and are immune to graph node reorderings."""
         if not isinstance(other, KernelCacheKey):
             return NotImplemented
         return (
             self.op_chain == other.op_chain
-            and self.input_fingerprints == other.input_fingerprints
-            and self.output_shape == other.output_shape
-            and self.output_dtype == other.output_dtype
-            and self.device == other.device
+            and sorted(self.input_fingerprints) == sorted(other.input_fingerprints)
+            and self.output_shapes == other.output_shapes
+            and self.output_dtypes == other.output_dtypes
+            and self.device_capability == other.device_capability
         )
 
 
@@ -322,13 +349,13 @@ class KernelCache:
             self._hits += 1
             logger.debug(
                 "Kernel cache HIT for %s (total hits=%d, size=%d)",
-                key.op_chain, self._hits, len(self._store),
+                "->".join(key.op_chain), self._hits, len(self._store),
             )
             return launcher
         self._misses += 1
         logger.debug(
             "Kernel cache MISS for %s (total misses=%d, size=%d)",
-            key.op_chain, self._misses, len(self._store),
+            "->".join(key.op_chain), self._misses, len(self._store),
         )
         return None
 
@@ -337,7 +364,7 @@ class KernelCache:
         self._store[key] = launcher
         logger.debug(
             "Cached kernel for %s (cache size=%d)",
-            key.op_chain, len(self._store),
+            "->".join(key.op_chain), len(self._store),
         )
 
     @property
@@ -363,19 +390,37 @@ class KernelCache:
 
 
 # ---------------------------------------------------------------------------
+# Device capability helper
+# ---------------------------------------------------------------------------
+
+def _get_device_capability(
+    tensor_map: Dict[str, torch.Tensor],
+) -> Tuple[int, int]:
+    """Extract CUDA device capability from the first CUDA tensor found.
+
+    Returns ``(0, 0)`` for CPU-only configurations where no CUDA tensor
+    is available.
+    """
+    for t in tensor_map.values():
+        if isinstance(t, torch.Tensor) and t.is_cuda:
+            return torch.cuda.get_device_capability(t.device)
+    return (0, 0)
+
+
+# ---------------------------------------------------------------------------
 # Key construction helpers
 # ---------------------------------------------------------------------------
 
-def build_op_chain(group: Any) -> str:
-    """Build a stable operator-chain string from a FusionGroup.
+def build_op_chain(group: Any) -> Tuple[str, ...]:
+    """Build a stable operator-chain tuple from a FusionGroup.
 
-    Concatenates the **canonical** string representations of every
-    ``call_function`` target in execution order, joined by ``"->"``.
+    Returns a tuple of **canonical** string representations of every
+    ``call_function`` target in execution order.
     Uses :func:`~fuseml.passes.topology.canonicalize_target` as the
     single source of truth for target → string conversion, ensuring
     consistency with :attr:`FusionGroup.op_signature`.
 
-    The resulting string is completely independent of ``node.name``,
+    The resulting tuple is completely independent of ``node.name``,
     placeholder naming conventions (``primals_*``, ``tangents_*``),
     and any other AOT Autograd tracing artifact.
 
@@ -387,16 +432,16 @@ def build_op_chain(group: Any) -> str:
 
     Returns
     -------
-    str
-        e.g. ``"aten.addmm.default->aten.gelu.default"``.
+    Tuple[str, ...]
+        e.g. ``("aten.addmm.default", "aten.gelu.default")``.
     """
     from fuseml.passes.topology import canonicalize_target
 
-    targets: List[str] = []
-    for node in group.all_nodes:
-        if node.op == "call_function":
-            targets.append(canonicalize_target(node.target))
-    return "->".join(targets)
+    return tuple(
+        canonicalize_target(node.target)
+        for node in group.all_nodes
+        if node.op == "call_function"
+    )
 
 
 def build_cache_key(
@@ -472,17 +517,13 @@ def build_cache_key(
             resolved_shape = resolved_shape or fp.shape
             resolved_dtype = resolved_dtype or fp.dtype
 
-    # ── Device ────────────────────────────────────────────────────────
-    device = "cpu"
-    for t in tensor_map.values():
-        if isinstance(t, torch.Tensor):
-            device = str(t.device)
-            break
+    # ── Device capability ─────────────────────────────────────────────
+    device_capability = _get_device_capability(tensor_map)
 
     return KernelCacheKey(
         op_chain=op_chain,
         input_fingerprints=tuple(fingerprints),
-        output_shape=resolved_shape,
-        output_dtype=resolved_dtype,
-        device=device,
+        output_shapes=(resolved_shape,),
+        output_dtypes=(resolved_dtype,),
+        device_capability=device_capability,
     )

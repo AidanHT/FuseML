@@ -1,8 +1,9 @@
 """Tests for KernelCacheKey, TensorFingerprint, and KernelCache.
 
-Validates deterministic hashing, field-by-field equality, cache hit/miss
-behaviour, and correct differentiation of tensor memory layouts (strides,
-storage offsets, pointer alignment, dtypes, devices).
+Validates deterministic SHA-256 hashing, field-by-field equality, cache
+hit/miss behaviour, sorted-fingerprint order-invariance, device capability
+keying, and correct differentiation of tensor memory layouts (strides,
+storage offsets, pointer alignment, dtypes, broadcast patterns).
 """
 
 from __future__ import annotations
@@ -66,7 +67,6 @@ def _make_fingerprint(**overrides) -> TensorFingerprint:
         aligned=True,
         dtype="torch.float32",
         broadcast_dims=(False, False),
-        tensor_subclass="Tensor",
     )
     defaults.update(overrides)
     return TensorFingerprint(**defaults)
@@ -75,14 +75,14 @@ def _make_fingerprint(**overrides) -> TensorFingerprint:
 def _make_key(**overrides) -> KernelCacheKey:
     """Build a KernelCacheKey with sensible defaults, applying overrides."""
     defaults = dict(
-        op_chain="aten.addmm.default->aten.gelu.default",
+        op_chain=("aten.addmm.default", "aten.gelu.default"),
         input_fingerprints=(
             _make_fingerprint(shape=(4, 128), stride=(128, 1)),
             _make_fingerprint(shape=(128, 128), stride=(128, 1)),
         ),
-        output_shape=(4, 128),
-        output_dtype="torch.float32",
-        device="cpu",
+        output_shapes=((4, 128),),
+        output_dtypes=("torch.float32",),
+        device_capability=(0, 0),
     )
     defaults.update(overrides)
     return KernelCacheKey(**defaults)
@@ -137,6 +137,12 @@ class TestTensorFingerprintCreation:
         t = torch.randn(4, 4, dtype=torch.float16)
         fp = TensorFingerprint.from_tensor(t)
         assert fp.dtype == "torch.float16"
+
+    def test_from_tensor_no_subclass_field(self):
+        """TensorFingerprint must not store tensor_subclass — pure physical."""
+        t = torch.randn(4, 4)
+        fp = TensorFingerprint.from_tensor(t)
+        assert not hasattr(fp, "tensor_subclass")
 
     def test_from_node_with_tensor_meta(self):
         node = _make_node("x", shape=(8, 64), dtype=torch.float16)
@@ -236,6 +242,27 @@ class TestTensorFingerprintHashEq:
         s = {_make_fingerprint(), _make_fingerprint()}
         assert len(s) == 1
 
+    def test_lt_ordering(self):
+        """TensorFingerprint supports __lt__ for deterministic sorting."""
+        fp_small = _make_fingerprint(shape=(2, 64), stride=(64, 1))
+        fp_large = _make_fingerprint(shape=(4, 128), stride=(128, 1))
+        assert fp_small < fp_large
+        assert not fp_large < fp_small
+
+    def test_lt_returns_not_implemented_for_non_fingerprint(self):
+        fp = _make_fingerprint()
+        assert fp.__lt__("not a fingerprint") is NotImplemented
+
+    def test_sorted_fingerprints_deterministic(self):
+        """sorted() on fingerprints produces a consistent ordering."""
+        fps = [
+            _make_fingerprint(shape=(128, 128), stride=(128, 1)),
+            _make_fingerprint(shape=(4, 128), stride=(128, 1)),
+            _make_fingerprint(shape=(64, 64), stride=(64, 1)),
+        ]
+        assert sorted(fps) == sorted(fps)
+        assert sorted(fps)[0].shape == (4, 128)
+
 
 # ======================================================================
 # KernelCacheKey — hash & equality
@@ -243,7 +270,7 @@ class TestTensorFingerprintHashEq:
 
 @pytest.mark.cache
 class TestKernelCacheKeyHashEq:
-    """Deterministic __hash__ and __eq__ for KernelCacheKey."""
+    """Deterministic SHA-256 __hash__ and __eq__ for KernelCacheKey."""
 
     def test_identical_keys_equal(self):
         a = _make_key()
@@ -255,9 +282,14 @@ class TestKernelCacheKeyHashEq:
         k = _make_key()
         assert hash(k) == hash(k)
 
+    def test_hash_is_int(self):
+        """SHA-256 based hash must return a proper int."""
+        k = _make_key()
+        assert isinstance(hash(k), int)
+
     def test_different_op_chain(self):
-        a = _make_key(op_chain="aten.addmm.default->aten.gelu.default")
-        b = _make_key(op_chain="aten.addmm.default->aten.relu.default")
+        a = _make_key(op_chain=("aten.addmm.default", "aten.gelu.default"))
+        b = _make_key(op_chain=("aten.addmm.default", "aten.relu.default"))
         assert a != b
 
     def test_different_input_fingerprints(self):
@@ -267,19 +299,19 @@ class TestKernelCacheKeyHashEq:
         b = _make_key(input_fingerprints=(fp_b,))
         assert a != b
 
-    def test_different_output_shape(self):
-        a = _make_key(output_shape=(4, 128))
-        b = _make_key(output_shape=(8, 128))
+    def test_different_output_shapes(self):
+        a = _make_key(output_shapes=((4, 128),))
+        b = _make_key(output_shapes=((8, 128),))
         assert a != b
 
-    def test_different_output_dtype(self):
-        a = _make_key(output_dtype="torch.float32")
-        b = _make_key(output_dtype="torch.float16")
+    def test_different_output_dtypes(self):
+        a = _make_key(output_dtypes=("torch.float32",))
+        b = _make_key(output_dtypes=("torch.float16",))
         assert a != b
 
-    def test_different_device(self):
-        a = _make_key(device="cpu")
-        b = _make_key(device="cuda:0")
+    def test_different_device_capability(self):
+        a = _make_key(device_capability=(0, 0))
+        b = _make_key(device_capability=(8, 0))
         assert a != b
 
     def test_not_equal_to_non_key(self):
@@ -292,12 +324,14 @@ class TestKernelCacheKeyHashEq:
         d = {k: "launcher"}
         assert d[_make_key()] == "launcher"
 
-    def test_fingerprint_order_matters(self):
+    def test_fingerprint_order_invariant(self):
+        """Sorted fingerprints make keys immune to input reordering."""
         fp_a = _make_fingerprint(shape=(4, 128), stride=(128, 1))
         fp_b = _make_fingerprint(shape=(128, 128), stride=(128, 1))
         k1 = _make_key(input_fingerprints=(fp_a, fp_b))
         k2 = _make_key(input_fingerprints=(fp_b, fp_a))
-        assert k1 != k2
+        assert k1 == k2
+        assert hash(k1) == hash(k2)
 
     def test_storage_offset_differentiates_keys(self):
         fp_zero = _make_fingerprint(storage_offset=0)
@@ -312,6 +346,13 @@ class TestKernelCacheKeyHashEq:
         a = _make_key(input_fingerprints=(fp_aligned,))
         b = _make_key(input_fingerprints=(fp_misaligned,))
         assert a != b
+
+    def test_device_capability_a100_vs_ada(self):
+        """Different GPU architectures produce different cache keys."""
+        a = _make_key(device_capability=(8, 0))   # A100
+        b = _make_key(device_capability=(8, 9))   # Ada Lovelace
+        assert a != b
+        assert hash(a) != hash(b)
 
 
 # ======================================================================
@@ -339,16 +380,16 @@ class TestKernelCache:
 
     def test_different_key_misses(self):
         cache = KernelCache()
-        key_a = _make_key(op_chain="a")
-        key_b = _make_key(op_chain="b")
+        key_a = _make_key(op_chain=("a",))
+        key_b = _make_key(op_chain=("b",))
         cache.store(key_a, "launcher_a")
         assert cache.lookup(key_b) is None
         assert cache.misses == 1
 
     def test_multiple_entries(self):
         cache = KernelCache()
-        k1 = _make_key(op_chain="chain1")
-        k2 = _make_key(op_chain="chain2")
+        k1 = _make_key(op_chain=("chain1",))
+        k2 = _make_key(op_chain=("chain2",))
         cache.store(k1, "L1")
         cache.store(k2, "L2")
         assert cache.size == 2
@@ -369,7 +410,7 @@ class TestKernelCache:
         key = _make_key()
         cache.store(key, "val")
         cache.lookup(key)  # hit
-        cache.lookup(_make_key(op_chain="miss"))  # miss
+        cache.lookup(_make_key(op_chain=("miss",)))  # miss
         cache.clear()
         assert cache.size == 0
         assert cache.hits == 0
@@ -384,7 +425,7 @@ class TestKernelCache:
         for _ in range(5):
             cache.lookup(key)
         for _ in range(3):
-            cache.lookup(_make_key(op_chain="nonexistent"))
+            cache.lookup(_make_key(op_chain=("nonexistent",)))
 
         assert cache.hits == 5
         assert cache.misses == 3
@@ -458,7 +499,7 @@ class TestBuildOpChain:
             output_node=base,
             output_metadata={},
         )
-        assert build_op_chain(group) == "aten.addmm.default"
+        assert build_op_chain(group) == ("aten.addmm.default",)
 
     def test_multi_op_chain(self):
         n1 = _make_node("addmm", target="aten.addmm.default")
@@ -471,14 +512,14 @@ class TestBuildOpChain:
             output_metadata={},
         )
         assert build_op_chain(group) == (
-            "aten.addmm.default->aten.gelu.default->aten.add.Tensor"
+            "aten.addmm.default", "aten.gelu.default", "aten.add.Tensor"
         )
 
     def test_skips_non_call_function(self):
         n1 = _make_node("addmm", op="call_function", target="aten.addmm.default")
         n2 = _make_node("placeholder", op="placeholder", target="x")
         group = SimpleNamespace(all_nodes=[n1, n2])
-        assert build_op_chain(group) == "aten.addmm.default"
+        assert build_op_chain(group) == ("aten.addmm.default",)
 
 
 # ======================================================================
@@ -507,11 +548,11 @@ class TestBuildCacheKey:
 
         key = build_cache_key(group, tensor_map)
         assert key is not None
-        assert key.op_chain == "aten.addmm.default->aten.gelu.default"
+        assert key.op_chain == ("aten.addmm.default", "aten.gelu.default")
         assert len(key.input_fingerprints) == 2
-        assert key.output_shape == (4, 128)
-        assert key.output_dtype == "torch.float32"
-        assert key.device == "cpu"
+        assert key.output_shapes == ((4, 128),)
+        assert key.output_dtypes == ("torch.float32",)
+        assert key.device_capability == (0, 0)  # CPU tensors
 
     def test_falls_back_to_node_metadata(self):
         """When a tensor is not in tensor_map, from_node is used."""
@@ -594,9 +635,9 @@ class TestBuildCacheKey:
         t = torch.randn(4, 128)
         key = build_cache_key(group, {"x": t})
         assert key is not None
-        assert key.output_shape == (4, 128)
+        assert key.output_shapes == ((4, 128),)
 
-    def test_device_extracted_from_tensor_map(self):
+    def test_device_capability_from_cpu_tensor_map(self):
         t = torch.randn(4, 128)  # CPU tensor
         inp = _make_node("x", shape=(4, 128))
         node = _make_node("addmm", target="aten.addmm.default", shape=(4, 128))
@@ -610,7 +651,7 @@ class TestBuildCacheKey:
 
         key = build_cache_key(group, {"x": t})
         assert key is not None
-        assert key.device == "cpu"
+        assert key.device_capability == (0, 0)  # CPU → (0, 0)
 
 
 # ======================================================================
@@ -708,49 +749,6 @@ class TestSymIntUnpacking:
 
 
 # ======================================================================
-# Subclass awareness — Tensor vs Parameter
-# ======================================================================
-
-@pytest.mark.cache
-class TestSubclassAwareness:
-    """Cache must distinguish torch.Tensor from nn.Parameter."""
-
-    def test_tensor_subclass_plain(self):
-        t = torch.randn(4, 4)
-        fp = TensorFingerprint.from_tensor(t)
-        assert fp.tensor_subclass == "Tensor"
-
-    def test_tensor_subclass_parameter(self):
-        p = torch.nn.Parameter(torch.randn(4, 4))
-        fp = TensorFingerprint.from_tensor(p)
-        assert fp.tensor_subclass == "Parameter"
-
-    def test_subclass_differentiates_fingerprints(self):
-        fp_tensor = _make_fingerprint(tensor_subclass="Tensor")
-        fp_param = _make_fingerprint(tensor_subclass="Parameter")
-        assert fp_tensor != fp_param
-
-    def test_subclass_differentiates_cache_keys(self):
-        cache = KernelCache()
-
-        fp_tensor = _make_fingerprint(tensor_subclass="Tensor")
-        fp_param = _make_fingerprint(tensor_subclass="Parameter")
-
-        k_tensor = _make_key(input_fingerprints=(fp_tensor,))
-        k_param = _make_key(input_fingerprints=(fp_param,))
-
-        cache.store(k_tensor, "tensor_launcher")
-        assert cache.lookup(k_param) is None  # must miss
-        assert cache.misses == 1
-
-    def test_from_node_defaults_to_tensor(self):
-        node = _make_node("x", shape=(8, 64))
-        fp = TensorFingerprint.from_node(node)
-        assert fp is not None
-        assert fp.tensor_subclass == "Tensor"
-
-
-# ======================================================================
 # Broadcast stride differentiation
 # ======================================================================
 
@@ -816,3 +814,58 @@ class TestBroadcastStrideDifferentiation:
         fp = TensorFingerprint.from_node(node)
         assert fp is not None
         assert fp.broadcast_dims == (True, False)
+
+
+# ======================================================================
+# SHA-256 hash determinism
+# ======================================================================
+
+@pytest.mark.cache
+class TestSHA256HashDeterminism:
+    """KernelCacheKey hash must be SHA-256 based and deterministic."""
+
+    def test_hash_reproducible_across_constructions(self):
+        """Two independently constructed identical keys produce the same hash."""
+        h1 = hash(_make_key())
+        h2 = hash(_make_key())
+        assert h1 == h2
+
+    def test_hash_stable_across_repeated_calls(self):
+        """hash() on the same key object returns the same value every time."""
+        k = _make_key()
+        hashes = [hash(k) for _ in range(100)]
+        assert len(set(hashes)) == 1
+
+    def test_hash_changes_with_any_field(self):
+        """Changing any single field must produce a different hash."""
+        base_hash = hash(_make_key())
+
+        assert hash(_make_key(op_chain=("different",))) != base_hash
+        assert hash(_make_key(output_shapes=((999,),))) != base_hash
+        assert hash(_make_key(output_dtypes=("torch.float16",))) != base_hash
+        assert hash(_make_key(device_capability=(9, 0))) != base_hash
+
+        fp_different = _make_fingerprint(shape=(1, 1), stride=(1, 1))
+        assert hash(_make_key(input_fingerprints=(fp_different,))) != base_hash
+
+    def test_no_fx_node_references_in_key(self):
+        """Cache key fields must contain only physical layout primitives."""
+        key = _make_key()
+        # op_chain: tuple of strings
+        assert all(isinstance(s, str) for s in key.op_chain)
+        # fingerprints: physical layout only
+        for fp in key.input_fingerprints:
+            assert all(isinstance(d, int) for d in fp.shape)
+            assert all(isinstance(d, int) for d in fp.stride)
+            assert isinstance(fp.storage_offset, int)
+            assert isinstance(fp.aligned, bool)
+            assert isinstance(fp.dtype, str)
+            assert all(isinstance(b, bool) for b in fp.broadcast_dims)
+            assert not hasattr(fp, "tensor_subclass")
+        # output shapes/dtypes: tuples of primitives
+        for shape in key.output_shapes:
+            assert all(isinstance(d, int) for d in shape)
+        for dtype in key.output_dtypes:
+            assert isinstance(dtype, str)
+        # device_capability: tuple of ints
+        assert all(isinstance(d, int) for d in key.device_capability)

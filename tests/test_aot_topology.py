@@ -235,7 +235,7 @@ class TestOpSignature:
             assert build_op_signature(group.all_nodes) == group.op_signature
 
     def test_op_chain_consistent_with_signature(self):
-        """build_op_chain result must be equivalent to joining op_signature."""
+        """build_op_chain result must match op_signature (both are tuples)."""
         model = nn.Sequential(nn.Linear(64, 64), nn.ReLU())
         gm = trace_no_grad(model, torch.randn(2, 64))
         groups = find_groups(gm)
@@ -243,8 +243,7 @@ class TestOpSignature:
         if groups:
             group = groups[0]
             chain = build_op_chain(group)
-            sig_chain = "->".join(group.op_signature)
-            assert chain == sig_chain
+            assert chain == group.op_signature
 
     def test_different_models_different_signatures(self):
         """Different model topologies must produce different signatures."""

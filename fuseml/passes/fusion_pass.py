@@ -6,6 +6,7 @@ placeholder function used as a symbolic target for fused kernel nodes.
 
 from __future__ import annotations
 
+import operator as _operator
 from typing import Any, Callable, Dict, List, Set, Tuple
 
 import torch
@@ -462,21 +463,32 @@ class FuseMLFusionPass:
                         _resolve_node(arg)
 
     # ------------------------------------------------------------------
-    # Phase 2 — Rewrite the graph
+    # Phase 2 — Rewrite the graph (SSA-preserving)
     # ------------------------------------------------------------------
     def _apply_surgery(self, groups: List[FusionGroup]) -> None:
         """Replace each *FusionGroup* in the graph with a fused kernel call.
 
         For every group, this method:
-        1. Inserts a new ``call_function`` node targeting
+
+        1. **Validates insertion topology** — ensures all external inputs
+           precede the insertion point, preventing cyclic dependencies
+           when residual connections are topologically parallel to the
+           GEMM base node.
+        2. **Inserts** a ``call_function`` node targeting
            :func:`fuseml_fused_kernel_placeholder` immediately after the
-           group's output node.
-        2. Wires the new node's args to the group's external ``inputs``.
-        3. Rewires all downstream consumers of the output node to read
-           from the new placeholder node instead.
-        4. After all groups are processed, eliminates dead code (the
-           now-disconnected original sequences) and recompiles the
-           ``GraphModule``.
+           group's output node, wired to the group's external ``inputs``.
+        3. **Rewires consumers** — for single-output groups, a direct
+           ``replace_all_uses_with``; for groups with
+           ``intermediate_outputs`` (escape nodes), inserts
+           ``operator.getitem`` nodes to decompose the multi-output
+           tuple and selectively rewires each intermediate node's
+           external consumers to the corresponding ``getitem``.
+        4. **Patches cross-group references** so that later groups whose
+           inputs referenced a now-replaced output node point to the
+           correct replacement.
+        5. **Eliminates dead code** and **validates acyclicity** via
+           iterative DFS before calling ``graph.lint()`` and
+           ``recompile()``.
 
         Parameters
         ----------
@@ -486,7 +498,10 @@ class FuseMLFusionPass:
         graph = self.graph_module.graph
 
         for group in groups:
-            # --- Insert placeholder node after the group's output ----------
+            # --- Phase 0: Validate insertion topology ---------------------
+            self._validate_insertion_topology(group)
+
+            # --- Phase 1: Insert placeholder node after the output --------
             with graph.inserting_after(group.output_node):
                 new_fused_node = graph.call_function(
                     fuseml_fused_kernel_placeholder,
@@ -512,13 +527,10 @@ class FuseMLFusionPass:
                 group,
             )
 
-            # --- Rewire downstream consumers to the new node ---------------
-            group.output_node.replace_all_uses_with(
-                new_fused_node,
-                propagate_meta=False,
-            )
+            # --- Phase 2: Rewire downstream consumers ---------------------
+            rewire_map = self._rewire_consumers(graph, group, new_fused_node)
 
-            # --- Patch remaining groups' input lists ----------------------
+            # --- Phase 3: Patch remaining groups' input lists -------------
             # replace_all_uses_with only updates FX graph args — it does
             # NOT touch the Python lists in other FusionGroup.inputs.
             # Without this patch, a later group whose inputs contained
@@ -529,25 +541,27 @@ class FuseMLFusionPass:
                 if other_group is group:
                     continue
                 for i, inp in enumerate(other_group.inputs):
-                    if inp is group.output_node:
-                        other_group.inputs[i] = new_fused_node
+                    replacement = rewire_map.get(inp)
+                    if replacement is not None:
+                        other_group.inputs[i] = replacement
 
-            # --- Dangling output guard ------------------------------------
+            # --- Phase 4: Dangling output guard ---------------------------
             # If the fusion group is the final computation before the
             # graph's output node, verify the output node's args now
-            # reference our new placeholder (not the dead original).
+            # reference the replacement (not the dead original).
             for graph_node in graph.nodes:
                 if graph_node.op == "output":
-                    def _patch_arg(arg):
-                        if arg is group.output_node:
+                    def _patch_arg(arg, _rmap=rewire_map):
+                        replacement = _rmap.get(arg)
+                        if replacement is not None:
                             logger.warning(
                                 "Dangling output guard: output node still "
                                 "references dead node %s — patching.",
-                                group.output_node.name,
+                                arg.name,
                             )
-                            return new_fused_node
+                            return replacement
                         if isinstance(arg, (tuple, list)):
-                            patched = [_patch_arg(a) for a in arg]
+                            patched = [_patch_arg(a, _rmap) for a in arg]
                             return type(arg)(patched)
                         return arg
 
@@ -587,7 +601,8 @@ class FuseMLFusionPass:
         # Phase 4: Final DCE to catch cascading orphans from phases 2-3.
         graph.eliminate_dead_code()
 
-        # --- Validation: catch topological invariant violations early ------
+        # --- Post-surgery validation --------------------------------------
+        self._validate_acyclicity(graph)
         graph.lint()
         self.graph_module.recompile()
 
@@ -595,6 +610,213 @@ class FuseMLFusionPass:
             "Graph surgery complete — %d group(s) replaced with placeholder kernels.",
             len(groups),
         )
+
+    # ------------------------------------------------------------------
+    # Surgery helpers — consumer rewiring
+    # ------------------------------------------------------------------
+    def _rewire_consumers(
+        self,
+        graph: torch.fx.Graph,
+        group: FusionGroup,
+        new_fused_node: torch.fx.Node,
+    ) -> Dict[torch.fx.Node, torch.fx.Node]:
+        """Rewire downstream consumers of fused nodes to the new placeholder.
+
+        **Single-output** (no ``intermediate_outputs``):
+        Direct ``replace_all_uses_with`` from the group's ``output_node``
+        to *new_fused_node*.
+
+        **Multi-output** (``intermediate_outputs`` present):
+        The Triton kernel must write intermediate activations back to HBM
+        so that external consumers (e.g. Autograd's backward pass) can
+        read them.  The FX graph models this as a tuple return:
+
+        * ``new_fused_node`` → returns ``(primary, inter_0, inter_1, …)``
+        * ``getitem(new_fused_node, 0)`` → primary output
+        * ``getitem(new_fused_node, 1)`` → first intermediate, etc.
+
+        External consumers of each intermediate node are selectively
+        rewired to the corresponding ``getitem`` node using
+        ``replace_input_with`` (not ``replace_all_uses_with``) to avoid
+        disturbing internal group wiring that DCE will clean up.
+
+        Returns
+        -------
+        dict[torch.fx.Node, torch.fx.Node]
+            Mapping from each replaced original node to its replacement.
+            Used by the caller to patch cross-group references and the
+            dangling-output guard.
+        """
+        if not group.intermediate_outputs:
+            # --- Single-output: simple replacement ------------------------
+            group.output_node.replace_all_uses_with(
+                new_fused_node,
+                propagate_meta=False,
+            )
+            return {group.output_node: new_fused_node}
+
+        # --- Multi-output: getitem decomposition --------------------------
+        prev_node = new_fused_node
+
+        # Primary output (index 0) — replaces group.output_node.
+        with graph.inserting_after(prev_node):
+            primary_getitem = graph.call_function(
+                _operator.getitem, args=(new_fused_node, 0),
+            )
+        if "tensor_meta" in group.output_node.meta:
+            primary_getitem.meta["tensor_meta"] = (
+                group.output_node.meta["tensor_meta"]
+            )
+        prev_node = primary_getitem
+
+        rewire_map: Dict[torch.fx.Node, torch.fx.Node] = {
+            group.output_node: primary_getitem,
+        }
+
+        # Intermediate outputs (indices 1, 2, …).
+        for idx, intermediate_node in enumerate(group.intermediate_outputs):
+            with graph.inserting_after(prev_node):
+                inter_getitem = graph.call_function(
+                    _operator.getitem,
+                    args=(new_fused_node, idx + 1),
+                )
+            if "tensor_meta" in intermediate_node.meta:
+                inter_getitem.meta["tensor_meta"] = (
+                    intermediate_node.meta["tensor_meta"]
+                )
+            rewire_map[intermediate_node] = inter_getitem
+            prev_node = inter_getitem
+
+        # Rewire output_node's ALL consumers → primary_getitem.
+        # (getitem nodes reference new_fused_node, not output_node,
+        # so replace_all_uses_with cannot create self-references.)
+        group.output_node.replace_all_uses_with(
+            primary_getitem, propagate_meta=False,
+        )
+
+        # Selectively rewire each intermediate node's EXTERNAL consumers
+        # to the corresponding getitem.  Internal group wiring is left
+        # intact — those nodes will be removed by DCE.
+        group_set = set(group.all_nodes)
+        for intermediate_node, getitem_node in rewire_map.items():
+            if intermediate_node is group.output_node:
+                continue  # already handled above
+            for user in list(intermediate_node.users):
+                if user not in group_set and user is not getitem_node:
+                    user.replace_input_with(intermediate_node, getitem_node)
+
+        # Attach multi-output metadata for downstream codegen.
+        new_fused_node.meta["num_outputs"] = (
+            1 + len(group.intermediate_outputs)
+        )
+        new_fused_node.meta["intermediate_output_names"] = [
+            n.name for n in group.intermediate_outputs
+        ]
+
+        logger.debug(
+            "Multi-output rewiring: %d getitem node(s) for group %s",
+            1 + len(group.intermediate_outputs),
+            group,
+        )
+        return rewire_map
+
+    # ------------------------------------------------------------------
+    # Surgery helpers — topology validation
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _validate_insertion_topology(group: FusionGroup) -> None:
+        """Verify all group inputs precede the output_node topologically.
+
+        The fused placeholder is inserted immediately after the group's
+        ``output_node``.  If any external input appears *after* the
+        output_node in the FX graph's node list (which maintains
+        topological order), the insertion would create a use-before-def
+        violation — breaking the SSA property.
+
+        AOT Autograd flattening can separate secondary inputs (e.g. the
+        residual connection feeding ``aten.add.Tensor``) from the main
+        computational trunk.  In a valid FX graph these inputs are always
+        topologically *before* the nodes that consume them, but this
+        guard catches any graph corruption that would silently produce
+        incorrect rewiring.
+
+        Raises
+        ------
+        RuntimeError
+            If an input appears after the insertion point.
+        """
+        graph = group.base_node.graph
+        topo_index: Dict[torch.fx.Node, int] = {
+            n: i for i, n in enumerate(graph.nodes)
+        }
+
+        output_pos = topo_index.get(group.output_node)
+        if output_pos is None:
+            return  # output_node missing from graph — caller will fail later
+
+        for inp in group.inputs:
+            inp_pos = topo_index.get(inp)
+            if inp_pos is not None and inp_pos > output_pos:
+                raise RuntimeError(
+                    f"SSA violation: input '{inp.name}' (topo position "
+                    f"{inp_pos}) appears after output_node "
+                    f"'{group.output_node.name}' (topo position "
+                    f"{output_pos}).  The fused placeholder would create "
+                    f"a cyclic dependency.  This indicates a malformed FX "
+                    f"graph or incorrect FusionGroup construction."
+                )
+
+    @staticmethod
+    def _validate_acyclicity(graph: torch.fx.Graph) -> None:
+        """Verify the graph contains no cycles after surgery.
+
+        Uses iterative DFS with three-colour marking
+        (WHITE → GRAY → BLACK) to detect back edges.  A back edge
+        exists when a GRAY node (currently on the DFS stack) is
+        encountered as a successor, proving a cycle in the directed
+        graph.
+
+        Raises
+        ------
+        RuntimeError
+            If a cycle is detected.
+        """
+        WHITE, GRAY, BLACK = 0, 1, 2
+        color: Dict[torch.fx.Node, int] = {n: WHITE for n in graph.nodes}
+
+        for start in graph.nodes:
+            if color[start] != WHITE:
+                continue
+
+            # Iterative DFS avoids stack overflow on deep graphs.
+            stack: List[Tuple[torch.fx.Node, bool]] = [(start, False)]
+            while stack:
+                node, post_visit = stack.pop()
+
+                if post_visit:
+                    color[node] = BLACK
+                    continue
+
+                if color[node] == BLACK:
+                    continue
+                if color[node] == GRAY:
+                    # Revisited via another path — safe to finalize.
+                    color[node] = BLACK
+                    continue
+
+                color[node] = GRAY
+                stack.append((node, True))  # schedule post-visit
+
+                for user in node.users:
+                    if color[user] == GRAY:
+                        raise RuntimeError(
+                            f"Cycle detected after graph surgery: "
+                            f"'{node.name}' → '{user.name}' forms a "
+                            f"back edge.  This indicates incorrect "
+                            f"node rewiring during fusion."
+                        )
+                    if color[user] == WHITE:
+                        stack.append((user, False))
 
     # ------------------------------------------------------------------
     # Public entry point
