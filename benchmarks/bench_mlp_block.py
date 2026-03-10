@@ -50,8 +50,8 @@ MIN_RUN_TIME: float = 5.0  # seconds, for Timer.blocked_autorange
 # the GPU clocks to ramp up and stabilise, preventing cold-start artifacts
 # (thermal throttling, DVFS ramp, driver init) from contaminating the
 # first measured mode.  20 dummy matmuls at full problem size is enough to
-# trigger boost clocks on laptop GPUs (RTX 4050/4060/4070).
-GPU_WARMUP_ITERS: int = 50
+# trigger boost clocks on laptop GPUs (RTX 4050/4060/4070); 25 is conservative.
+GPU_WARMUP_ITERS: int = 25
 
 L2_FLUSH_SIZE_BYTES: int = 128 * 1024 * 1024  # 128 MB (exceeds all known GPU L2 caches)
 

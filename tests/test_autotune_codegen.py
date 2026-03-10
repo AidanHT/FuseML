@@ -24,7 +24,7 @@ from fuseml.codegen.kernel_generator import (
     _AUTOTUNE_BLOCK_K_CHOICES,
     _AUTOTUNE_BLOCK_M_CHOICES,
     _AUTOTUNE_BLOCK_N_CHOICES,
-    _AUTOTUNE_GROUP_SIZE_M,
+    _AUTOTUNE_GROUP_SIZE_M_CHOICES,
     _AUTOTUNE_NUM_STAGES_CHOICES,
     _AUTOTUNE_NUM_WARPS_CHOICES,
     _AUTOTUNE_REDUCTION_NUM_WARPS_CHOICES,
@@ -125,19 +125,19 @@ class TestAutotuneConstants:
         assert _AUTOTUNE_SRAM_BUDGET_BYTES == 100 * 1024
 
     def test_block_m_choices(self):
-        assert _AUTOTUNE_BLOCK_M_CHOICES == (64, 128)
+        assert _AUTOTUNE_BLOCK_M_CHOICES == (32, 64, 128, 256)
 
     def test_block_n_choices(self):
-        assert _AUTOTUNE_BLOCK_N_CHOICES == (64, 128)
+        assert _AUTOTUNE_BLOCK_N_CHOICES == (32, 64, 128, 256)
 
     def test_block_k_choices(self):
-        assert _AUTOTUNE_BLOCK_K_CHOICES == (32, 64)
+        assert _AUTOTUNE_BLOCK_K_CHOICES == (32, 64, 128)
 
     def test_num_warps_choices(self):
-        assert _AUTOTUNE_NUM_WARPS_CHOICES == (4, 8)
+        assert _AUTOTUNE_NUM_WARPS_CHOICES == (4, 8, 16)
 
     def test_num_stages_choices(self):
-        assert _AUTOTUNE_NUM_STAGES_CHOICES == (3, 5)
+        assert _AUTOTUNE_NUM_STAGES_CHOICES == (2, 3, 4, 5)
 
     def test_reduction_num_warps_includes_16(self):
         assert 16 in _AUTOTUNE_REDUCTION_NUM_WARPS_CHOICES
@@ -147,8 +147,8 @@ class TestAutotuneConstants:
         for w in _AUTOTUNE_NUM_WARPS_CHOICES:
             assert w in _AUTOTUNE_REDUCTION_NUM_WARPS_CHOICES
 
-    def test_group_size_m(self):
-        assert _AUTOTUNE_GROUP_SIZE_M == 8
+    def test_group_size_m_choices(self):
+        assert _AUTOTUNE_GROUP_SIZE_M_CHOICES == (4, 8, 16)
 
     def test_dtype_bytes_fp32(self):
         assert _DTYPE_BYTES[torch.float32] == 4
@@ -217,7 +217,7 @@ class TestBuildAutotuneConfigs:
     """Verify _build_autotune_configs generates the full Cartesian product."""
 
     def test_standard_config_count(self):
-        """Standard (non-reduction) config count = |M| * |N| * |K| * |warps| * |stages|."""
+        """Standard (non-reduction) config count = |M| * |N| * |K| * |warps| * |stages| * |gsm|."""
         configs = TritonKernelGenerator._build_autotune_configs(torch.float32)
         expected = (
             len(_AUTOTUNE_BLOCK_M_CHOICES)
@@ -225,6 +225,7 @@ class TestBuildAutotuneConfigs:
             * len(_AUTOTUNE_BLOCK_K_CHOICES)
             * len(_AUTOTUNE_NUM_WARPS_CHOICES)
             * len(_AUTOTUNE_NUM_STAGES_CHOICES)
+            * len(_AUTOTUNE_GROUP_SIZE_M_CHOICES)
         )
         assert len(configs) == expected
 
@@ -240,11 +241,11 @@ class TestBuildAutotuneConfigs:
         warp_counts = {c["num_warps"] for c in configs}
         assert 16 in warp_counts
 
-    def test_standard_configs_max_8_warps(self):
-        """Standard configs should not exceed 8 warps."""
+    def test_standard_configs_max_16_warps(self):
+        """Standard configs should not exceed 16 warps."""
         configs = TritonKernelGenerator._build_autotune_configs(torch.float32, False)
         max_warps = max(c["num_warps"] for c in configs)
-        assert max_warps == 8
+        assert max_warps == 16
 
     def test_all_configs_have_required_keys(self):
         """Every config must have all six required keys."""
@@ -254,11 +255,11 @@ class TestBuildAutotuneConfigs:
         for cfg in configs:
             assert set(cfg.keys()) == required
 
-    def test_group_size_m_is_constant(self):
-        """All configs share the same GROUP_SIZE_M."""
+    def test_group_size_m_in_choices(self):
+        """All configs have a GROUP_SIZE_M from the choices tuple."""
         configs = TritonKernelGenerator._build_autotune_configs(torch.float32)
         for cfg in configs:
-            assert cfg["GROUP_SIZE_M"] == _AUTOTUNE_GROUP_SIZE_M
+            assert cfg["GROUP_SIZE_M"] in _AUTOTUNE_GROUP_SIZE_M_CHOICES
 
     def test_block_sizes_are_powers_of_two(self):
         """All tile dimensions must be powers of two."""
@@ -483,12 +484,14 @@ class TestGenerateAutotuneConfigs:
         assert config_count > 0
         # All configs in the output are SRAM-safe (verified by the pruning logic)
 
-    def test_reduction_has_more_configs_or_higher_warps(self, gen, matmul_inputs_fp32, output_fp32):
-        """Reduction mode should produce configs with higher warp counts."""
+    def test_reduction_has_more_configs_or_extra_warps(self, gen, matmul_inputs_fp32, output_fp32):
+        """Reduction mode should produce more configs (superset warp choices)."""
         standard = gen.generate_autotune_configs(matmul_inputs_fp32, output_fp32, False)
         reduction = gen.generate_autotune_configs(matmul_inputs_fp32, output_fp32, True)
         assert "num_warps=16" in reduction
-        assert "num_warps=16" not in standard
+        # Reduction includes num_warps=2 which standard does not.
+        assert "num_warps=2" in reduction
+        assert "num_warps=2" not in standard
 
     def test_fp16_generates_configs(self, gen, matmul_inputs_fp16, output_fp16):
         """FP16 inputs should generate valid autotune configs."""
@@ -586,13 +589,13 @@ class TestReductionSpecialisation:
         warp_counts = {c["num_warps"] for c in configs}
         assert 16 in warp_counts
 
-    def test_standard_configs_lack_16_warps(self):
-        """Standard (non-reduction) configs must NOT include num_warps=16."""
+    def test_standard_configs_lack_2_warps(self):
+        """Standard (non-reduction) configs must NOT include num_warps=2."""
         configs = TritonKernelGenerator._build_autotune_configs(
             torch.float32, has_reduction=False,
         )
         warp_counts = {c["num_warps"] for c in configs}
-        assert 16 not in warp_counts
+        assert 2 not in warp_counts
 
     def test_reduction_still_includes_lower_warps(self):
         """Reduction configs should still include 4 and 8 warps."""

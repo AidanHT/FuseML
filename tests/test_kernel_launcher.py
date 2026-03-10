@@ -476,13 +476,13 @@ class TestSelectNumWarps:
         """FP32 with moderate tile size → 4 warps."""
         assert _select_num_warps(128, 256, torch.float32) == 4
 
-    def test_fp16_large_returns_8(self):
-        """FP16 with large tile (>= 4096 elements) → 8 warps for tensor cores."""
-        assert _select_num_warps(128, 256, torch.float16) == 8
+    def test_fp16_large_returns_16(self):
+        """FP16 with very large tile (>= 16384 elements) → 16 warps for tensor cores."""
+        assert _select_num_warps(128, 256, torch.float16) == 16
 
-    def test_bf16_large_returns_8(self):
+    def test_bf16_large_returns_16(self):
         """BF16 behaves like FP16."""
-        assert _select_num_warps(128, 256, torch.bfloat16) == 8
+        assert _select_num_warps(128, 256, torch.bfloat16) == 16
 
     def test_fp16_small_tile_returns_4(self):
         """FP16 with tile area < 4096 but >= 1024 → 4 warps (not enough to justify 8)."""
@@ -585,8 +585,8 @@ class TestKernelLaunchHeuristics:
         b = torch.randn(64, 256)
         launcher(a, b)
         call = mock_kernel_fn.calls[0]
-        # M=128, N=256 → tile_area=32768 >= 4096 and FP16 → 8 warps
-        assert call["kwargs"]["num_warps"] == 8
+        # M=128, N=256 → tile_area=32768 >= 16384 and FP16 → 16 warps
+        assert call["kwargs"]["num_warps"] == 16
 
 
 # ---------------------------------------------------------------------------
@@ -1316,8 +1316,8 @@ class TestComputeLaunchParams:
     def test_fp16_gets_more_warps(self):
         lp_fp32 = compute_launch_params(128, 256, 64, torch.float32)
         lp_fp16 = compute_launch_params(128, 256, 64, torch.float16)
-        # FP16 large tile → 8 warps; FP32 → 4 warps
-        assert lp_fp16.num_warps == 8
+        # FP16 very large tile (128*128=16384) → 16 warps; FP32 → 4 warps
+        assert lp_fp16.num_warps == 16
         assert lp_fp32.num_warps == 4
 
     def test_sram_downscale_bumps_stages(self):

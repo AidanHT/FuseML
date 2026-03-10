@@ -89,7 +89,7 @@ _DEFAULT_SRAM_BUDGET_BYTES: int = _FALLBACK_SRAM_BUDGET_BYTES
 _BLOCK_M_CHOICES: tuple[int, ...] = (32, 64, 128, 256)
 _BLOCK_N_CHOICES: tuple[int, ...] = (32, 64, 128, 256)
 _BLOCK_K_CHOICES: tuple[int, ...] = (32, 64, 128)
-_NUM_WARPS_CHOICES: tuple[int, ...] = (2, 4, 8)
+_NUM_WARPS_CHOICES: tuple[int, ...] = (2, 4, 8, 16)
 _NUM_STAGES_CHOICES: tuple[int, ...] = (2, 3, 4, 5)
 
 # Minimum block dimension — below 16 launch overhead dominates compute.
@@ -391,11 +391,11 @@ class SRAMAutotuner:
 
         # ── Tile area bonus ──────────────────────────────────────────
         tile_area = cfg.block_m * cfg.block_n
-        # Normalise to [0, 1] range — 128×128 = 16384 is the max.
+        # Normalise to [0, 1] range — 256×256 = 65536 is the max.
         # For small problems, large tiles waste resources — cap the
         # effective area at the problem area.
         effective_area = min(tile_area, max(M, 1) * max(N, 1))
-        area_score = min(effective_area / 16384.0, 1.0)
+        area_score = min(effective_area / 65536.0, 1.0)
 
         # ── SRAM utilisation (closer to budget = better reuse) ───────
         sram_util = cfg.sram_bytes / _DEFAULT_SRAM_BUDGET_BYTES
@@ -406,6 +406,9 @@ class SRAMAutotuner:
         if tile_area < 1024:
             # Tiny tile — prefer 2 warps to avoid scheduling overhead.
             warp_score = 1.2 if cfg.num_warps == 2 else 0.8
+        elif is_half and tile_area >= 16384:
+            # Very large half-precision tile — 16 warps saturate tensor cores.
+            warp_score = 1.3 if cfg.num_warps == 16 else (1.1 if cfg.num_warps >= 8 else 0.8)
         elif is_half and tile_area >= 4096:
             # Large half-precision tile — 8 warps saturate tensor cores.
             warp_score = 1.2 if cfg.num_warps >= 8 else 0.9

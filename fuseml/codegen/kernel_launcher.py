@@ -154,6 +154,8 @@ def _select_num_warps(
     if tile_area < 1024:
         return 2
     is_half = dtype in (torch.float16, torch.bfloat16)
+    if is_half and tile_area >= 16384:
+        return 16
     if is_half and tile_area >= 4096:
         return 8
     return 4

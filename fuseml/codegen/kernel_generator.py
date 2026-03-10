@@ -99,7 +99,8 @@ _AUTOTUNE_SRAM_BUDGET_BYTES: int = _DEFAULT_SRAM_BUDGET_BYTES
 # Candidate tile dimensions for autotune config generation.
 # Covers small tiles (32) for occupancy on low-SM-count laptop GPUs
 # through large tiles (256) for data reuse on high-end desktop GPUs.
-# SRAM pruning keeps the effective config count manageable.
+# SRAM pruning + heuristic filtering keeps the effective config count
+# manageable (target < 100 surviving configs).
 _AUTOTUNE_BLOCK_M_CHOICES: tuple[int, ...] = (32, 64, 128, 256)
 _AUTOTUNE_BLOCK_N_CHOICES: tuple[int, ...] = (32, 64, 128, 256)
 _AUTOTUNE_BLOCK_K_CHOICES: tuple[int, ...] = (32, 64, 128)
@@ -109,12 +110,12 @@ _AUTOTUNE_BLOCK_K_CHOICES: tuple[int, ...] = (32, 64, 128)
 # stage counts (up to 5) improve latency hiding by overlapping more
 # cp.async copies with Tensor Core compute, but increase register
 # pressure.  The autotuner selects the optimal balance at runtime.
-_AUTOTUNE_NUM_WARPS_CHOICES: tuple[int, ...] = (2, 4, 8)
+_AUTOTUNE_NUM_WARPS_CHOICES: tuple[int, ...] = (4, 8, 16)
 _AUTOTUNE_NUM_STAGES_CHOICES: tuple[int, ...] = (2, 3, 4, 5)
 
 # Reduction-specialised warp counts — higher counts saturate the SMs
 # during tl.atomic_add / tl.atomic_max cross-thread synchronisation.
-_AUTOTUNE_REDUCTION_NUM_WARPS_CHOICES: tuple[int, ...] = (4, 8, 16)
+_AUTOTUNE_REDUCTION_NUM_WARPS_CHOICES: tuple[int, ...] = (2, 4, 8, 16)
 
 # L2 swizzle group width candidates — controls how many M-blocks are
 # grouped in the 1-D → 2-D block-index mapping.  Different values suit
@@ -416,6 +417,40 @@ class TritonKernelGenerator:
         return survivors
 
     @staticmethod
+    def _prune_configs_by_heuristic(configs: list[dict]) -> list[dict]:
+        """Remove configs that are obviously sub-optimal via cheap heuristics.
+
+        Applied after SRAM pruning to keep the surviving config count
+        under ~100, limiting first-run Triton JIT compilation time.
+
+        Rules:
+        * 16 warps only make sense with large tiles (area >= 16384).
+        * GROUP_SIZE_M=16 is wasteful with very small spatial tiles.
+        * BLOCK_K=128 with num_stages > 2 almost always exceeds SRAM
+          for useful spatial tile sizes — any that survived SRAM pruning
+          are likely tiny spatial tiles where BLOCK_K=128 is overkill.
+        """
+        survivors: list[dict] = []
+        for cfg in configs:
+            tile_area = cfg["BLOCK_SIZE_M"] * cfg["BLOCK_SIZE_N"]
+            # 16 warps are wasted on small tiles.
+            if cfg["num_warps"] == 16 and tile_area < 16384:
+                continue
+            # BLOCK_K=128 + deep pipelining is almost never SRAM-safe
+            # for useful spatial tiles; skip to avoid compiling duds.
+            if cfg["BLOCK_SIZE_K"] == 128 and cfg["num_stages"] > 2:
+                continue
+            # GROUP_SIZE_M=16 is excessive for tiny output tiles.
+            if cfg["GROUP_SIZE_M"] == 16 and tile_area < 4096:
+                continue
+            survivors.append(cfg)
+        logger.debug(
+            "Heuristic pruning — %d / %d configs survive",
+            len(survivors), len(configs),
+        )
+        return survivors
+
+    @staticmethod
     def _section_autotune_decorator(
         configs: list[dict],
     ) -> str:
@@ -503,10 +538,12 @@ class TritonKernelGenerator:
         pruned = self._prune_configs_by_sram(
             all_configs, operand_dtype, sram_budget=_get_sram_budget(),
         )
+        pruned = self._prune_configs_by_heuristic(pruned)
 
-        logger.debug(
-            "Autotune config generation — %d configs after SRAM pruning "
-            "(dtype=%s, reduction=%s)",
+        logger.info(
+            "Autotune config generation — %d configs after SRAM + heuristic "
+            "pruning (dtype=%s, reduction=%s).  First-run JIT compilation "
+            "may take 1-3 minutes on laptop GPUs.",
             len(pruned), operand_dtype, has_reduction,
         )
 

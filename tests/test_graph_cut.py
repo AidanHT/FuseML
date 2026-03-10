@@ -127,12 +127,16 @@ class TestSupportedTritonOps:
             assert SUPPORTED_TRITON_OPS[op] == "reduction"
 
     def test_does_not_contain_barrier_ops(self):
-        """Barrier ops like softmax / layernorm must NOT be in the supported set."""
+        """Barrier ops like softmax / layernorm must NOT be in the supported set.
+
+        Note: mm.default and addmm.default are dual-role — they are barriers
+        for forward absorption but also supported GEMM triggers that Triton
+        compiles.  They intentionally belong in SUPPORTED_TRITON_OPS.
+        """
         barrier_ops = [
             torch.ops.aten._softmax.default,
             torch.ops.aten._log_softmax.default,
             torch.ops.aten.native_layer_norm.default,
-            torch.ops.aten.mm.default,
             torch.ops.aten.bmm.default,
             torch.ops.aten.convolution.default,
         ]

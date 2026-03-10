@@ -89,7 +89,8 @@ TRANSPARENT_OPS: Set[Callable] = {
     torch.ops.aten.squeeze.dim,
     torch.ops.aten.expand.default,
     torch.ops.aten.permute.default,
-    torch.ops.aten.t.default,
+    # aten.t.default intentionally NOT here — it swaps dimensions,
+    # which breaks matmul operand identification in the kernel generator.
     torch.ops.aten.slice.Tensor,
     torch.ops.aten.select.int,
 }
@@ -279,26 +280,56 @@ _BYTES_PER_ELEM: Dict[Any, int] = {
     torch.int8: 1,
 }
 
-# Total FLOP threshold above which cuBLAS outperforms custom Triton GEMM.
-#
-# The tradeoff: a custom Triton GEMM + fused epilogue eliminates one HBM
-# round-trip (saving ~2·M·N·bpe bytes of traffic), but achieves lower
-# compute throughput than cuBLAS (~60-70% efficiency vs cuBLAS's ~90%+).
-#
-# For small GEMMs (< threshold), the HBM savings and reduced kernel
-# launch overhead outweigh the lower compute throughput.  For large GEMMs
-# (> threshold), cuBLAS's superior compute throughput dominates and the
-# relative HBM savings become negligible.
-#
-# Calibrated for Ada Lovelace (RTX 4050/4060/4070/4090):
-#   - 10 TFLOP crossover: fusion wins below, cuBLAS wins above.
-#   - On laptop GPUs running far below peak TFLOPS, the HBM savings
-#     from fusing GEMM+epilogue (eliminating one full M×N intermediate
-#     read+write) outweigh the Triton-vs-cuBLAS compute efficiency gap.
-#   - small  preset (M=128,  K=256,  N=1024):   67M FLOPs → fuse  ✓
-#   - medium preset (M=2048, K=1024, N=4096): 17.2G FLOPs → fuse  ✓
-#   - large  preset (M=16384,K=4096, N=16384): 2.2T FLOPs → fuse  ✓
-_COMPUTE_BOUND_FLOP_THRESHOLD: float = 1e13  # 10 TFLOP
+# Conservative static FLOP threshold — used as a fallback when GPU
+# properties cannot be queried.  500 GFLOP is low enough to catch
+# medium-to-large GEMMs where cuBLAS's superior compute throughput
+# outweighs the HBM savings from Triton epilogue fusion.
+_COMPUTE_BOUND_FLOP_THRESHOLD: float = 5e11  # 500 GFLOP
+
+# Empirical efficiency gap between Triton GEMM and cuBLAS on Ada
+# Lovelace.  Triton achieves roughly 85-90% of cuBLAS throughput,
+# so the penalty is ~12% of GEMM execution time.
+_TRITON_VS_CUBLAS_EFFICIENCY_GAP: float = 0.12
+
+
+def _get_gpu_specs() -> Tuple[float, float] | None:
+    """Query peak FLOPS (half-precision) and memory bandwidth from the GPU.
+
+    Returns ``(peak_flops_hz, bandwidth_bytes_per_sec)`` or ``None``
+    when CUDA is unavailable.
+    """
+    try:
+        if not torch.cuda.is_available():
+            return None
+        props = torch.cuda.get_device_properties(torch.cuda.current_device())
+        # Peak FP16 Tensor Core FLOPS ≈ SM_count × clock_GHz × FMA_ops_per_SM
+        # For Ada (sm_89): 128 FP16 FMA ops/SM/cycle × 2 (FMA = 2 ops)
+        sm_count = props.multi_processor_count
+        clock_hz = props.clock_rate * 1000  # clock_rate is in kHz
+        # Ada: 128 FP16 FMA per SM per cycle = 256 FP16 ops per SM per cycle
+        # Ampere: same.  This is a reasonable estimate across architectures.
+        fp16_ops_per_sm_per_cycle = 256
+        peak_flops = sm_count * clock_hz * fp16_ops_per_sm_per_cycle
+
+        # Memory bandwidth from total_memory and memory_clock is unreliable
+        # (no bus width in props).  Use a conservative lookup by SM count.
+        # RTX 4050 Laptop (20 SM): ~192 GB/s
+        # RTX 4060 (24 SM): ~272 GB/s
+        # RTX 4070 (46 SM): ~504 GB/s
+        # RTX 4090 (128 SM): ~1008 GB/s
+        # Fallback: 192 GB/s (conservative laptop estimate).
+        if sm_count >= 100:
+            bandwidth = 1008e9
+        elif sm_count >= 40:
+            bandwidth = 504e9
+        elif sm_count >= 22:
+            bandwidth = 272e9
+        else:
+            bandwidth = 192e9
+
+        return (peak_flops, bandwidth)
+    except Exception:
+        return None
 
 
 def is_compute_bound_gemm(
@@ -306,28 +337,65 @@ def is_compute_bound_gemm(
 ) -> bool:
     """Return ``True`` if a GEMM with dimensions (M, N, K) is compute-bound.
 
-    Uses total FLOP count (``2·M·N·K``) rather than arithmetic intensity
-    to decide whether cuBLAS should handle the matmul.  This captures the
-    key tradeoff: for small GEMMs the HBM savings from fusion outweigh
-    the slower Triton compute throughput, while for large GEMMs cuBLAS's
-    optimised inner loops (CUTLASS tiles, persistent kernels, split-K)
-    dominate and the relative HBM savings become negligible.
+    Uses an **adaptive cost model** that compares the time penalty from
+    Triton's lower compute throughput against the time saved by
+    eliminating one HBM round-trip (the fusion benefit).
+
+    When GPU properties are available::
+
+        penalty_time = (2·M·N·K / gpu_peak_flops) × efficiency_gap
+        savings_time = (2·M·N·bpe) / gpu_bandwidth
+
+    If ``penalty_time > savings_time``, cuBLAS should handle the matmul.
+
+    Falls back to a static 500 GFLOP threshold when GPU specs cannot
+    be queried.
 
     Parameters
     ----------
     M, N, K :
         Matrix dimensions.
     dtype :
-        Element precision (unused in FLOP-based check, kept for API
-        compatibility and potential future dtype-specific thresholds).
+        Element precision — determines bytes per element for the HBM
+        savings calculation.
 
     Returns
     -------
     bool
-        ``True`` when the GEMM is large enough that cuBLAS should be
-        preferred over a custom Triton fused kernel.
+        ``True`` when cuBLAS should be preferred over a custom Triton
+        fused kernel.
     """
     flops = 2.0 * M * N * K
+
+    # Try adaptive cost model first.
+    gpu_specs = _get_gpu_specs()
+    if gpu_specs is not None:
+        peak_flops, bandwidth = gpu_specs
+        if peak_flops > 0 and bandwidth > 0:
+            bpe = _BYTES_PER_ELEM.get(dtype, 2)
+            # Time penalty from using Triton instead of cuBLAS.
+            gemm_time = flops / peak_flops
+            penalty_time = gemm_time * _TRITON_VS_CUBLAS_EFFICIENCY_GAP
+            # Time saved by eliminating one M×N intermediate read+write.
+            hbm_savings_bytes = 2.0 * M * N * bpe
+            savings_time = hbm_savings_bytes / bandwidth
+            if penalty_time > savings_time:
+                logger.debug(
+                    "Adaptive compute-bound check — M=%d, N=%d, K=%d: "
+                    "penalty=%.3f ms > savings=%.3f ms → skip fusion",
+                    M, N, K,
+                    penalty_time * 1000, savings_time * 1000,
+                )
+                return True
+            logger.debug(
+                "Adaptive compute-bound check — M=%d, N=%d, K=%d: "
+                "penalty=%.3f ms <= savings=%.3f ms → fuse",
+                M, N, K,
+                penalty_time * 1000, savings_time * 1000,
+            )
+            return False
+
+    # Fallback: static threshold.
     return flops > _COMPUTE_BOUND_FLOP_THRESHOLD
 
 

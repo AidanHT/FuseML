@@ -590,19 +590,19 @@ class TestAutotunerConstants:
         assert _DEFAULT_SRAM_BUDGET_BYTES == 100 * 1024
 
     def test_block_m_choices(self):
-        assert _BLOCK_M_CHOICES == (32, 64, 128)
+        assert _BLOCK_M_CHOICES == (32, 64, 128, 256)
 
     def test_block_n_choices(self):
-        assert _BLOCK_N_CHOICES == (32, 64, 128)
+        assert _BLOCK_N_CHOICES == (32, 64, 128, 256)
 
     def test_block_k_choices(self):
-        assert _BLOCK_K_CHOICES == (32, 64)
+        assert _BLOCK_K_CHOICES == (32, 64, 128)
 
     def test_num_warps_includes_2(self):
         assert 2 in _NUM_WARPS_CHOICES
 
     def test_num_warps_choices(self):
-        assert _NUM_WARPS_CHOICES == (2, 4, 8)
+        assert _NUM_WARPS_CHOICES == (2, 4, 8, 16)
 
     def test_num_stages_choices(self):
         assert _NUM_STAGES_CHOICES == (2, 3, 4, 5)
@@ -637,13 +637,13 @@ class TestConfigCounts:
             * len(_NUM_WARPS_CHOICES)
             * len(_NUM_STAGES_CHOICES)
         )
-        # 3 * 3 * 2 * 3 * 4 = 216
-        assert total == 216
+        # 4 * 4 * 3 * 4 * 4 = 768
+        assert total == 768
 
     def test_fp32_safe_configs_less_than_total(self):
         """Not all configs fit in 100 KB at FP32 — some should be pruned."""
         all_configs = list(generate_sram_safe_configs(torch.float32))
-        assert len(all_configs) < 216
+        assert len(all_configs) < 768
 
     def test_fp16_safe_configs_at_least_fp32(self):
         """FP16 should have at least as many safe configs as FP32."""
