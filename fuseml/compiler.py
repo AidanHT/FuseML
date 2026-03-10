@@ -274,7 +274,13 @@ class FuseMLCompiler:
                     found += 1
                 if is_trigger(node):
                     has_any_trigger = True
-                    if not FuseMLFusionPass._is_compute_bound_trigger(
+                    if FuseMLFusionPass._is_tiny_output(node):
+                        logger.debug(
+                            "Tiny GEMM trigger %s — skipping (output "
+                            "too small for profitable fusion).",
+                            node.name,
+                        )
+                    elif not FuseMLFusionPass._is_compute_bound_trigger(
                         node, min_penalty=100e-6,
                     ):
                         has_fusible_trigger = True  # Triton-fusible

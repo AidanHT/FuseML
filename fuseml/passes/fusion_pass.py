@@ -455,6 +455,48 @@ class FuseMLFusionPass:
 
         return is_compute_bound_gemm(M, N, K, dtype, num_epilogue_ops, min_penalty=min_penalty)
 
+    # Minimum output elements for profitable Triton fusion.
+    # Below this threshold, Triton dispatch overhead (~20-50 us) exceeds
+    # the HBM savings from fusing one elementwise op (~10 us at 500K
+    # elements, bf16, 192 GB/s).  Skip fusion to avoid regressions on
+    # tiny GEMMs where eager PyTorch is faster.
+    _MIN_FUSION_OUTPUT_ELEMENTS: int = 500_000
+
+    @staticmethod
+    def _is_tiny_output(node: torch.fx.Node) -> bool:
+        """Return ``True`` if the trigger's output is too small for Triton."""
+        if len(node.args) < 3:
+            return False
+
+        input_node = node.args[1]
+        weight_node = node.args[2]
+
+        def _get_shape(n):
+            if not isinstance(n, torch.fx.Node):
+                return None
+            meta = n.meta.get("tensor_meta")
+            if meta is not None and hasattr(meta, "shape"):
+                return meta.shape
+            val = n.meta.get("val")
+            if val is not None and hasattr(val, "shape"):
+                return val.shape
+            return None
+
+        input_shape = _get_shape(input_node)
+        weight_shape = _get_shape(weight_node)
+        if input_shape is None or weight_shape is None:
+            return False
+        if len(input_shape) < 2 or len(weight_shape) < 2:
+            return False
+
+        try:
+            M = int(input_shape[-2])
+            N = int(weight_shape[-1])
+        except (TypeError, ValueError):
+            return False
+
+        return M * N < FuseMLFusionPass._MIN_FUSION_OUTPUT_ELEMENTS
+
     @staticmethod
     def _collect_external_inputs(
         node: torch.fx.Node,

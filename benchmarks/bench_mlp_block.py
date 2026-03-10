@@ -127,23 +127,41 @@ def _fuseml_breakdown(M: int, D: int, I: int, bpe: int) -> dict[str, int]:
     }
 
 
-def _cublas_epilogue_breakdown(M: int, D: int, I: int, bpe: int) -> dict[str, int]:
-    """HBM traffic for full cuBLAS epilogue fusion (2 kernels).
+def _cublas_epilogue_partial_breakdown(M: int, D: int, I: int, bpe: int) -> dict[str, int]:
+    """HBM traffic when only the first GEMM (addmm+GeLU) is fused via cublasLt.
 
-    Kernel 1: cublasLt(addmm + GeLU) — reads inputs, writes GeLU output
-    directly.  No intermediate M×I write+read for standalone GeLU.
-
-    Kernel 2: cublasLt(addmm + bias + residual) — reads inputs + residual,
-    writes final output.  No separate add kernel — the residual is fused
-    via cublasLt's BIAS_POINTER epilogue with beta=1, C=residual.
+    The second GEMM (addmm+add) falls back to eager (2 separate kernels).
+    Total: 3 kernels.
     """
     return {
-        # Kernel 1: cublasLt(addmm + GeLU fused)
+        # Kernel 1: cublasLt(addmm + GeLU fused) — no intermediate
         "K1_read_x": M * D * bpe,
         "K1_read_W1": D * I * bpe,
         "K1_read_bias1": I * bpe,
         "K1_write_gelu_out": M * I * bpe,
-        # Kernel 2: cublasLt(addmm + bias + residual fused)
+        # Kernel 2: cuBLAS addmm (eager, unfused)
+        "K2_read_gelu_out": M * I * bpe,
+        "K2_read_W2": I * D * bpe,
+        "K2_read_bias2": D * bpe,
+        "K2_write_linear2": M * D * bpe,
+        # Kernel 3: add (eager, separate)
+        "K3_read_linear2": M * D * bpe,
+        "K3_read_residual": M * D * bpe,
+        "K3_write_final": M * D * bpe,
+    }
+
+
+def _cublas_epilogue_full_breakdown(M: int, D: int, I: int, bpe: int) -> dict[str, int]:
+    """HBM traffic when BOTH groups are fused via cublasLt (2 kernels).
+
+    Kernel 1: cublasLt(addmm + GeLU).
+    Kernel 2: cublasLt(addmm + bias + residual).
+    """
+    return {
+        "K1_read_x": M * D * bpe,
+        "K1_read_W1": D * I * bpe,
+        "K1_read_bias1": I * bpe,
+        "K1_write_gelu_out": M * I * bpe,
         "K2_read_gelu_out": M * I * bpe,
         "K2_read_W2": I * D * bpe,
         "K2_read_bias2": D * bpe,
@@ -201,9 +219,11 @@ def compute_hbm_traffic(
         # FuseML fuses elementwise post-ops into GEMM epilogues.
         breakdown = _fuseml_breakdown(M, D, I, bpe)
     elif mode == "cublas_epilogue":
-        # cuBLAS epilogue: GeLU fused into first GEMM via cublasLt,
-        # second GEMM + residual add run as separate kernels.
-        breakdown = _cublas_epilogue_breakdown(M, D, I, bpe)
+        # Full cuBLAS epilogue: both groups fused (2 kernels).
+        breakdown = _cublas_epilogue_full_breakdown(M, D, I, bpe)
+    elif mode == "cublas_epilogue_partial":
+        # Partial: only addmm+GeLU fused, addmm+add stays eager (3 kernels).
+        breakdown = _cublas_epilogue_partial_breakdown(M, D, I, bpe)
     else:
         raise ValueError(f"Unknown mode: {mode!r}")
 
@@ -461,33 +481,53 @@ def print_header(args: argparse.Namespace, M: int, gpu_name: str) -> None:
     print(sep)
 
 
-def print_results_table(results: list[BenchmarkResult]) -> None:
+def _kernel_count_for_mode(mode_key: str) -> int:
+    """Return the expected CUDA kernel count for a given HBM mode."""
+    return {
+        "eager": 4,
+        "fuseml": 2,
+        "cublas_epilogue": 2,
+        "cublas_epilogue_partial": 3,
+    }.get(mode_key, 4)
+
+
+def print_results_table(
+    results: list[BenchmarkResult],
+    mode_keys: dict[str, str] | None = None,
+) -> None:
     """Print a formatted ASCII table of benchmark results."""
+    mode_keys = mode_keys or {}
     header = (
-        f"+{'':->14}+{'':->14}+{'':->10}+{'':->12}+{'':->12}+\n"
-        f"| {'Mode':<12} | {'Latency (ms)':>12} | {'IQR (ms)':>8} | {'HBM* (MB)':>10} | {'BW* (GB/s)':>10} |\n"
-        f"+{'':->14}+{'':->14}+{'':->10}+{'':->12}+{'':->12}+"
+        f"+{'':->14}+{'':->14}+{'':->10}+{'':->12}+{'':->12}+{'':->10}+\n"
+        f"| {'Mode':<12} | {'Latency (ms)':>12} | {'IQR (ms)':>8} "
+        f"| {'HBM* (MB)':>10} | {'BW* (GB/s)':>10} | {'Kernels':>8} |\n"
+        f"+{'':->14}+{'':->14}+{'':->10}+{'':->12}+{'':->12}+{'':->10}+"
     )
     print(f"\n{header}")
     for r in results:
+        mk = mode_keys.get(r.mode, r.mode.lower())
+        kcount = _kernel_count_for_mode(mk)
         print(
             f"| {r.mode:<12} "
             f"| {r.latency_ms:>12.2f} "
             f"| {r.iqr_ms:>8.2f} "
             f"| {r.hbm_traffic.total_mb:>10.1f} "
-            f"| {r.throughput_gb_s:>10.1f} |"
+            f"| {r.throughput_gb_s:>10.1f} "
+            f"| {kcount:>8} |"
         )
-    print(f"+{'':->14}+{'':->14}+{'':->10}+{'':->12}+{'':->12}+")
+    print(f"+{'':->14}+{'':->14}+{'':->10}+{'':->12}+{'':->12}+{'':->10}+")
     print("  * HBM/BW are analytical estimates, not measured.  Use `ncu` for actual DRAM traffic.")
 
 
-def print_speedup_summary(results: list[BenchmarkResult]) -> None:
-    """Print speedup ratios and HBM savings relative to eager mode."""
+def print_speedup_summary(
+    results: list[BenchmarkResult],
+    fuseml_compiler: object | None = None,
+) -> None:
+    """Print speedup ratios, HBM savings, and fusion info."""
     eager = next((r for r in results if r.mode == "Eager"), None)
     if eager is None:
         return
 
-    # Speedup
     parts: list[str] = []
     for r in results:
         if r.mode == "Eager":
@@ -497,7 +537,6 @@ def print_speedup_summary(results: list[BenchmarkResult]) -> None:
     if parts:
         print(f"\nSpeedup vs Eager:  {'  |  '.join(parts)}")
 
-    # HBM savings (compare first non-eager mode that has different traffic)
     for r in results:
         if r.mode == "Eager":
             continue
@@ -509,6 +548,11 @@ def print_speedup_summary(results: list[BenchmarkResult]) -> None:
                 f"({pct:.1f}% reduction)"
             )
             break
+
+    if fuseml_compiler is not None:
+        strategy = getattr(fuseml_compiler, "fusion_strategy", "none")
+        applied = getattr(fuseml_compiler, "fusion_applied", False)
+        print(f"Fusion strategy:   {strategy}  (applied={applied})")
 
 
 # ---------------------------------------------------------------------------
@@ -623,13 +667,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--preset",
         type=str,
-        choices=["large", "medium", "small"],
+        choices=["large", "medium", "small", "memory_bound"],
         default=None,
         help=(
-            "Dimension presets: 'large' (default, compute-bound GEMMs — "
-            "cuBLAS wins), 'medium' (balanced), 'small' (memory-bound — "
-            "fusion wins).  Overrides --batch-size/--seq-len/--d-model/"
-            "--d-intermediate."
+            "Dimension presets: 'large' (compute-bound GEMMs — cuBLAS "
+            "epilogue fusion), 'medium' (balanced), 'small' (tiny — "
+            "overhead-dominated), 'memory_bound' (memory-bound GEMMs — "
+            "Triton fusion shines, 20-60%% speedup).  Overrides "
+            "--batch-size/--seq-len/--d-model/--d-intermediate."
         ),
     )
     return parser.parse_args()
@@ -659,9 +704,10 @@ def main() -> None:
 
     # -- Apply dimension preset (overrides individual CLI args) --
     _PRESETS = {
-        "small":  {"batch_size": 1, "seq_len": 128,  "d_model": 256,  "d_intermediate": 1024},
-        "medium": {"batch_size": 4, "seq_len": 512,  "d_model": 1024, "d_intermediate": 4096},
-        "large":  {"batch_size": 8, "seq_len": 2048, "d_model": 4096, "d_intermediate": 16384},
+        "small":        {"batch_size": 1,  "seq_len": 128,  "d_model": 256,  "d_intermediate": 1024},
+        "medium":       {"batch_size": 4,  "seq_len": 512,  "d_model": 1024, "d_intermediate": 4096},
+        "large":        {"batch_size": 8,  "seq_len": 2048, "d_model": 4096, "d_intermediate": 16384},
+        "memory_bound": {"batch_size": 32, "seq_len": 512,  "d_model": 256,  "d_intermediate": 1024},
     }
     if args.preset is not None:
         for k, v in _PRESETS[args.preset].items():
@@ -749,35 +795,44 @@ def main() -> None:
         print("  (no compiled backends available -- skipping)")
 
     # -- Compute HBM traffic estimates --
-    # Select the HBM model based on the compiler's actual fusion strategy:
-    # - No fusion applied → use eager traffic model
-    # - cuBLAS epilogue fusion → GeLU fused, residual add separate
-    # - Triton / mixed → full fusion traffic model
+    # Select the HBM model based on the compiler's actual fusion strategy.
+    # For cuBLAS epilogue, distinguish partial (only GELU fused) from full
+    # (both GELU and residual fused).  Partial is the common case since
+    # the cublasLt CUDA extension for residual fusion requires cl.exe.
+    mode_keys: dict[str, str] = {}
     traffic: dict[str, HBMTrafficEstimate] = {}
     for mode_name in compiled_models:
         if mode_name == "FuseML" and fuseml_compiler is not None:
             if not fuseml_compiler.fusion_applied:
                 mode_key = "eager"
             elif fuseml_compiler.fusion_strategy == "cublas_epilogue":
-                mode_key = "cublas_epilogue"
-            else:
+                mode_key = "cublas_epilogue_partial"
+            elif fuseml_compiler.fusion_strategy == "triton":
                 mode_key = "fuseml"
+            elif fuseml_compiler.fusion_strategy == "mixed":
+                mode_key = "fuseml"
+            else:
+                mode_key = "eager"
         else:
             mode_key = mode_name.lower()
+        mode_keys[mode_name] = mode_key
         traffic[mode_name] = compute_hbm_traffic(M, args.d_model, args.d_intermediate, dtype, mode_key)
 
-    # -- Print HBM traffic breakdown (always shown, even with only Eager) --
+    # -- Print HBM traffic breakdown --
     eager_traffic = traffic.get("Eager")
-    fused_traffic_est = compute_hbm_traffic(M, args.d_model, args.d_intermediate, dtype, "fuseml")
+    fuseml_traffic = traffic.get("FuseML")
+    fuseml_mode_key = mode_keys.get("FuseML", "eager")
+    fuseml_kcount = _kernel_count_for_mode(fuseml_mode_key)
     if eager_traffic:
-        saved_mb = eager_traffic.total_mb - fused_traffic_est.total_mb
-        print(f"\nHBM Traffic Estimate (analytical model — NOT measured):")
-        print(f"  These numbers are computed from matrix dimensions and dtype,")
-        print(f"  not from hardware performance counters.  Use NVIDIA Nsight")
-        print(f"  Compute (ncu) for actual DRAM traffic measurement.")
-        print(f"  Eager (4 kernels):  {eager_traffic.total_mb:,.1f} MB")
-        print(f"  Fused (2 kernels):  {fused_traffic_est.total_mb:,.1f} MB")
-        print(f"  Savings:            {saved_mb:,.1f} MB ({saved_mb / eager_traffic.total_mb * 100:.1f}% reduction)")
+        print(f"\nHBM Traffic Estimate (analytical model):")
+        print(f"  Eager ({_kernel_count_for_mode('eager')} kernels):  {eager_traffic.total_mb:,.1f} MB")
+        if fuseml_traffic and fuseml_traffic.total_mb != eager_traffic.total_mb:
+            saved_mb = eager_traffic.total_mb - fuseml_traffic.total_mb
+            pct = saved_mb / eager_traffic.total_mb * 100
+            print(f"  FuseML ({fuseml_kcount} kernels):  {fuseml_traffic.total_mb:,.1f} MB")
+            print(f"  Savings:            {saved_mb:,.1f} MB ({pct:.1f}% reduction)")
+        else:
+            print(f"  FuseML:             same as eager (no fusion applied)")
 
     # -- Run benchmarks --
     n_modes = len(compiled_models)
@@ -804,8 +859,8 @@ def main() -> None:
         )
 
     # -- Results --
-    print_results_table(results)
-    print_speedup_summary(results)
+    print_results_table(results, mode_keys=mode_keys)
+    print_speedup_summary(results, fuseml_compiler=fuseml_compiler)
 
     # -- Plot --
     if not args.no_plot:
