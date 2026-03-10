@@ -916,10 +916,27 @@ class FuseMLFusionPass:
             The same ``graph_module`` passed at construction, modified
             in-place with fused subgraphs replaced by Triton kernel calls.
         """
-        # --- Shape propagation (requires concrete example tensors) ----------
+        # --- Shape propagation (skip when torch.compile already provided metadata) ---
+        # torch.compile's abstract-interpretation pass populates node.meta["val"]
+        # with FakeTensors.  When this metadata is present, ShapeProp is
+        # redundant — all downstream code (compute-bound checks, output
+        # metadata extraction) already falls back to meta["val"].
         if example_inputs is not None:
-            logger.debug("Running ShapeProp with %d example input(s).", len(example_inputs))
-            ShapeProp(self.graph_module).propagate(*example_inputs)
+            has_faketensor_meta = any(
+                n.meta.get("val") is not None
+                for n in self.graph_module.graph.nodes
+                if n.op == "call_function"
+            )
+            if has_faketensor_meta:
+                logger.debug(
+                    "FakeTensor metadata already present — skipping ShapeProp."
+                )
+            else:
+                logger.debug(
+                    "Running ShapeProp with %d example input(s).",
+                    len(example_inputs),
+                )
+                ShapeProp(self.graph_module).propagate(*example_inputs)
 
         groups = self._find_fusion_groups()
 

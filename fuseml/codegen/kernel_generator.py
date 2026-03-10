@@ -68,36 +68,58 @@ _DTYPE_BYTES: dict[torch.dtype, int] = {
     torch.bfloat16: 2,
 }
 
-# Ada Lovelace (sm_89) SRAM budget — up to 100 KB configurable shared
-# memory per SM.  This is the primary target architecture.  Configs whose
-# shared-memory footprint exceeds this are pruned before writing the
-# @triton.autotune decorator, preventing "Out of Shared Memory" PTX
-# failures.  The budget accounts for both A-tile and B-tile buffers
-# across all software-pipeline stages.
-_AUTOTUNE_SRAM_BUDGET_BYTES: int = 100 * 1024
+# Default SRAM budget fallback — used when no CUDA device is available.
+# Ada Lovelace (sm_89) supports up to 100 KB configurable shared memory
+# per SM.  Configs whose shared-memory footprint exceeds the budget are
+# pruned before writing the @triton.autotune decorator, preventing
+# "Out of Shared Memory" PTX failures.
+_DEFAULT_SRAM_BUDGET_BYTES: int = 100 * 1024
+
+
+def _get_sram_budget() -> int:
+    """Query the GPU's actual shared memory capacity, with a static fallback.
+
+    Uses ``torch.cuda.get_device_properties`` to read the hardware's
+    maximum configurable shared memory per block (``max_shared_memory_per_block``).
+    Falls back to 100 KB when no CUDA device is available.
+    """
+    try:
+        if torch.cuda.is_available():
+            props = torch.cuda.get_device_properties(torch.cuda.current_device())
+            budget = getattr(props, "max_shared_memory_per_block", 0)
+            if budget > 0:
+                return budget
+    except Exception:
+        pass
+    return _DEFAULT_SRAM_BUDGET_BYTES
+
+
+_AUTOTUNE_SRAM_BUDGET_BYTES: int = _DEFAULT_SRAM_BUDGET_BYTES
 
 # Candidate tile dimensions for autotune config generation.
-# Kept small (~12 configs after SRAM pruning) to bound first-run
-# compilation time.  Covers the key performance-relevant axes:
-# tile size (occupancy vs. reuse) and pipeline depth (latency hiding).
-_AUTOTUNE_BLOCK_M_CHOICES: tuple[int, ...] = (64, 128)
-_AUTOTUNE_BLOCK_N_CHOICES: tuple[int, ...] = (64, 128)
-_AUTOTUNE_BLOCK_K_CHOICES: tuple[int, ...] = (32, 64)
+# Covers small tiles (32) for occupancy on low-SM-count laptop GPUs
+# through large tiles (256) for data reuse on high-end desktop GPUs.
+# SRAM pruning keeps the effective config count manageable.
+_AUTOTUNE_BLOCK_M_CHOICES: tuple[int, ...] = (32, 64, 128, 256)
+_AUTOTUNE_BLOCK_N_CHOICES: tuple[int, ...] = (32, 64, 128, 256)
+_AUTOTUNE_BLOCK_K_CHOICES: tuple[int, ...] = (32, 64, 128)
 
 # Standard warp counts and software-pipelining depths.
 # Ada uses cp.async (not TMA) for async global→shared copies.  Higher
 # stage counts (up to 5) improve latency hiding by overlapping more
 # cp.async copies with Tensor Core compute, but increase register
 # pressure.  The autotuner selects the optimal balance at runtime.
-_AUTOTUNE_NUM_WARPS_CHOICES: tuple[int, ...] = (4, 8)
-_AUTOTUNE_NUM_STAGES_CHOICES: tuple[int, ...] = (3, 5)
+_AUTOTUNE_NUM_WARPS_CHOICES: tuple[int, ...] = (2, 4, 8)
+_AUTOTUNE_NUM_STAGES_CHOICES: tuple[int, ...] = (2, 3, 4, 5)
 
 # Reduction-specialised warp counts — higher counts saturate the SMs
 # during tl.atomic_add / tl.atomic_max cross-thread synchronisation.
 _AUTOTUNE_REDUCTION_NUM_WARPS_CHOICES: tuple[int, ...] = (4, 8, 16)
 
-# Default L2 swizzle group width used in all autotune configs.
-_AUTOTUNE_GROUP_SIZE_M: int = 8
+# L2 swizzle group width candidates — controls how many M-blocks are
+# grouped in the 1-D → 2-D block-index mapping.  Different values suit
+# different matrix aspect ratios.
+_AUTOTUNE_GROUP_SIZE_M_CHOICES: tuple[int, ...] = (4, 8, 16)
 
 
 # ---------------------------------------------------------------------------
@@ -349,16 +371,17 @@ class TritonKernelGenerator:
         for bm in _AUTOTUNE_BLOCK_M_CHOICES:
             for bn in _AUTOTUNE_BLOCK_N_CHOICES:
                 for bk in _AUTOTUNE_BLOCK_K_CHOICES:
-                    for nw in warp_choices:
-                        for ns in _AUTOTUNE_NUM_STAGES_CHOICES:
-                            configs.append({
-                                "BLOCK_SIZE_M": bm,
-                                "BLOCK_SIZE_N": bn,
-                                "BLOCK_SIZE_K": bk,
-                                "GROUP_SIZE_M": _AUTOTUNE_GROUP_SIZE_M,
-                                "num_warps": nw,
-                                "num_stages": ns,
-                            })
+                    for gsm in _AUTOTUNE_GROUP_SIZE_M_CHOICES:
+                        for nw in warp_choices:
+                            for ns in _AUTOTUNE_NUM_STAGES_CHOICES:
+                                configs.append({
+                                    "BLOCK_SIZE_M": bm,
+                                    "BLOCK_SIZE_N": bn,
+                                    "BLOCK_SIZE_K": bk,
+                                    "GROUP_SIZE_M": gsm,
+                                    "num_warps": nw,
+                                    "num_stages": ns,
+                                })
         return configs
 
     @staticmethod
@@ -477,7 +500,9 @@ class TritonKernelGenerator:
             operand_dtype = output_tensor.dtype
 
         all_configs = self._build_autotune_configs(operand_dtype, has_reduction)
-        pruned = self._prune_configs_by_sram(all_configs, operand_dtype)
+        pruned = self._prune_configs_by_sram(
+            all_configs, operand_dtype, sram_budget=_get_sram_budget(),
+        )
 
         logger.debug(
             "Autotune config generation — %d configs after SRAM pruning "
@@ -685,13 +710,13 @@ class TritonKernelGenerator:
             if dim == "n":
                 sections.append(
                     f"\n    # Bias addition — load {v.name} and broadcast along N axis"
-                    f"\n    {v.name} = tl.load({v.name}_ptrs, mask=offs_n < N, other=0.0){bias_cast}"
+                    f"\n    {v.name} = tl.load({v.name}_ptrs, mask=offs_n < N, other=0.0, eviction_policy='evict_first'){bias_cast}"
                     f"\n    acc = acc + {v.name}[None, :]"
                 )
             else:
                 sections.append(
                     f"\n    # Bias addition — load {v.name} and broadcast along M axis"
-                    f"\n    {v.name} = tl.load({v.name}_ptrs, mask=offs_m < M, other=0.0){bias_cast}"
+                    f"\n    {v.name} = tl.load({v.name}_ptrs, mask=offs_m < M, other=0.0, eviction_policy='evict_first'){bias_cast}"
                     f"\n    acc = acc + {v.name}[:, None]"
                 )
 
@@ -1593,14 +1618,10 @@ class TritonKernelGenerator:
                     f"    # mask, then broadcast across M via [None, :] before fusing",
                     f"    # into acc.  Using a 2-D mask here would be incorrect because",
                     f"    # {residual_name}_ptrs is a 1-D pointer block (no M stride).",
-                    f"    {residual_name} = tl.load({residual_name}_ptrs, mask=offs_n < N, other=0.0)",
+                    f"    {residual_name} = tl.load({residual_name}_ptrs, mask=offs_n < N, other=0.0, eviction_policy='evict_first')",
                     f"    acc = acc + {residual_name}[None, :]",
                 ])
 
-            # Check for stride-0 broadcast dimensions on 2-D tensors.
-            # When TensorFingerprint.broadcast_dims indicates a zero-stride
-            # axis, generate 1-D pointer arithmetic and let Triton broadcast
-            # to [BLOCK_M, BLOCK_N] — avoids loading duplicate rows/columns.
             broadcast_dim = TritonKernelGenerator._detect_epilogue_broadcast(
                 residual_arg_node,
             )
@@ -1610,7 +1631,7 @@ class TritonKernelGenerator:
                     f"    # Broadcast add — {residual_name} has stride=0 along M",
                     f"    # (broadcast_dims[0]=True); load 1-D along N, broadcast to",
                     f"    # [BLOCK_M, BLOCK_N] via [None, :] (no redundant row loads).",
-                    f"    {residual_name} = tl.load({residual_name}_ptr + offs_n * {s_n}, mask=offs_n < N, other=0.0)",
+                    f"    {residual_name} = tl.load({residual_name}_ptr + offs_n * {s_n}, mask=offs_n < N, other=0.0, eviction_policy='evict_first')",
                     f"    acc = acc + {residual_name}[None, :]",
                 ])
             if broadcast_dim == "n":
@@ -1619,7 +1640,7 @@ class TritonKernelGenerator:
                     f"    # Broadcast add — {residual_name} has stride=0 along N",
                     f"    # (broadcast_dims[1]=True); load 1-D along M, broadcast to",
                     f"    # [BLOCK_M, BLOCK_N] via [:, None] (no redundant column loads).",
-                    f"    {residual_name} = tl.load({residual_name}_ptr + offs_m * {s_m}, mask=offs_m < M, other=0.0)",
+                    f"    {residual_name} = tl.load({residual_name}_ptr + offs_m * {s_m}, mask=offs_m < M, other=0.0, eviction_policy='evict_first')",
                     f"    acc = acc + {residual_name}[:, None]",
                 ])
 
@@ -1627,7 +1648,7 @@ class TritonKernelGenerator:
                 f"    # Residual add — load 2-D {residual_name} tile from HBM into SRAM",
                 (
                     f"    {residual_name} = tl.load({residual_name}_ptrs, "
-                    f"mask=(offs_m[:, None] < M) & (offs_n[None, :] < N), other=0.0)"
+                    f"mask=(offs_m[:, None] < M) & (offs_n[None, :] < N), other=0.0, eviction_policy='evict_first')"
                 ),
                 f"    acc = acc + {residual_name}",
             ])
@@ -1674,11 +1695,10 @@ class TritonKernelGenerator:
                     f"    # Broadcast mul — load 1-D tile along N with offs_n mask,",
                     f"    # then broadcast across M via [None, :] before multiplying",
                     f"    # into acc.  {ext_name}_ptrs is a 1-D pointer block (no M stride).",
-                    f"    {ext_name} = tl.load({ext_name}_ptrs, mask=offs_n < N, other=0.0)",
+                    f"    {ext_name} = tl.load({ext_name}_ptrs, mask=offs_n < N, other=0.0, eviction_policy='evict_first')",
                     f"    acc = acc * {ext_name}[None, :]",
                 ])
 
-            # Check for stride-0 broadcast dimensions on 2-D tensors.
             broadcast_dim = TritonKernelGenerator._detect_epilogue_broadcast(ext_node)
             if broadcast_dim == "m":
                 s_n = _stride_param(ext_name, "n")
@@ -1686,7 +1706,7 @@ class TritonKernelGenerator:
                     f"    # Broadcast mul — {ext_name} has stride=0 along M",
                     f"    # (broadcast_dims[0]=True); load 1-D along N, broadcast to",
                     f"    # [BLOCK_M, BLOCK_N] via [None, :] (no redundant row loads).",
-                    f"    {ext_name} = tl.load({ext_name}_ptr + offs_n * {s_n}, mask=offs_n < N, other=0.0)",
+                    f"    {ext_name} = tl.load({ext_name}_ptr + offs_n * {s_n}, mask=offs_n < N, other=0.0, eviction_policy='evict_first')",
                     f"    acc = acc * {ext_name}[None, :]",
                 ])
             if broadcast_dim == "n":
@@ -1695,7 +1715,7 @@ class TritonKernelGenerator:
                     f"    # Broadcast mul — {ext_name} has stride=0 along N",
                     f"    # (broadcast_dims[1]=True); load 1-D along M, broadcast to",
                     f"    # [BLOCK_M, BLOCK_N] via [:, None] (no redundant column loads).",
-                    f"    {ext_name} = tl.load({ext_name}_ptr + offs_m * {s_m}, mask=offs_m < M, other=0.0)",
+                    f"    {ext_name} = tl.load({ext_name}_ptr + offs_m * {s_m}, mask=offs_m < M, other=0.0, eviction_policy='evict_first')",
                     f"    acc = acc * {ext_name}[:, None]",
                 ])
 
@@ -1703,7 +1723,7 @@ class TritonKernelGenerator:
                 f"    # Tensor mul — load 2-D {ext_name} tile from HBM into SRAM",
                 (
                     f"    {ext_name} = tl.load({ext_name}_ptrs, "
-                    f"mask=(offs_m[:, None] < M) & (offs_n[None, :] < N), other=0.0)"
+                    f"mask=(offs_m[:, None] < M) & (offs_n[None, :] < N), other=0.0, eviction_policy='evict_first')"
                 ),
                 f"    acc = acc * {ext_name}",
             ])

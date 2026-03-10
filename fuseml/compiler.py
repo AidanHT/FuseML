@@ -47,6 +47,7 @@ from fuseml.passes.control_flow_validation import (
     validate_graph_control_flow,
 )
 from fuseml.passes.fusion_pass import FuseMLFusionPass, fuseml_fused_kernel_placeholder
+from fuseml.passes.topology import is_trigger
 from fuseml.registry import SupportedOpsRegistry, build_default_registry
 
 
@@ -224,8 +225,26 @@ class FuseMLCompiler:
             )
             return gm.forward
 
-        # ── Step 1: tag candidates for observability ──────────────────
-        self.capture_and_print_graph(gm)
+        # ── Step 1: single-pass candidate tagging + trigger pre-scan ──
+        # Combines the observability tagging and trigger detection into
+        # one graph traversal instead of two separate walks.
+        has_any_trigger = False
+        found: int = 0
+        for node in gm.graph.nodes:
+            if node.op == "call_function":
+                if self.registry.is_supported(node.target):
+                    node.meta["fusion_candidate"] = True
+                    node.meta["fusion_category"] = self.registry.get_category(node.target)
+                    self.fusion_candidates.append(node)
+                    found += 1
+                if is_trigger(node):
+                    has_any_trigger = True
+
+        if not has_any_trigger:
+            logger.info("No trigger ops in graph — returning unmodified forward.")
+            return gm.forward
+
+        self._log_graph_dump(gm, found)
 
         # ── Step 2: run fusion pass (discovery + surgery) ─────────────
         fusion_pass = FuseMLFusionPass(gm, self.registry)
@@ -470,28 +489,11 @@ class FuseMLCompiler:
         return launcher
 
     # ------------------------------------------------------------------
-    # Graph capture, tagging, and printing (observability)
+    # Graph logging (observability)
     # ------------------------------------------------------------------
-    def capture_and_print_graph(self, gm: torch.fx.GraphModule) -> None:
-        """Walk the FX graph, tag registry-matched nodes, and log the result.
-
-        For every ``call_function`` node whose target is in ``self.registry``,
-        attaches ``node.meta['fusion_candidate'] = True`` and the op's
-        registry category.  A formatted summary is logged at INFO level.
-        """
-        found: int = 0
-
-        for node in gm.graph.nodes:
-            if node.op != "call_function":
-                continue
-
-            if self.registry.is_supported(node.target):
-                node.meta["fusion_candidate"] = True
-                node.meta["fusion_category"] = self.registry.get_category(node.target)
-                self.fusion_candidates.append(node)
-                found += 1
-
-        # ── Print annotated graph ──────────────────────────────────────
+    @staticmethod
+    def _log_graph_dump(gm: torch.fx.GraphModule, found: int) -> None:
+        """Log the annotated FX graph (nodes must already be tagged)."""
         logger.info("--- FX Graph Dump (fusion candidates marked with *) ---")
         for node in gm.graph.nodes:
             is_candidate = node.meta.get("fusion_candidate", False)
@@ -515,6 +517,24 @@ class FuseMLCompiler:
             )
         else:
             logger.info("No registry-matched ops detected in this graph.")
+
+    def capture_and_print_graph(self, gm: torch.fx.GraphModule) -> None:
+        """Walk the FX graph, tag registry-matched nodes, and log the result.
+
+        Backward-compatible entry point.  The main compilation pipeline
+        uses the combined single-pass tagging in ``_compile_aten_graph``
+        and calls ``_log_graph_dump`` directly.
+        """
+        found: int = 0
+        for node in gm.graph.nodes:
+            if node.op != "call_function":
+                continue
+            if self.registry.is_supported(node.target):
+                node.meta["fusion_candidate"] = True
+                node.meta["fusion_category"] = self.registry.get_category(node.target)
+                self.fusion_candidates.append(node)
+                found += 1
+        self._log_graph_dump(gm, found)
 
 
 # ======================================================================

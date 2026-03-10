@@ -37,6 +37,7 @@ from fuseml.passes.topology import TRANSPARENT_OPS
 SUPPORTED_TRITON_OPS: Dict[Any, str] = {
     # GEMM base — the kernel's matmul core
     torch.ops.aten.addmm.default: "gemm",
+    torch.ops.aten.mm.default: "gemm",
     # Elementwise activations / arithmetic (register ops on `acc`)
     torch.ops.aten.relu.default: "elementwise",
     torch.ops.aten.relu_.default: "elementwise",

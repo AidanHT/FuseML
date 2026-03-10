@@ -54,6 +54,7 @@ class NodeRole(Enum):
 
 TRIGGER_OPS: Set[Callable] = {
     torch.ops.aten.addmm.default,
+    torch.ops.aten.mm.default,
 }
 
 BARRIER_OPS: Set[Callable] = {
@@ -88,6 +89,7 @@ TRANSPARENT_OPS: Set[Callable] = {
     torch.ops.aten.squeeze.dim,
     torch.ops.aten.expand.default,
     torch.ops.aten.permute.default,
+    torch.ops.aten.t.default,
     torch.ops.aten.slice.Tensor,
     torch.ops.aten.select.int,
 }
@@ -289,11 +291,14 @@ _BYTES_PER_ELEM: Dict[Any, int] = {
 # relative HBM savings become negligible.
 #
 # Calibrated for Ada Lovelace (RTX 4050/4060/4070/4090):
-#   - 100 GFLOP crossover: fusion wins below, cuBLAS wins above.
+#   - 10 TFLOP crossover: fusion wins below, cuBLAS wins above.
+#   - On laptop GPUs running far below peak TFLOPS, the HBM savings
+#     from fusing GEMM+epilogue (eliminating one full M×N intermediate
+#     read+write) outweigh the Triton-vs-cuBLAS compute efficiency gap.
 #   - small  preset (M=128,  K=256,  N=1024):   67M FLOPs → fuse  ✓
 #   - medium preset (M=2048, K=1024, N=4096): 17.2G FLOPs → fuse  ✓
-#   - large  preset (M=16384,K=4096, N=16384): 2.2T FLOPs → cuBLAS ✓
-_COMPUTE_BOUND_FLOP_THRESHOLD: float = 1e11  # 100 GFLOP
+#   - large  preset (M=16384,K=4096, N=16384): 2.2T FLOPs → fuse  ✓
+_COMPUTE_BOUND_FLOP_THRESHOLD: float = 1e13  # 10 TFLOP
 
 
 def is_compute_bound_gemm(

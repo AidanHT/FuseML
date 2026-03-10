@@ -676,9 +676,18 @@ class KernelLauncher:
                 f"got {len(input_tensors)}."
             )
 
-        # ── Negative-stride fast-path ─────────────────────────────────
-        # CPU-side metadata check only — no GPU synchronisation.
-        input_tensors = tuple(self._materialize_if_needed(t) for t in input_tensors)
+        # ── Negative-stride guard (rare path only) ────────────────────
+        # Avoid tuple reconstruction when no tensor has negative strides
+        # (the overwhelmingly common case).
+        needs_materialize = False
+        for t in input_tensors:
+            if self._has_negative_strides(t):
+                needs_materialize = True
+                break
+        if needs_materialize:
+            input_tensors = tuple(
+                self._materialize_if_needed(t) for t in input_tensors
+            )
 
         left_t = input_tensors[self._left_idx]
         right_t = input_tensors[self._right_idx]
@@ -698,8 +707,6 @@ class KernelLauncher:
         )
 
         # ── Output allocation — explicit device/dtype, pre-computed ───
-        # The allocation kind (_is_reduced, _alloc_fill_value,
-        # _alloc_dtype) was resolved at __init__; only M, N are dynamic.
         if self._is_reduced:
             surviving_size: int = M if self._reduction_axis == 1 else N
             output = torch.full(
@@ -728,8 +735,6 @@ class KernelLauncher:
         )
 
         # ── Flat argument assembly ────────────────────────────────────
-        # All dynamic shapes and strides are passed as explicit Python
-        # ints — no dict construction, no runtime type coercion.
         tensor_args: list[torch.Tensor] = list(input_tensors)
         tensor_args.append(output)
         tensor_args.extend(intermediate_outputs)
@@ -746,43 +751,41 @@ class KernelLauncher:
         for t in intermediate_outputs:
             stride_args.extend([int(t.stride(0)), int(t.stride(1))])
 
-        # ── Kernel launch + post-kernel fixup ─────────────────────────
-        # The closure is kept for EagerFallbackGuard compatibility but
-        # contains zero data-dependent branching — the post-kernel
-        # strategy integer was resolved at __init__.
-        post_strategy = self._post_kernel_strategy
-
-        def _triton_launch() -> torch.Tensor:
-            """Closure capturing all launch state for the fallback guard."""
-            self._kernel_fn[grid](
-                *tensor_args,
-                M, N, K,
-                *stride_args,
-                **self._frozen_launch_kwargs,
-            )
-
-            # Post-kernel: integer dispatch, no data-dependent branching.
-            if post_strategy == KernelLauncher._POST_KERNEL_CAST_ONLY:
-                # Fused mean: epilogue already divided — just cast.
-                # Tensor.to() is a no-op when dtypes already match.
-                return output.to(out_dtype)
-            if post_strategy == KernelLauncher._POST_KERNEL_MEAN_DIV:
-                # Legacy mean: in-place scalar multiply (single CUDA op)
-                # instead of tensor / scalar (which constructs a scalar
-                # tensor on the fly).
-                reduced_dim_size = N if self._reduction_axis == 1 else M
-                return output.mul_(1.0 / reduced_dim_size).to(out_dtype)
-            return output
-
-        # ── Guarded execution ────────────────────────────────────────
+        # ── Guarded path (fallback guard active) ─────────────────────
+        # Closure is only allocated when a fallback guard exists.
         if self._fallback_guard is not None:
+            post_strategy = self._post_kernel_strategy
+
+            def _triton_launch() -> torch.Tensor:
+                self._kernel_fn[grid](
+                    *tensor_args, M, N, K, *stride_args,
+                    **self._frozen_launch_kwargs,
+                )
+                if post_strategy == KernelLauncher._POST_KERNEL_CAST_ONLY:
+                    return output.to(out_dtype)
+                if post_strategy == KernelLauncher._POST_KERNEL_MEAN_DIV:
+                    reduced_dim_size = N if self._reduction_axis == 1 else M
+                    return output.mul_(1.0 / reduced_dim_size).to(out_dtype)
+                return output
+
             return self._fallback_guard.execute(
                 _triton_launch,
                 input_tensors,
                 triton_buffers=[output] + intermediate_outputs,
             )
 
-        return _triton_launch()
+        # ── Inline fast path (no fallback guard) ──────────────────────
+        self._kernel_fn[grid](
+            *tensor_args, M, N, K, *stride_args,
+            **self._frozen_launch_kwargs,
+        )
+
+        if self._post_kernel_strategy == self._POST_KERNEL_CAST_ONLY:
+            return output.to(out_dtype)
+        if self._post_kernel_strategy == self._POST_KERNEL_MEAN_DIV:
+            reduced_dim_size = N if self._reduction_axis == 1 else M
+            return output.mul_(1.0 / reduced_dim_size).to(out_dtype)
+        return output
 
     # ------------------------------------------------------------------
     # Repr

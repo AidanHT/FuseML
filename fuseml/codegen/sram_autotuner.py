@@ -60,19 +60,35 @@ _DTYPE_BYTES: dict[torch.dtype, int] = {
 }
 
 # ---------------------------------------------------------------------------
-# SRAM budget — Ada Lovelace (sm_89) supports up to 100 KB configurable
-# shared memory per SM.  We use this as the default budget for AOT tuning.
+# SRAM budget — queried at runtime from the GPU, with 100 KB fallback
+# for Ada Lovelace (sm_89) when no CUDA device is available.
 # ---------------------------------------------------------------------------
 
-_DEFAULT_SRAM_BUDGET_BYTES: int = 100 * 1024
+_FALLBACK_SRAM_BUDGET_BYTES: int = 100 * 1024
+
+
+def _get_sram_budget() -> int:
+    """Query the GPU's actual shared memory capacity at runtime."""
+    try:
+        if torch.cuda.is_available():
+            props = torch.cuda.get_device_properties(torch.cuda.current_device())
+            budget = getattr(props, "max_shared_memory_per_block", 0)
+            if budget > 0:
+                return budget
+    except Exception:
+        pass
+    return _FALLBACK_SRAM_BUDGET_BYTES
+
+
+_DEFAULT_SRAM_BUDGET_BYTES: int = _FALLBACK_SRAM_BUDGET_BYTES
 
 # ---------------------------------------------------------------------------
 # Candidate tile sizes for the AOT search space
 # ---------------------------------------------------------------------------
 
-_BLOCK_M_CHOICES: tuple[int, ...] = (32, 64, 128)
-_BLOCK_N_CHOICES: tuple[int, ...] = (32, 64, 128)
-_BLOCK_K_CHOICES: tuple[int, ...] = (32, 64)
+_BLOCK_M_CHOICES: tuple[int, ...] = (32, 64, 128, 256)
+_BLOCK_N_CHOICES: tuple[int, ...] = (32, 64, 128, 256)
+_BLOCK_K_CHOICES: tuple[int, ...] = (32, 64, 128)
 _NUM_WARPS_CHOICES: tuple[int, ...] = (2, 4, 8)
 _NUM_STAGES_CHOICES: tuple[int, ...] = (2, 3, 4, 5)
 
@@ -218,9 +234,9 @@ class SRAMAutotuner:
 
     def __init__(
         self,
-        sram_budget: int = _DEFAULT_SRAM_BUDGET_BYTES,
+        sram_budget: int | None = None,
     ) -> None:
-        self._sram_budget = sram_budget
+        self._sram_budget = sram_budget if sram_budget is not None else _get_sram_budget()
         # Internal cache: (M, N, K, dtype_str) → TuneConfig
         self._config_cache: dict[tuple, TuneConfig] = {}
 
