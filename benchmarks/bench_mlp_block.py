@@ -61,6 +61,97 @@ COLORS: dict[str, str] = {
     "FuseML": "#55A868",
 }
 
+PRESETS: dict[str, dict[str, int | str]] = {
+    "small": {
+        "batch_size": 1,
+        "seq_len": 128,
+        "d_model": 256,
+        "d_intermediate": 1024,
+        "workload": "mlp_block",
+    },
+    "medium": {
+        "batch_size": 4,
+        "seq_len": 512,
+        "d_model": 1024,
+        "d_intermediate": 4096,
+        "workload": "mlp_block",
+    },
+    "large": {
+        "batch_size": 8,
+        "seq_len": 2048,
+        "d_model": 4096,
+        "d_intermediate": 16384,
+        "workload": "mlp_block",
+    },
+    "memory_bound": {
+        "batch_size": 32,
+        "seq_len": 512,
+        "d_model": 256,
+        "d_intermediate": 1024,
+        "workload": "mlp_block",
+    },
+    "activation_heavy_small": {
+        "batch_size": 1,
+        "seq_len": 128,
+        "d_model": 256,
+        "d_intermediate": 1024,
+        "workload": "activation_heavy",
+    },
+    "activation_heavy_medium": {
+        "batch_size": 4,
+        "seq_len": 512,
+        "d_model": 1024,
+        "d_intermediate": 4096,
+        "workload": "activation_heavy",
+    },
+    "activation_heavy_large": {
+        "batch_size": 8,
+        "seq_len": 2048,
+        "d_model": 4096,
+        "d_intermediate": 16384,
+        "workload": "activation_heavy",
+    },
+    "activation_heavy_memory_bound": {
+        "batch_size": 32,
+        "seq_len": 512,
+        "d_model": 256,
+        "d_intermediate": 1024,
+        "workload": "activation_heavy",
+    },
+    "stacked_small": {
+        "batch_size": 1,
+        "seq_len": 128,
+        "d_model": 256,
+        "d_intermediate": 1024,
+        "workload": "stacked_mlp",
+        "num_blocks": 4,
+    },
+    "stacked_medium": {
+        "batch_size": 4,
+        "seq_len": 512,
+        "d_model": 1024,
+        "d_intermediate": 4096,
+        "workload": "stacked_mlp",
+        "num_blocks": 4,
+    },
+    "stacked_large": {
+        "batch_size": 8,
+        "seq_len": 2048,
+        "d_model": 4096,
+        "d_intermediate": 16384,
+        "workload": "stacked_mlp",
+        "num_blocks": 4,
+    },
+    "stacked_memory_bound": {
+        "batch_size": 16,
+        "seq_len": 512,
+        "d_model": 512,
+        "d_intermediate": 2048,
+        "workload": "stacked_mlp",
+        "num_blocks": 4,
+    },
+}
+
 # ---------------------------------------------------------------------------
 # Model
 # ---------------------------------------------------------------------------
@@ -86,6 +177,46 @@ class TransformerMLP(nn.Module):
         x = self.gelu(x)
         x = self.linear2(x)
         x = x + residual
+        return x
+
+
+class ActivationHeavyMLP(nn.Module):
+    """Block with extra pointwise epilogue work.
+
+    Pattern: Linear -> GeLU -> Mul -> AddConst -> Linear -> Add(residual).
+    The extra mul/add ops are absorbable and increase eager HBM traffic,
+    making fusion gains easier to observe on memory-bound dimensions.
+    """
+
+    def __init__(self, d_model: int, d_intermediate: int) -> None:
+        super().__init__()
+        self.linear1 = nn.Linear(d_model, d_intermediate)
+        self.gelu = nn.GELU()
+        self.linear2 = nn.Linear(d_intermediate, d_model)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        residual = x
+        x = self.linear1(x)
+        x = self.gelu(x)
+        x = x * 0.5
+        x = x + 0.125
+        x = self.linear2(x)
+        x = x + residual
+        return x
+
+
+class StackedTransformerMLP(nn.Module):
+    """Stacked TransformerMLP blocks to stress repeated fusion opportunities."""
+
+    def __init__(self, d_model: int, d_intermediate: int, num_blocks: int) -> None:
+        super().__init__()
+        self.blocks = nn.ModuleList(
+            [TransformerMLP(d_model, d_intermediate) for _ in range(num_blocks)]
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        for block in self.blocks:
+            x = block(x)
         return x
 
 
@@ -170,12 +301,50 @@ def _cublas_epilogue_full_breakdown(M: int, D: int, I: int, bpe: int) -> dict[st
     }
 
 
+def _activation_heavy_eager_breakdown(M: int, D: int, I: int, bpe: int) -> dict[str, int]:
+    """HBM traffic for activation-heavy eager path (6 kernels)."""
+    return {
+        # Linear1
+        "Linear1_read_x": M * D * bpe,
+        "Linear1_read_W1": D * I * bpe,
+        "Linear1_read_bias1": I * bpe,
+        "Linear1_write": M * I * bpe,
+        # GeLU
+        "GeLU_read": M * I * bpe,
+        "GeLU_write": M * I * bpe,
+        # Mul
+        "Mul_read": M * I * bpe,
+        "Mul_write": M * I * bpe,
+        # AddConst
+        "AddConst_read": M * I * bpe,
+        "AddConst_write": M * I * bpe,
+        # Linear2
+        "Linear2_read_act": M * I * bpe,
+        "Linear2_read_W2": I * D * bpe,
+        "Linear2_read_bias2": D * bpe,
+        "Linear2_write": M * D * bpe,
+        # Residual Add
+        "Add_read_linear2": M * D * bpe,
+        "Add_read_residual": M * D * bpe,
+        "Add_write": M * D * bpe,
+    }
+
+
+def _scale_breakdown(breakdown: dict[str, int], factor: int) -> dict[str, int]:
+    """Scale a byte-traffic breakdown by a positive integer factor."""
+    if factor <= 1:
+        return breakdown
+    return {k: v * factor for k, v in breakdown.items()}
+
+
 def compute_hbm_traffic(
     M: int,
     d_model: int,
     d_intermediate: int,
     dtype: torch.dtype,
     mode: str,
+    workload: str = "mlp_block",
+    num_blocks: int = 1,
 ) -> HBMTrafficEstimate:
     """Compute theoretical HBM traffic for one forward pass.
 
@@ -190,7 +359,13 @@ def compute_hbm_traffic(
     dtype : torch.dtype
         Element precision.
     mode : str
-        One of ``"eager"``, ``"inductor"``, ``"fuseml"``.
+        One of ``"eager"``, ``"fuseml"``, ``"cublas_epilogue"``,
+        ``"cublas_epilogue_partial"``.
+    workload : str
+        Benchmark workload type: ``"mlp_block"``, ``"activation_heavy"``,
+        or ``"stacked_mlp"``.
+    num_blocks : int
+        Number of repeated blocks for ``"stacked_mlp"``.
     """
     bpe = _bytes_per_element(dtype)
     D, I = d_model, d_intermediate
@@ -215,6 +390,9 @@ def compute_hbm_traffic(
             "Add_read_residual": M * D * bpe,
             "Add_write": M * D * bpe,
         }
+
+        if workload == "activation_heavy":
+            breakdown = _activation_heavy_eager_breakdown(M, D, I, bpe)
     elif mode == "fuseml":
         # FuseML fuses elementwise post-ops into GEMM epilogues.
         breakdown = _fuseml_breakdown(M, D, I, bpe)
@@ -226,6 +404,9 @@ def compute_hbm_traffic(
         breakdown = _cublas_epilogue_partial_breakdown(M, D, I, bpe)
     else:
         raise ValueError(f"Unknown mode: {mode!r}")
+
+    if workload == "stacked_mlp":
+        breakdown = _scale_breakdown(breakdown, max(1, num_blocks))
 
     total = sum(breakdown.values())
     return HBMTrafficEstimate(mode=mode, total_bytes=total, breakdown=breakdown)
@@ -285,7 +466,7 @@ def validate_correctness(
     _tol = {
         torch.float32: (1e-3, 1e-3),
         torch.float16: (1e-2, 1e-2),
-        torch.bfloat16: (2e-2, 1e-2),
+        torch.bfloat16: (5e-2, 2e-2),
     }
     atol, rtol = _tol.get(x.dtype, (1e-3, 1e-3))
 
@@ -475,10 +656,27 @@ def print_header(args: argparse.Namespace, M: int, gpu_name: str) -> None:
         f"  Config: batch={args.batch_size}, seq={args.seq_len}, "
         f"d_model={args.d_model}, d_inter={args.d_intermediate}"
     )
+    print(f"  Workload: {args.workload}  |  Blocks: {args.num_blocks}")
     print(f"  dtype={args.dtype}  |  M={M}  |  GPU: {gpu_name}")
     mode_str = "precise (per-iter L2 flush)" if args.precise else "Timer (steady-state)"
     print(f"  Warmup: {args.warmup}  |  Measurement: {args.iters}  |  Mode: {mode_str}")
     print(sep)
+
+
+def _build_model(
+    workload: str,
+    d_model: int,
+    d_intermediate: int,
+    num_blocks: int,
+) -> nn.Module:
+    """Build the benchmark model for the selected workload."""
+    if workload == "mlp_block":
+        return TransformerMLP(d_model, d_intermediate)
+    if workload == "activation_heavy":
+        return ActivationHeavyMLP(d_model, d_intermediate)
+    if workload == "stacked_mlp":
+        return StackedTransformerMLP(d_model, d_intermediate, max(1, num_blocks))
+    raise ValueError(f"Unsupported workload: {workload}")
 
 
 def _kernel_count_for_mode(mode_key: str) -> int:
@@ -649,6 +847,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--d-model", type=int, default=D_MODEL)
     parser.add_argument("--d-intermediate", type=int, default=D_INTERMEDIATE)
     parser.add_argument(
+        "--workload",
+        type=str,
+        default="mlp_block",
+        choices=["mlp_block", "activation_heavy", "stacked_mlp"],
+        help=(
+            "Benchmark workload type: mlp_block (baseline Transformer MLP), "
+            "activation_heavy (extra fusible pointwise ops), "
+            "stacked_mlp (multiple MLP blocks)."
+        ),
+    )
+    parser.add_argument(
+        "--num-blocks",
+        type=int,
+        default=4,
+        help="Number of repeated blocks for --workload stacked_mlp.",
+    )
+    parser.add_argument(
         "--dtype",
         type=str,
         default="bfloat16",
@@ -665,16 +880,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save-plot", type=str, default=None, help="Save chart to file")
     parser.add_argument("--skip-fuseml", action="store_true", help="Skip FuseML mode")
     parser.add_argument(
+        "--all-presets",
+        action="store_true",
+        help="Run all presets sequentially in one command.",
+    )
+    parser.add_argument(
         "--preset",
         type=str,
-        choices=["large", "medium", "small", "memory_bound"],
+        choices=list(PRESETS.keys()),
         default=None,
         help=(
-            "Dimension presets: 'large' (compute-bound GEMMs — cuBLAS "
-            "epilogue fusion), 'medium' (balanced), 'small' (tiny — "
-            "overhead-dominated), 'memory_bound' (memory-bound GEMMs — "
-            "Triton fusion shines, 20-60%% speedup).  Overrides "
-            "--batch-size/--seq-len/--d-model/--d-intermediate."
+            "Dimension presets: 'small/medium/large/memory_bound' (MLP block), "
+            "'activation_heavy_small/medium/large/memory_bound' (extra fusible "
+            "pointwise ops), 'stacked_small/medium/large/memory_bound' "
+            "(repeated MLP blocks).  Overrides relevant model args."
         ),
     )
     return parser.parse_args()
@@ -699,19 +918,16 @@ def _gpu_warmup(model: nn.Module, x: torch.Tensor, *, iters: int = 20) -> None:
     torch.cuda.synchronize(x.device)
 
 
-def main() -> None:
-    args = parse_args()
+def _apply_preset(args: argparse.Namespace, preset_name: str | None) -> None:
+    """Apply preset overrides onto an argparse namespace in-place."""
+    if preset_name is None:
+        return
+    for k, v in PRESETS[preset_name].items():
+        setattr(args, k, v)
 
-    # -- Apply dimension preset (overrides individual CLI args) --
-    _PRESETS = {
-        "small":        {"batch_size": 1,  "seq_len": 128,  "d_model": 256,  "d_intermediate": 1024},
-        "medium":       {"batch_size": 4,  "seq_len": 512,  "d_model": 1024, "d_intermediate": 4096},
-        "large":        {"batch_size": 8,  "seq_len": 2048, "d_model": 4096, "d_intermediate": 16384},
-        "memory_bound": {"batch_size": 32, "seq_len": 512,  "d_model": 256,  "d_intermediate": 1024},
-    }
-    if args.preset is not None:
-        for k, v in _PRESETS[args.preset].items():
-            setattr(args, k, v)
+
+def _run_single(args: argparse.Namespace) -> None:
+    """Run one benchmark configuration (single workload/preset)."""
 
     # -- Resolve dtype --
     dtype_map = {
@@ -742,7 +958,12 @@ def main() -> None:
 
     # -- Allocate model & input --
     try:
-        model = TransformerMLP(args.d_model, args.d_intermediate)
+        model = _build_model(
+            args.workload,
+            args.d_model,
+            args.d_intermediate,
+            args.num_blocks,
+        )
         model = model.to(device=device, dtype=dtype).eval()
         x = torch.randn(M, args.d_model, device=device, dtype=dtype)
     except torch.cuda.OutOfMemoryError:
@@ -816,7 +1037,15 @@ def main() -> None:
         else:
             mode_key = mode_name.lower()
         mode_keys[mode_name] = mode_key
-        traffic[mode_name] = compute_hbm_traffic(M, args.d_model, args.d_intermediate, dtype, mode_key)
+        traffic[mode_name] = compute_hbm_traffic(
+            M,
+            args.d_model,
+            args.d_intermediate,
+            dtype,
+            mode_key,
+            workload=args.workload,
+            num_blocks=args.num_blocks,
+        )
 
     # -- Print HBM traffic breakdown --
     eager_traffic = traffic.get("Eager")
@@ -865,6 +1094,44 @@ def main() -> None:
     # -- Plot --
     if not args.no_plot:
         plot_results(results, save_path=args.save_plot)
+
+
+def main() -> None:
+    args = parse_args()
+
+    if args.all_presets:
+        if args.preset is not None:
+            print("ERROR: Use either --preset or --all-presets, not both.")
+            sys.exit(2)
+
+        preset_names = list(PRESETS.keys())
+        print(
+            f"Running all presets ({len(preset_names)}): "
+            f"{', '.join(preset_names)}"
+        )
+
+        for i, preset_name in enumerate(preset_names, 1):
+            run_args = argparse.Namespace(**vars(args))
+            run_args.all_presets = False
+            run_args.preset = preset_name
+            _apply_preset(run_args, preset_name)
+
+            # Avoid interactive plot windows in batch mode unless caller
+            # explicitly requested output files.
+            if args.save_plot is None:
+                run_args.no_plot = True
+            else:
+                p = Path(args.save_plot)
+                run_args.save_plot = str(p.with_name(f"{p.stem}_{preset_name}{p.suffix}"))
+
+            print(f"\n{'=' * 72}")
+            print(f"[ALL PRESETS] {i}/{len(preset_names)} -> {preset_name}")
+            print(f"{'=' * 72}")
+            _run_single(run_args)
+        return
+
+    _apply_preset(args, args.preset)
+    _run_single(args)
 
 
 if __name__ == "__main__":

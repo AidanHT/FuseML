@@ -17,9 +17,9 @@ class SupportedOpsRegistry:
     """Registry of ops eligible for fusion based on arithmetic intensity.
 
     Low arithmetic-intensity (memory-bound) ops spend most of their wall-clock
-    time moving data between HBM and SRAM rather than doing FLOPs.  Fusing
-    consecutive memory-bound ops into a single Triton kernel eliminates the
-    intermediate HBM round-trips.
+    time moving data between HBM and SRAM rather than doing FLOPs (Floating Point 
+    Operations Per second). Fusing consecutive memory-bound ops into a single Triton 
+    kernel eliminates the intermediate HBM round-trips.
 
     Usage
     -----

@@ -263,3 +263,8 @@ build
 !SETUP.md
 !README.md
 !.gitignore
+
+# Benchmark Dashboard & Capture Scripts (local only)
+# ============================================================================
+benchmarks/results_dashboard.html
+benchmarks/capture_charts.py

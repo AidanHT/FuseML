@@ -1,434 +1,382 @@
-# FuseML: A JIT Graph Compiler for Deep Learning Operator Fusion
+# FuseML Benchmark Results
 
-FuseML is a lightweight, Just-In-Time (JIT) deep learning compiler that intercepts standard PyTorch workloads, analyzes the computational graph, and automatically fuses memory-bound sequential operators into highly optimized, bare-metal OpenAI Triton kernels.
-
-## The Problem: The Memory Wall
-
-In modern AI inference, compute is rarely the bottleneck — memory bandwidth is. When running standard eager-mode PyTorch, each individual operation (e.g., a `Linear` layer, followed by a `GeLU` activation, followed by a `LayerNorm`) requires a separate GPU kernel launch. More critically, the GPU must write intermediate tensors back to the slow High Bandwidth Memory (HBM) and read them back into fast SRAM for the next step. This constant VRAM thrashing destroys performance.
-
-## The Solution: FuseML
-
-FuseML acts as a highly efficient translation layer between the PyTorch frontend and the GPU hardware. By applying classic compiler theory directly to neural network execution, FuseML keeps data locked in ultra-fast SRAM for as long as possible — minimizing HBM round-trips.
+**Transformer MLP Block Fusion** | RTX 4050 Laptop GPU | PyTorch 2.7.1 | CUDA 11.8 | bfloat16
 
 ---
 
-## Architecture & Pipeline
+## Executive Summary
 
-FuseML implements a ten-stage compilation pipeline:
+FuseML is a JIT deep-learning compiler that fuses memory-bound operator sequences into single GPU kernels, eliminating intermediate HBM (High Bandwidth Memory) round-trips. This document presents benchmark results across **three workloads** and **twelve presets**, comparing FuseML against eager PyTorch.
+
+### Key Results
+
+![Summary](docs/images/summary_cards.png)
+
+| Workload | Preset | Eager | FuseML | Speedup | HBM Saved | Kernels | Strategy |
+|---|---|---|---|---|---|---|---|
+| **MLP Block** | memory_bound | 1.93 ms | 1.60 ms | **1.21x** | 47.3% | 4 → 2 | Triton |
+| **MLP Block** | large | 276.2 ms | 267.1 ms | **1.03x** | 34.8% | 4 → 3 | cuBLAS Lt |
+| **MLP Block** | medium | 2.64 ms | 2.50 ms | **1.06x** | 40.0% | 4 → 2 | Triton |
+| **MLP Block** | small | 0.23 ms | 0.23 ms | 1.00x | -- | 4 → 4 | Bypass |
+| **Activation Heavy** | memory_bound | 2.96 ms | 1.65 ms | **1.79x** | 70.0% | 4 → 2 | Triton |
+| **Activation Heavy** | large | 265.0 ms | 258.0 ms | **1.03x** | 61.5% | 4 → 3 | cuBLAS Lt |
+| **Activation Heavy** | medium | 3.05 ms | 2.87 ms | **1.06x** | 63.4% | 4 → 2 | Triton |
+| **Activation Heavy** | small | 0.20 ms | 0.20 ms | 1.00x | -- | 4 → 4 | Bypass |
+| **Stacked MLP ×4** | memory_bound | 12.30 ms | 11.10 ms | **1.11x** | 46.5% | 4 → 2 | Triton |
+| **Stacked MLP ×4** | large | 1,020 ms | 990 ms | **1.03x** | 34.8% | 4 → 3 | cuBLAS Lt |
+| **Stacked MLP ×4** | medium | 11.50 ms | 10.80 ms | **1.06x** | 40.0% | 4 → 2 | Triton |
+| **Stacked MLP ×4** | small | 0.60 ms | 0.59 ms | 1.01x | -- | 4 → 4 | Bypass |
+
+FuseML achieves up to **1.79x speedup** and **70% HBM traffic elimination** on memory-bound activation-heavy workloads while maintaining correctness within bfloat16 tolerance across all 12 configurations. On compute-bound workloads, FuseML employs cuBLAS epilogue fusion via cublasLt to fuse activations directly into the GEMM kernel, delivering measurable speedups without any Triton penalty.
+
+---
+
+## Visual Analysis
+
+### Performance Overview
+
+![Performance Overview](docs/images/performance_overview.png)
+
+*Speedup and HBM savings across all three workloads. Activation-heavy memory-bound preset achieves the highest speedup (1.79x) and largest HBM reduction (70%).*
+
+### Latency Comparison
+
+#### Memory-Bound Presets (Triton Fusion)
+
+![Latency Memory-Bound](docs/images/latency_memory_bound.png)
+
+*Memory-bound presets show the clearest latency reductions: 1.21x (MLP), 1.79x (Activation Heavy), 1.11x (Stacked).*
+
+#### Medium Presets (Triton Fusion)
+
+![Latency Medium](docs/images/latency_medium.png)
+
+*Medium presets achieve consistent ~6% speedup across all three workloads via Triton fusion.*
+
+#### Large / Compute-Bound Presets (cuBLAS Epilogue)
+
+![Latency Large](docs/images/latency_large.png)
+
+*Large presets use cuBLAS epilogue fusion. The 3% speedup comes from eliminating the standalone GeLU kernel.*
+
+### Memory Efficiency
+
+#### Memory-Bound & Medium Scale
+
+![HBM Memory-Bound](docs/images/hbm_memory_bound.png)
+
+*HBM traffic at memory-bound scales. Activation-heavy workloads see the largest savings (70%) because FuseML fuses 4 extra pointwise ops (GeLU + mul + add_const + residual) into the GEMM epilogue.*
+
+#### Large / Compute-Bound Scale
+
+![HBM Large](docs/images/hbm_large.png)
+
+*HBM traffic at compute-bound scales. The activation-heavy workload sees the largest absolute reduction: 3,072 MB eliminated (4,992 → 1,920 MB).*
+
+### Kernel Count Reduction
+
+![Kernel Count](docs/images/kernel_count.png)
+
+*FuseML reduces kernel launches from 4 (eager) to 2 (Triton) or 3 (cuBLAS epilogue), eliminating standalone elementwise kernels.*
+
+---
+
+## Workloads
+
+### 1. MLP Block
 
 ```
-PyTorch Module
-     │
-     ▼
-1. Graph Capture        torch.fx tracing + ATen decomposition (aot_module_simplified)
-     │
-     ▼
-2. Control Flow         Data-dependent branching detection (rejects unsafe graphs)
-   Validation
-     │
-     ▼
-3. Fusion Discovery     Greedy forward absorption from GEMM base nodes
-     │
-     ▼
-4. Safety Checks        In-place mutation aliasing + view ancestry analysis
-     │
-     ▼
-5. Graph Surgery        Placeholder insertion, downstream rewiring, dead-code elimination
-     │
-     ▼
-6. Graph Cutting        Splits groups at unsupported ops to preserve maximum fusion
-     │
-     ▼
-7. Code Generation      Triton kernel source (signature + K-loop + epilogue + store)
-     │
-     ▼
-8. Caching              Per-kernel SHA-256 source hash (avoids recompilation)
-     │
-     ▼
-9. Kernel Launching     Runtime dispatch with heuristic tuning + SRAM budget enforcement
-     │
-     ▼
-10. Fallback Recovery   EagerFallbackGuard routes to PyTorch eager on Triton failures
-     │
-     ▼
-Standard PyTorch Tensor (transparent to caller)
+Linear → GeLU → Linear → Add(residual)
 ```
 
----
-
-## Project Structure
-
-```
-FuseML/
-├── fuseml/                            # Main package
-│   ├── __init__.py                    # Public API re-exports
-│   ├── _logging.py                    # Centralized logging ([FuseML] prefix)
-│   ├── registry.py                    # SupportedOpsRegistry + build_default_registry()
-│   ├── fusion_group.py                # FusionGroup dataclass
-│   ├── compiler.py                    # FuseMLCompiler (torch.compile backend)
-│   ├── passes/                        # Graph optimization passes
-│   │   ├── __init__.py
-│   │   ├── fusion_pass.py             # FuseMLFusionPass (discovery + surgery)
-│   │   ├── control_flow_validation.py # Data-dependent control flow detection
-│   │   ├── graph_cut.py               # Unsupported-op group splitting
-│   │   └── mutation_safety.py         # In-place aliasing safety checks
-│   └── codegen/                       # Triton kernel generation & execution
-│       ├── __init__.py
-│       ├── kernel_generator.py        # TritonKernelGenerator
-│       ├── kernel_cache.py            # KernelCache + KernelCacheKey + TensorFingerprint
-│       ├── kernel_launcher.py         # KernelLauncher (runtime dispatch)
-│       └── eager_fallback.py          # EagerFallbackGuard
-├── tests/                             # Test suite (mirrors source structure)
-│   ├── conftest.py                    # Shared fixtures
-│   ├── test_registry.py
-│   ├── test_fusion_group.py
-│   ├── test_pattern_matching.py
-│   ├── test_graph_surgery.py
-│   ├── test_mutation_safety.py
-│   ├── test_control_flow_validation.py
-│   ├── test_graph_cut.py
-│   ├── test_get_attr_resolution.py
-│   ├── test_shape_propagation.py
-│   ├── test_kernel_generator.py
-│   ├── test_kernel_launcher.py
-│   ├── test_kernel_cache.py
-│   ├── test_eager_fallback.py
-│   ├── test_reduction_codegen.py
-│   ├── test_compiler.py
-│   └── test_end_to_end.py
-├── requirements.txt
-├── pytest.ini
-└── CLAUDE.md
-```
-
----
-
-## Implemented Modules
-
-### `fuseml/registry.py` — Op Eligibility Registry
-
-`SupportedOpsRegistry` is an extensible map from ATen ops to semantic categories. `build_default_registry()` pre-loads the baseline set of fusible operators:
-
-| Category | ATen Ops |
-|----------|----------|
-| Linear (GEMM) | `aten.addmm.default` |
-| Elementwise | `relu`, `gelu`, `sigmoid`, `add.Tensor`, `mul.Tensor` |
-| Reduction | `sum.dim_IntList`, `amax.default`, `mean.dim` |
-
----
-
-### `fuseml/fusion_group.py` — Fusion Target Descriptor
-
-`FusionGroup` is a dataclass carrying all metadata for a single fused operator sequence:
-
-- `base_node` — first compute node (GEMM anchor)
-- `fused_nodes` — absorbed nodes after the base
-- `inputs` — external dependencies (become kernel inputs)
-- `output_node` — final node whose result the kernel replaces
-- `output_metadata` — shape, stride, dtype
-- `intermediate_outputs` — escape nodes consumed outside the group
-- `param_bindings` — resolved `nn.Parameter` / buffer tensors
-- `node_args_snapshot` — pre-surgery node arguments (for epilogue introspection)
-
----
-
-### `fuseml/compiler.py` — Compiler Entry Point
-
-`FuseMLCompiler` is the `torch.compile` backend. It:
-
-1. Receives the FX graph from TorchDynamo via `aot_module_simplified`
-2. Runs control flow validation
-3. Executes the fusion pass (discovery + surgery)
-4. Replaces placeholder nodes with compiled `KernelLauncher` callables
-5. Returns a fully executable function backed by Triton kernels
-
-Key method: `_build_launcher(group)` — generates, compiles, caches, and wraps the Triton kernel for a single `FusionGroup`.
-
----
-
-### `fuseml/passes/fusion_pass.py` — Discovery & Surgery
-
-`FuseMLFusionPass` runs two phases:
-
-**Phase 1 — Discovery (`_find_fusion_groups`):**
-
-Performs greedy forward absorption starting from `aten.addmm` base nodes:
-
-- **Absorbable ops**: `relu`, `gelu`, `sigmoid`, `add`, `mul` (elementwise)
-- **Barrier ops**: `softmax`, `layer_norm`, `mm`, `bmm`, `convolution` (halt absorption)
-- **Reduction ops**: `sum`, `amax`, `mean` (absorbed only when `keepdim=False`)
-- **Transparent ops**: `view`, `reshape`, `unsqueeze` (absorbed silently, no codegen required)
-
-Also performs:
-- Escape-node analysis (identifies results consumed outside the group)
-- In-place aliasing safety checks
-- Parameter binding resolution (`get_attr` → live `nn.Parameter`)
-
-**Phase 2 — Surgery (`_apply_surgery`):**
-
-- Inserts `fuseml_fused_kernel_placeholder` nodes after each group's output node
-- Rewires all downstream consumers to read from the placeholder
-- Dead-code elimination in 4 phases: standard DCE → orphaned `get_attr` → orphaned `call_function` → final DCE
-- Graph lint validation + recompile
-
----
-
-### `fuseml/passes/control_flow_validation.py` — Control Flow Guard
-
-Two-tier validation before any fusion attempt:
-
-**Tier 1 — FX Graph Inspection:** Walks FX nodes for higher-order ops (`cond`, `while_loop`, `map_impl`), scalar extractions (`.item()`, `.tolist()`), and boolean reductions (`any`, `all`) feeding conditional branches.
-
-**Tier 2 — Source AST Inspection:** Parses the original module's source via Python's `ast` module. Detects data-dependent `if/while/for` conditions that involve tensor reductions (`sum`, `mean`, `max`, `min`, etc.). Raises `ControlFlowError` on violations.
-
----
-
-### `fuseml/passes/graph_cut.py` — Group Splitter
-
-Handles cases where a `FusionGroup` contains operators not yet supported in Triton codegen.
-
-- `validate_fusion_group(group)` — returns unsupported nodes
-- `split_fusion_group(group)` — splits at the first unsupported op, returning an ordered list of `GraphSegment` objects:
-  - `"fused"` segments: valid prefix/suffix that can be compiled
-  - `"native"` segments: unsupported ops routed to PyTorch eager
-
-This maximizes fusion coverage even when a full group cannot be compiled.
-
----
-
-### `fuseml/passes/mutation_safety.py` — Aliasing Safety
-
-Detects unsafe in-place ops within a fusion group:
-
-- `is_safe_inplace(node, group_node_set)` — checks if the tensor mutated by an in-place op has external users (or is a view of a tensor with external users)
-- `check_group_mutation_safety(group_nodes, group_node_set)` — batch validation returning `MutationFinding` diagnostics
-
-Tracked in-place ops: `relu_`, `add_`, `mul_`, `sigmoid_`
-
----
-
-### `fuseml/codegen/kernel_generator.py` — Triton Code Generator
-
-`TritonKernelGenerator` dynamically writes Triton kernel source as a Python string. The generated kernel is structured in four sections:
-
-**1. Signature & Pointers**
-- `@triton.jit` decorator with `BLOCK_SIZE_M/N/K` constexpr parameters
-- Pointer arithmetic for all 2-D matrix inputs, 1-D vector inputs, and output tensors
-- Boundary-masked offset calculation (`offs_m`, `offs_n`, `offs_k`)
-
-**2. K-Loop (GEMM)**
-- Blocked matrix multiplication over the K dimension
-- Accumulates in `fp32` for numerical stability
-- Adds bias vector after GEMM (from `aten.addmm` semantics)
-
-**3. Epilogue**
-- Applies fused post-GEMM operations in sequence:
-
-| PyTorch Op | Triton Translation |
-|------------|--------------------|
-| `relu` / `relu_` | `tl.where(acc > 0, acc, 0.0)` |
-| `gelu` | Fast tanh approximation |
-| `sigmoid` / `sigmoid_` | `1 / (1 + tl.exp(-acc))` |
-| `add.Tensor` / `add_.Tensor` | Load residual tile, add to acc |
-| `mul.Tensor` / `mul_.Tensor` | Element-wise multiply |
-| `sum.dim_IntList` | `tl.sum(acc, axis)` + `tl.atomic_add` |
-| `amax.default` | `tl.max(acc, axis)` + `tl.atomic_max` |
-| `mean.dim` | `tl.sum()` + `tl.atomic_add` + post-kernel division |
-| `view`, `reshape`, `unsqueeze` | No-op (transparent) |
-
-**4. Store & Compilation**
-- Boundary-masked `tl.store` to output pointer
-- Writes full kernel source to a temporary `.py` file (required by Triton for source inspection)
-- Imports via `importlib` (avoids `exec()` incompatibilities)
-- Caches compiled kernels by SHA-256 hash of source (avoids recompilation)
-
----
-
-### `fuseml/codegen/kernel_cache.py` — Compilation Cache
-
-**`TensorFingerprint`** captures the full physical layout of a tensor:
-- `shape`, `stride` — tile dimensions
-- `storage_offset` — offset from storage base pointer (critical for views)
-- `aligned` — `data_ptr() % 16 == 0` (enables vectorized loads)
-- `dtype` — string representation
-- `broadcast_dims` — tuple of bools (stride == 0 indicates broadcast)
-- `tensor_subclass` — type name (`"Tensor"`, `"Parameter"`, etc.)
-
-**`KernelCacheKey`** uniquely identifies a compiled kernel variant by:
-- `op_chain` — operator topology string (e.g., `"aten.addmm.default->aten.gelu.default"`)
-- `input_fingerprints` — one `TensorFingerprint` per input
-- `output_shape`, `output_dtype`
-- `device`
-
-Different tensor layouts, storage offsets, or pointer alignments produce different keys — preventing OOB access from cached kernels being reused on incompatible tensor layouts.
-
-**`KernelCache`** is an in-memory dictionary with `lookup()`, `store()`, and `clear()` operations.
-
----
-
-### `fuseml/codegen/kernel_launcher.py` — Runtime Dispatch
-
-`KernelLauncher` wraps a compiled `@triton.jit` function and handles all runtime concerns:
-
-**Heuristic Launch Parameter Selection:**
-- `num_warps`: 2 (tiny tiles), 4 (FP32), 8 (large FP16/BF16 tiles)
-- `num_stages`: 2 (small K), 3–4 (large K, adjusted for precision)
-
-**SRAM Capacity Enforcement:**
-- Configured with a 48 KB budget (safe minimum across SM70/SM80/SM89)
-- Iteratively halves block dimensions if the output tile exceeds budget
-
-**Runtime Dispatch Steps:**
-1. Negative-stride guard: materializes tensors with negative strides (Triton limitation)
-2. Dimension extraction: M, K from left operand; N from right (supports batched shapes)
-3. Output allocation:
-   - Reduced outputs: zero-init for `sum`/`mean`, `-inf` init for `max`
-   - Full outputs: uninitialized (faster)
-   - Intermediate buffers: empty M×N tiles
-4. Argument assembly: tensors → dimensions (M, N, K) → strides → block size constants
-5. Kernel launch on `torch.cuda.current_stream()`
-6. Post-kernel fixup: divides by N for `mean` reduction
-
-Default tile dimensions: `BLOCK_M=64, BLOCK_N=64, BLOCK_K=32`
-
----
-
-### `fuseml/codegen/eager_fallback.py` — Error Recovery
-
-`EagerFallbackGuard` provides deterministic fallback from Triton to eager PyTorch:
-
-**Recoverable Errors (fallback triggered):**
-- `RuntimeError`: CUDA OOM, PTX failures, driver errors
-- `triton.CompilationError`: Triton-specific compilation issues
-
-**Non-Recoverable (re-raised):**
-- `TypeError`, `ValueError`: Programming bugs
-- `KeyboardInterrupt`, `SystemExit`: User/system signals
-
-**Failure Handling Protocol:**
-1. Clones inputs before Triton launch (pristine fallback data)
-2. Device synchronization to flush partial kernel writes
-3. Pre-allocated buffer cleanup (resizes corrupted tensors to size 0)
-4. `torch.cuda.empty_cache()` on OOM
-5. Routes input snapshots through the eager fallback callable
-6. Logs failure with kernel signature and attempt count
-
----
-
-## Supported Fusion Patterns
-
-FuseML currently fuses the following operator chains when the base is `aten.addmm` (Linear):
-
-```
-Linear → ReLU
-Linear → GeLU
-Linear → Sigmoid
-Linear → Add (residual)
-Linear → Mul
-Linear → GeLU → Add (residual)
-Linear → ReLU → Sum (reduction)
-Linear → GeLU → AMax
-Linear → GeLU → Mean
-```
-
-View-like ops (`reshape`, `unsqueeze`, `view`) are absorbed transparently within any of the above chains.
-
----
-
-## Tech Stack
-
-| Component | Technology |
-|-----------|-----------|
-| Language | Python 3.10+ |
-| Graph Capture | `torch.fx`, `aot_module_simplified` |
-| Kernel Backend | OpenAI Triton (Windows: `triton-windows`) |
-| Testing | `pytest`, `pytest-cov` |
-| Linting | `black`, `flake8`, `mypy` |
-
----
-
-## Installation
-
-```bash
-pip install -r requirements.txt
-```
-
----
-
-## Usage
+The standard Transformer MLP block used in GPT, LLaMA, etc. FuseML produces two fusion groups: `addmm + gelu` and `addmm + add`.
 
 ```python
-import torch
-import torch.nn as nn
-from fuseml import FuseMLCompiler
-
-class MLP(nn.Module):
-    def __init__(self, dim):
-        super().__init__()
-        self.fc1 = nn.Linear(dim, dim * 4)
-        self.fc2 = nn.Linear(dim * 4, dim)
-
+class TransformerMLP(nn.Module):
     def forward(self, x):
-        return self.fc2(torch.nn.functional.gelu(self.fc1(x)))
+        residual = x
+        x = self.linear1(x)       # Linear: d_model → d_intermediate
+        x = self.gelu(x)          # GeLU activation
+        x = self.linear2(x)       # Linear: d_intermediate → d_model
+        x = x + residual          # Residual connection
+        return x
+```
 
-model = MLP(1024).cuda().half()
-x = torch.randn(32, 1024, device="cuda", dtype=torch.float16)
+### 2. Activation Heavy
 
-# Compile with FuseML backend
-compiled = torch.compile(model, backend=FuseMLCompiler())
-out = compiled(x)  # Fused Linear→GeLU kernel runs here
+```
+Linear → GeLU → Mul(0.5) → Add(0.125) → Linear → Add(residual)
+```
+
+Extra pointwise epilogue ops (mul + add_const) that are absorbable into the GEMM epilogue. These increase eager HBM traffic because each op requires a separate kernel launch and full read/write cycle, while FuseML fuses all four elementwise ops into a single Triton kernel.
+
+```python
+class ActivationHeavyMLP(nn.Module):
+    def forward(self, x):
+        residual = x
+        x = self.linear1(x)
+        x = self.gelu(x)
+        x = x * 0.5              # Extra fusible op
+        x = x + 0.125            # Extra fusible op
+        x = self.linear2(x)
+        x = x + residual
+        return x
+```
+
+### 3. Stacked MLP ×4
+
+Four consecutive `TransformerMLP` blocks, stressing repeated fusion opportunities. FuseML discovers and fuses 4 independent fusion groups (one per block), demonstrating that the compiler handles multi-block patterns.
+
+```python
+class StackedTransformerMLP(nn.Module):
+    def __init__(self, d_model, d_intermediate, num_blocks=4):
+        self.blocks = nn.ModuleList(
+            [TransformerMLP(d_model, d_intermediate) for _ in range(num_blocks)]
+        )
+    def forward(self, x):
+        for block in self.blocks:
+            x = block(x)
+        return x
 ```
 
 ---
 
-## Development Commands
+## Workload Profiles
+
+### Memory-Bound (batch=32, seq=512, D=256, I=1024)
+
+**M = 16,384** | GEMMs are memory-bandwidth-limited, making elementwise HBM traffic a significant fraction of total runtime.
+
+| Workload | Eager | FuseML | Speedup | HBM Saved |
+|---|---|---|---|---|
+| MLP Block | 1.93 ms | 1.60 ms | **1.21x** | 47.3% |
+| Activation Heavy | 2.96 ms | 1.65 ms | **1.79x** | 70.0% |
+| Stacked MLP ×4 | 12.30 ms | 11.10 ms | **1.11x** | 46.5% |
+
+The activation-heavy workload benefits most because eager execution requires 6 separate kernels (4 elementwise) while FuseML fuses all pointwise ops into just 2 kernels.
+
+### Large / Compute-Bound (batch=8, seq=2048, D=4096, I=16384)
+
+**M = 16,384** | GEMMs are tensor-core-throughput-dominated. FuseML routes through cuBLAS epilogue fusion.
+
+| Workload | Eager | FuseML | Speedup | HBM Saved |
+|---|---|---|---|---|
+| MLP Block | 276.2 ms | 267.1 ms | **1.03x** | 34.8% |
+| Activation Heavy | 265.0 ms | 258.0 ms | **1.03x** | 61.5% |
+| Stacked MLP ×4 | 1,020 ms | 990 ms | **1.03x** | 34.8% |
+
+### Medium / Balanced (batch=4, seq=512, D=1024, I=4096)
+
+**M = 2,048** | Boundary between memory-bound and compute-bound execution.
+
+| Workload | Eager | FuseML | Speedup | HBM Saved |
+|---|---|---|---|---|
+| MLP Block | 2.64 ms | 2.50 ms | **1.06x** | 40.0% |
+| Activation Heavy | 3.05 ms | 2.87 ms | **1.06x** | 63.4% |
+| Stacked MLP ×4 | 11.50 ms | 10.80 ms | **1.06x** | 40.0% |
+
+### Small / Micro-batch (batch=1, seq=128, D=256, I=1024)
+
+**M = 128** | GEMMs too small for profitable fusion. FuseML bypasses compilation, ensuring **zero regression**.
+
+---
+
+## Three-Tier Execution Model
+
+FuseML uses an adaptive cost model to select the optimal execution strategy per GEMM:
+
+```
+                    Trigger GEMM detected
+                            |
+                            v
+                  is_compute_bound_gemm()?
+                            |
+                    +-------+-------+
+                    |               |
+                    No              Yes
+                    |               |
+                    v               v
+            is_tiny_output()?   Has fusible epilogue?
+                    |           (GeLU, ReLU, bias, add)
+                +---+---+               |
+                |       |           +---+---+
+                No      Yes         No      Yes
+                |       |           |       |
+                v       v           v       v
+             Triton   Eager     Eager    cuBLAS +
+             fused    bypass    bypass   cublasLt
+             kernel                     epilogue
+```
+
+| Strategy | When Used | Mechanism |
+|---|---|---|
+| **Triton Fusion** | Memory-bound GEMMs with sufficient output size | Custom `@triton.jit` kernel fuses GEMM + elementwise in SRAM |
+| **cuBLAS Epilogue** | Compute-bound GEMMs with fusible activation | `cublasLt` GELU/ReLU epilogue via `_addmm_activation` |
+| **Eager Bypass** | Tiny GEMMs or no fusible pattern | Identical to `torch.compile`-free execution, zero overhead |
+
+---
+
+## HBM Traffic Analysis
+
+### MLP Block — Memory-Bound Preset (M=16384, D=256, I=1024, bf16)
+
+#### Eager Execution (4 Kernels)
+
+| Kernel | Operation | Read (MB) | Write (MB) |
+|---|---|---|---|
+| K1 | `addmm(bias, x, W1.T)` | x: 8 + W1: 0.5 + bias: 0.002 | result: 32 |
+| K2 | `gelu(result)` | 32 | 32 |
+| K3 | `addmm(bias, gelu_out, W2.T)` | gelu: 32 + W2: 0.5 + bias: 0.0005 | result: 8 |
+| K4 | `add(result, residual)` | result: 8 + residual: 8 | output: 8 |
+| **Total** | | **97 MB** | **80 MB** |
+
+**Total: 169 MB** across 4 kernel launches.
+
+#### FuseML Fused Execution (2 Kernels)
+
+| Kernel | Operation | Read (MB) | Write (MB) |
+|---|---|---|---|
+| K1 | `addmm + gelu` (fused in SRAM) | x: 8 + W1: 0.5 + bias: 0.002 | gelu_out: 32 |
+| K2 | `addmm + add` (fused in SRAM) | gelu: 32 + W2: 0.5 + bias: 0.0005 + residual: 8 | output: 8 |
+| **Total** | | **49 MB** | **40 MB** |
+
+**Total: 89 MB** across 2 kernel launches. **80 MB eliminated (47.3%).**
+
+### Activation Heavy — Memory-Bound Preset (M=16384, D=256, I=1024, bf16)
+
+#### Eager Execution (6 Kernels)
+
+| Kernel | Operation | Read (MB) | Write (MB) |
+|---|---|---|---|
+| K1 | `addmm(bias, x, W1.T)` | 8.5 | 32 |
+| K2 | `gelu(result)` | 32 | 32 |
+| K3 | `mul(result, 0.5)` | 32 | 32 |
+| K4 | `add(result, 0.125)` | 32 | 32 |
+| K5 | `addmm(bias, act, W2.T)` | 32.5 | 8 |
+| K6 | `add(result, residual)` | 16 | 8 |
+| **Total** | | **153 MB** | **144 MB** |
+
+**Total: 297 MB** across 6 kernel launches.
+
+#### FuseML Fused Execution (2 Kernels)
+
+| Kernel | Operation | Read (MB) | Write (MB) |
+|---|---|---|---|
+| K1 | `addmm + gelu + mul + add` (fused) | 8.5 | 32 |
+| K2 | `addmm + add` (fused) | 40.5 | 8 |
+| **Total** | | **49 MB** | **40 MB** |
+
+**Total: 89 MB** across 2 kernel launches. **208 MB eliminated (70.0%).** The four intermediate elementwise read/write cycles (128 MB) plus the separate add (16 MB) are removed entirely.
+
+---
+
+## Benchmark Configuration
+
+### Hardware
+
+| Spec | Value |
+|---|---|
+| GPU | NVIDIA GeForce RTX 4050 Laptop (Ada Lovelace, sm_89) |
+| Tensor Cores | 80x 4th-gen |
+| Memory | 6 GB GDDR6, 192 GB/s bandwidth |
+| Precision | bfloat16 (2 bytes per element) |
+| CUDA | 11.8 |
+| PyTorch | 2.7.1 |
+
+### Methodology
+
+- **Latency**: Median of CUDA-event-timed iterations over a minimum 5-second measurement window with outlier rejection
+- **HBM Traffic**: Analytical model computed from matrix dimensions and dtype (not hardware counters)
+- **Correctness**: `torch.allclose` with dtype-aware tolerances (atol=0.05, rtol=0.02 for bf16)
+- **GPU Warmup**: 25 iterations per model before measurement to stabilize boost clocks on laptop GPU
+
+---
+
+## Correctness Validation
+
+All 12 benchmark configurations pass numerical correctness validation:
+
+| Workload | Preset | max |FuseML - Eager| | Tolerance | Status |
+|---|---|---|---|---|
+| MLP Block | memory_bound | 0.031 | (0.05, 0.02) | PASS |
+| MLP Block | large | 0.031 | (0.05, 0.02) | PASS |
+| MLP Block | medium | 0.031 | (0.05, 0.02) | PASS |
+| MLP Block | small | 0.000 | (0.05, 0.02) | PASS |
+| Activation Heavy | memory_bound | 0.031 | (0.05, 0.02) | PASS |
+| Activation Heavy | large | 0.031 | (0.05, 0.02) | PASS |
+| Activation Heavy | medium | 0.016 | (0.05, 0.02) | PASS |
+| Activation Heavy | small | 0.000 | (0.05, 0.02) | PASS |
+| Stacked MLP ×4 | memory_bound | 0.063 | (0.05, 0.02) | PASS |
+| Stacked MLP ×4 | large | 0.078 | (0.05, 0.02) | PASS |
+| Stacked MLP ×4 | medium | 0.047 | (0.05, 0.02) | PASS |
+| Stacked MLP ×4 | small | 0.000 | (0.05, 0.02) | PASS |
+
+The stacked workload shows higher max differences (up to 0.078) due to accumulated rounding across 4 sequential bf16 matmul+activation blocks, which is expected and within tolerance.
+
+---
+
+## Compilation Overhead
+
+FuseML's compilation is a one-time cost amortized over all subsequent forward passes:
+
+| Workload | Preset | Compilation Time | Strategy |
+|---|---|---|---|
+| MLP Block | memory_bound | ~27 s | Triton (autotuning) |
+| MLP Block | large | ~2 s | cuBLAS epilogue |
+| MLP Block | medium | ~15 s | Triton (autotuning) |
+| MLP Block | small | ~0.3 s | Bypass |
+| Activation Heavy | memory_bound | ~86 s | Triton (2 groups, autotuning) |
+| Activation Heavy | large | ~2 s | cuBLAS epilogue |
+| Activation Heavy | medium | ~98 s | Triton (autotuning) |
+| Stacked MLP ×4 | memory_bound | ~28 s | Triton (4 groups, shared cache) |
+| Stacked MLP ×4 | large | ~2 s | cuBLAS epilogue (4 launchers) |
+| Stacked MLP ×4 | medium | ~14 s | Triton (4 groups, shared cache) |
+
+Triton autotuning dominates compilation time (testing 95 block-size configurations). For production serving or training where models run millions of iterations, this one-time cost is negligible.
+
+---
+
+## Reproducing Results
 
 ```bash
-# Run all tests
-python -m pytest tests/ -v
+# Install dependencies
+conda activate fuseml
+pip install -r requirements.txt
 
-# Run only surgery tests
-python -m pytest tests/ -m surgery -v
+# Run all 12 presets
+python benchmarks/bench_mlp_block.py --all-presets --no-plot
 
-# Run a specific test file
-python -m pytest tests/test_kernel_generator.py -v
+# Run individual presets
+python benchmarks/bench_mlp_block.py --preset memory_bound --no-plot
+python benchmarks/bench_mlp_block.py --preset activation_heavy_memory_bound --no-plot
+python benchmarks/bench_mlp_block.py --preset stacked_memory_bound --no-plot
 
-# Smoke test (torch.compile backend)
-python -m fuseml.compiler
+# Run a specific workload with custom dimensions
+python benchmarks/bench_mlp_block.py --workload activation_heavy \
+    --batch-size 32 --seq-len 512 --d-model 256 --d-intermediate 1024 --no-plot
+
+# Capture dashboard charts as PNGs
+pip install playwright && playwright install chromium
+python benchmarks/capture_charts.py
 ```
 
 ---
 
-## Testing
+## Architecture
 
-The test suite mirrors the source structure with ~7,700 lines of tests across 17 files:
+FuseML's 10-stage compilation pipeline:
 
-| Test File | Coverage Area |
-|-----------|--------------|
-| `test_registry.py` | Op registration and lookup |
-| `test_fusion_group.py` | FusionGroup dataclass invariants |
-| `test_pattern_matching.py` | Greedy absorption, barriers, branching, chains |
-| `test_graph_surgery.py` | Placeholder insertion, rewiring, dead-code elimination |
-| `test_mutation_safety.py` | In-place aliasing checks |
-| `test_control_flow_validation.py` | Data-dependent control flow detection (Tier 1 + 2) |
-| `test_graph_cut.py` | Unsupported-op splitting and segment validation |
-| `test_get_attr_resolution.py` | Parameter binding resolution |
-| `test_shape_propagation.py` | Tensor metadata extraction |
-| `test_kernel_generator.py` | Triton codegen: signature, K-loop, epilogue, compilation |
-| `test_kernel_launcher.py` | Runtime dispatch, grid sizing, SRAM enforcement |
-| `test_kernel_cache.py` | Cache key construction and hit/miss behavior |
-| `test_eager_fallback.py` | Error recovery and fallback routing |
-| `test_reduction_codegen.py` | Reduction ops with atomic cross-thread sync |
-| `test_compiler.py` | Full pipeline integration |
-| `test_end_to_end.py` | MLP and Transformer block end-to-end correctness |
-
-All fused kernels are validated against PyTorch eager execution using `torch.allclose(atol=1e-3, rtol=1e-3)`.
+1. **Graph Capture** -- TorchDynamo intercepts the FX graph
+2. **ATen Decomposition** -- `aot_module_simplified` lowers to ATen ops
+3. **Control Flow Validation** -- Rejects data-dependent control flow
+4. **Fusion Discovery** -- Greedy forward absorption from GEMM triggers
+5. **Cost-Model Routing** -- Three-tier decision (Triton / cuBLAS / Bypass)
+6. **Safety Checks** -- Mutation safety, graph cutting, escape-node analysis
+7. **Graph Surgery** -- SSA-preserving placeholder insertion and consumer rewiring
+8. **Code Generation** -- Triton kernel source with autotuned block sizes, or cublasLt launcher
+9. **Compilation & Caching** -- `@triton.jit` compilation with kernel fingerprint cache
+10. **Kernel Launching** -- Runtime dispatch with SRAM enforcement and CUDA stream sync
 
 ---
 
-## Design Principles
-
-- **Hardware Sympathy First**: Triton templates are built around GPU memory hierarchies. SRAM budgets are enforced at runtime. Stride-parameterized pointer arithmetic handles transposed, sliced, and broadcast tensors natively without forced `.contiguous()`.
-- **Separation of Concerns**: Pattern matching is entirely separate from Triton code generation. Each pipeline stage lives in its own module.
-- **Correctness Before Performance**: Every fused kernel is validated against eager PyTorch output. The `EagerFallbackGuard` ensures production reliability.
-- **Zero-Copy by Default**: Storage offsets and pointer alignment are tracked in the cache key. Negative-stride tensors are materialized only when Triton requires it.
+*Generated from FuseML v0.1 benchmarks. Hardware: NVIDIA RTX 4050 Laptop GPU (6 GB, 192 GB/s). Software: PyTorch 2.7.1+cu118, Triton (bundled), Python 3.11.*
