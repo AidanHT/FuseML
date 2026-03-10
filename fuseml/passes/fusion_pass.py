@@ -337,7 +337,7 @@ class FuseMLFusionPass:
         }
 
     @staticmethod
-    def _is_compute_bound_trigger(node: torch.fx.Node) -> bool:
+    def _is_compute_bound_trigger(node: torch.fx.Node, *, min_penalty: float = 0.0) -> bool:
         """Return ``True`` if the addmm trigger node has compute-bound dims.
 
         Extracts M, N, K from the node's tensor metadata (populated by
@@ -410,7 +410,7 @@ class FuseMLFusionPass:
             else:
                 break
 
-        return is_compute_bound_gemm(M, N, K, dtype, num_epilogue_ops)
+        return is_compute_bound_gemm(M, N, K, dtype, num_epilogue_ops, min_penalty=min_penalty)
 
     @staticmethod
     def _collect_external_inputs(

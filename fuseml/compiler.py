@@ -52,6 +52,19 @@ from fuseml.registry import SupportedOpsRegistry, build_default_registry
 
 
 # ---------------------------------------------------------------------------
+# Sentinel exception — bypasses aot_module_simplified overhead
+# ---------------------------------------------------------------------------
+
+class _NoFusionPossible(Exception):
+    """Raised when the ATen graph has no profitable fusion opportunities.
+
+    Caught by :meth:`FuseMLCompiler.__call__` to bypass the
+    ``aot_module_simplified`` wrapper and return the original (non-decomposed)
+    forward function, eliminating per-invocation AOT overhead.
+    """
+
+
+# ---------------------------------------------------------------------------
 # Node-to-descriptor helper
 # ---------------------------------------------------------------------------
 
@@ -163,6 +176,12 @@ class FuseMLCompiler:
         (producing ``aten.addmm.default``, ``aten.gelu.default``, etc.)
         before running the fusion pipeline.
 
+        When the ATen-level analysis determines no profitable fusion is
+        possible (e.g. all GEMMs are compute-bound), the compiler raises
+        :class:`_NoFusionPossible` to bypass the ``aot_module_simplified``
+        wrapper entirely — returning the original (non-decomposed) forward
+        function so that the no-fusion path has zero per-invocation overhead.
+
         Parameters
         ----------
         gm:
@@ -184,11 +203,21 @@ class FuseMLCompiler:
             optimised = self._compile_aten_graph(aten_gm, aten_inputs)
             return make_boxed_func(optimised)
 
-        return aot_module_simplified(
-            gm,
-            example_inputs,
-            fw_compiler=_aten_compiler,
-        )
+        try:
+            return aot_module_simplified(
+                gm,
+                example_inputs,
+                fw_compiler=_aten_compiler,
+            )
+        except _NoFusionPossible as exc:
+            # No profitable fusion found — return the original forward
+            # WITHOUT the aot_module_simplified wrapper.  This eliminates
+            # the per-invocation overhead of AOT Autograd's functionalization
+            # layer, ensuring the no-fusion path matches eager speed.
+            logger.info(
+                "Bypassing AOT decomposition — %s", exc,
+            )
+            return gm.forward
 
     # ------------------------------------------------------------------
     # ATen-level compilation (called after aot_autograd decomposition)
@@ -218,17 +247,15 @@ class FuseMLCompiler:
         try:
             validate_graph_control_flow(gm)
         except ControlFlowError as exc:
-            logger.warning(
-                "Data-dependent control flow detected — skipping fusion "
-                "and falling back to eager execution for this subgraph: %s",
-                exc,
-            )
-            return gm.forward
+            raise _NoFusionPossible(
+                f"data-dependent control flow: {exc}"
+            ) from exc
 
         # ── Step 1: single-pass candidate tagging + trigger pre-scan ──
-        # Combines the observability tagging and trigger detection into
-        # one graph traversal instead of two separate walks.
+        # Combines the observability tagging, trigger detection, and
+        # early compute-bound rejection into one graph traversal.
         has_any_trigger = False
+        has_fusible_trigger = False
         found: int = 0
         for node in gm.graph.nodes:
             if node.op == "call_function":
@@ -239,10 +266,23 @@ class FuseMLCompiler:
                     found += 1
                 if is_trigger(node):
                     has_any_trigger = True
+                    # Early compute-bound check using metadata from
+                    # torch.compile's abstract interpretation (node.meta["val"]).
+                    # If ALL triggers are compute-bound, we can skip the
+                    # fusion pass entirely — cuBLAS handles everything
+                    # faster and the graph analysis would be wasted work.
+                    if not FuseMLFusionPass._is_compute_bound_trigger(
+                        node, min_penalty=100e-6,
+                    ):
+                        has_fusible_trigger = True
 
         if not has_any_trigger:
-            logger.info("No trigger ops in graph — returning unmodified forward.")
-            return gm.forward
+            raise _NoFusionPossible("no trigger ops in graph")
+
+        if not has_fusible_trigger:
+            raise _NoFusionPossible(
+                "all trigger ops are compute-bound — cuBLAS preferred"
+            )
 
         self._log_graph_dump(gm, found)
 
@@ -258,8 +298,9 @@ class FuseMLCompiler:
         ]
 
         if not nodes_to_process:
-            logger.info("No placeholder nodes found — returning unmodified forward.")
-            return gm.forward
+            raise _NoFusionPossible(
+                "fusion pass found no fusible sequences"
+            )
 
         # ── Build tensor map for cache key construction ────────────────
         # Map graph-level placeholder node names to the corresponding

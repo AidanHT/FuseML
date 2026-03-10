@@ -17,7 +17,7 @@ import torch.nn as nn
 
 from fuseml.codegen.kernel_generator import TensorDescriptor, TritonKernelGenerator
 from fuseml.codegen.kernel_launcher import KernelLauncher
-from fuseml.compiler import FuseMLCompiler, _descriptor_from_metadata, _node_to_descriptor
+from fuseml.compiler import FuseMLCompiler, _NoFusionPossible, _descriptor_from_metadata, _node_to_descriptor
 from fuseml.registry import SupportedOpsRegistry, build_default_registry
 
 from conftest import trace_no_grad, find_groups_with_shapes, run_surgery
@@ -225,22 +225,24 @@ class TestFuseMLCompilerCallNoFusion:
     """Verify __call__ returns a callable when no fusion groups are found."""
 
     def test_no_fusible_ops_returns_callable(self):
-        """Graph of just a ReLU (no addmm trigger) returns the forward callable."""
+        """Graph of just a ReLU (no addmm trigger) raises _NoFusionPossible."""
         gm = trace_no_grad(nn.ReLU(), torch.randn(2, 64))
         compiler = FuseMLCompiler()
-        # Use _compile_aten_graph directly — make_fx already produces aten ops.
-        result = compiler._compile_aten_graph(gm, [torch.randn(2, 64)])
-        assert callable(result)
+        # _compile_aten_graph now raises _NoFusionPossible when no triggers
+        # are present — the caller (__call__) catches it to bypass AOT.
+        with pytest.raises(_NoFusionPossible):
+            compiler._compile_aten_graph(gm, [torch.randn(2, 64)])
 
     def test_empty_registry_returns_forward(self):
-        """With an empty registry, no ops match — forward returned unchanged."""
+        """With an empty registry, all triggers are compute-bound — raises _NoFusionPossible."""
         model = nn.Sequential(nn.Linear(64, 64), nn.ReLU())
         gm = trace_no_grad(model, torch.randn(2, 64))
         empty_reg = SupportedOpsRegistry()
         compiler = FuseMLCompiler(registry=empty_reg)
-        # Use _compile_aten_graph directly — make_fx already produces aten ops.
-        result = compiler._compile_aten_graph(gm, [torch.randn(2, 64)])
-        assert callable(result)
+        # _compile_aten_graph raises _NoFusionPossible when no fusion is
+        # profitable — the caller (__call__) catches it to bypass AOT.
+        with pytest.raises(_NoFusionPossible):
+            compiler._compile_aten_graph(gm, [torch.randn(2, 64)])
 
 
 # ---------------------------------------------------------------------------

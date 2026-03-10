@@ -24,7 +24,7 @@ from fuseml.passes.control_flow_validation import (
     _check_source_ast,
     validate_graph_control_flow,
 )
-from fuseml.compiler import FuseMLCompiler
+from fuseml.compiler import FuseMLCompiler, _NoFusionPossible
 
 from conftest import trace_no_grad
 
@@ -360,15 +360,18 @@ class TestCompilerFallback:
     """When control flow is detected, the compiler returns gm.forward."""
 
     def test_clean_model_compiles_normally(self):
+        """Clean model with small test matrices raises _NoFusionPossible
+        (all triggers compute-bound at small sizes).  This is expected —
+        the caller (__call__) catches it to bypass AOT."""
         model = CleanLinearReLU()
         gm = trace_no_grad(model, torch.randn(2, 64))
         compiler = FuseMLCompiler()
-        # Use _compile_aten_graph directly — make_fx already produces aten ops.
-        result = compiler._compile_aten_graph(gm, [torch.randn(2, 64)])
-        assert callable(result)
+        with pytest.raises(_NoFusionPossible):
+            compiler._compile_aten_graph(gm, [torch.randn(2, 64)])
 
     def test_item_graph_falls_back_to_forward(self):
-        """Graph with an injected .item() node triggers fallback."""
+        """Graph with an injected .item() node raises _NoFusionPossible
+        due to control-flow violation."""
         model = CleanLinearReLU()
         gm = trace_no_grad(model, torch.randn(2, 64))
 
@@ -382,10 +385,5 @@ class TestCompilerFallback:
         gm.recompile()
 
         compiler = FuseMLCompiler()
-        # Use _compile_aten_graph directly — make_fx already produces aten ops.
-        result = compiler._compile_aten_graph(gm, [torch.randn(2, 64)])
-        assert callable(result), "Compiler should return a callable on fallback"
-        # gm.forward is a bound method — each access creates a new object,
-        # so we compare the underlying __func__ and __self__ instead.
-        assert result.__func__ is gm.forward.__func__
-        assert result.__self__ is gm
+        with pytest.raises(_NoFusionPossible, match="control flow"):
+            compiler._compile_aten_graph(gm, [torch.randn(2, 64)])

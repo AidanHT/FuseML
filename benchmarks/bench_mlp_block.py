@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -255,6 +256,21 @@ def validate_correctness(
 
 
 # ---------------------------------------------------------------------------
+# Progress helpers
+# ---------------------------------------------------------------------------
+
+
+def _progress_bar(current: int, total: int, *, width: int = 28) -> str:
+    """Return an inline ASCII progress bar: [████░░░░]  42/200  21%."""
+    frac = current / total if total > 0 else 0.0
+    filled = int(width * frac)
+    bar = "\u2588" * filled + "\u2591" * (width - filled)
+    pct = int(100 * frac)
+    pad = len(str(total))
+    return f"[{bar}] {current:>{pad}}/{total}  {pct:3d}%"
+
+
+# ---------------------------------------------------------------------------
 # Benchmark core
 # ---------------------------------------------------------------------------
 
@@ -309,7 +325,17 @@ def _bench_timer(label: str, model: nn.Module, x: torch.Tensor) -> tuple[float, 
         label="MLP Block",
         sub_label=label,
     )
+    print(
+        f"    [timer] blocked_autorange  (min {MIN_RUN_TIME:.0f}s, "
+        f"outlier rejection enabled)...",
+        end="",
+        flush=True,
+    )
+    t0 = time.perf_counter()
     measurement = timer.blocked_autorange(min_run_time=MIN_RUN_TIME)
+    elapsed = time.perf_counter() - t0
+    total_iters = measurement.number_per_run * len(measurement.times)
+    print(f"  done  ({elapsed:.1f}s elapsed, {total_iters} iters)")
     latency_ms = measurement.median * 1e3
     iqr_ms = measurement.iqr * 1e3
     return latency_ms, iqr_ms
@@ -323,15 +349,23 @@ def _bench_precise(
     measure_iters: int,
 ) -> tuple[float, float]:
     """Cache-cold measurement with per-iteration L2 flush and CUDA events."""
-    # Warmup
+    # Warmup — GPU ops are async so we sync once at the end rather than per iter.
+    print(f"    [warmup]  {warmup_iters} iters...", end="", flush=True)
+    t0 = time.perf_counter()
     with torch.no_grad():
         for _ in range(warmup_iters):
             model(x)
         torch.cuda.synchronize(device)
+    print(f"  done  ({time.perf_counter() - t0:.1f}s)")
 
-    # Measurement
+    # Measurement — each iter syncs the device, so the progress bar reflects
+    # true GPU progress.
     latencies_ms: list[float] = []
-    for _ in range(measure_iters):
+    sys.stdout.write(f"\r    [measure] {_progress_bar(0, measure_iters)}")
+    sys.stdout.flush()
+    t0 = time.perf_counter()
+
+    for i in range(measure_iters):
         flush_l2_cache(device)
 
         start = torch.cuda.Event(enable_timing=True)
@@ -344,6 +378,12 @@ def _bench_precise(
 
         torch.cuda.synchronize(device)
         latencies_ms.append(start.elapsed_time(end))  # milliseconds
+
+        sys.stdout.write(f"\r    [measure] {_progress_bar(i + 1, measure_iters)}")
+        sys.stdout.flush()
+
+    elapsed = time.perf_counter() - t0
+    print(f"  done  ({elapsed:.1f}s)")
 
     t = torch.tensor(latencies_ms)
     latency_ms = t.median().item()
@@ -624,8 +664,11 @@ def main() -> None:
             from fuseml import FuseMLCompiler
 
             fuseml_model = torch.compile(model, backend=FuseMLCompiler())
+            print("\nTriggering FuseML compilation (first forward pass)...", end="", flush=True)
+            t0 = time.perf_counter()
             with torch.no_grad():
                 fuseml_model(x)  # trigger compilation
+            print(f"  done  ({time.perf_counter() - t0:.1f}s)")
             compiled_models["FuseML"] = fuseml_model
         except Exception as exc:
             print(f"WARNING: FuseML compilation failed: {exc}")
@@ -639,10 +682,13 @@ def main() -> None:
     #
     # We warm up ALL compiled models, not just Eager, so that every
     # backend's first Timer invocation sees stabilised clocks.
-    print("\nGPU Warmup (stabilising clocks)...", end="", flush=True)
-    for warmup_model in compiled_models.values():
+    n_modes = len(compiled_models)
+    print(f"\nGPU Warmup (stabilising clocks)  [{n_modes} model(s), {GPU_WARMUP_ITERS} iters each]:")
+    for idx, (name, warmup_model) in enumerate(compiled_models.items(), 1):
+        print(f"  [{idx}/{n_modes}] {name}...", end="", flush=True)
+        t0 = time.perf_counter()
         _gpu_warmup(warmup_model, x, iters=GPU_WARMUP_ITERS)
-    print("  done")
+        print(f"  done  ({time.perf_counter() - t0:.1f}s)")
 
     # -- Correctness validation --
     print("\nCorrectness Validation:")
@@ -672,10 +718,13 @@ def main() -> None:
         print(f"  Savings:            {saved_mb:,.1f} MB ({saved_mb / eager_traffic.total_mb * 100:.1f}% reduction)")
 
     # -- Run benchmarks --
-    print("\nRunning benchmarks...")
+    n_modes = len(compiled_models)
+    method = "precise (CUDA events)" if args.precise else f"timer (min {MIN_RUN_TIME:.0f}s)"
+    print(f"\nRunning benchmarks  [{n_modes} mode(s), method: {method}]:")
     results: list[BenchmarkResult] = []
-    for mode_name, mode_model in compiled_models.items():
-        print(f"  Benchmarking {mode_name}...", end="", flush=True)
+    for idx, (mode_name, mode_model) in enumerate(compiled_models.items(), 1):
+        print(f"\n  [{idx}/{n_modes}] {mode_name}")
+        t0 = time.perf_counter()
         result = benchmark_mode(
             label=mode_name,
             model=mode_model,
@@ -685,8 +734,12 @@ def main() -> None:
             warmup_iters=args.warmup,
             measure_iters=args.iters,
         )
+        elapsed = time.perf_counter() - t0
         results.append(result)
-        print(f"  done ({result.latency_ms:.2f} ms median)")
+        print(
+            f"  -> {result.latency_ms:.3f} ms median  "
+            f"(IQR: {result.iqr_ms:.3f} ms, total: {elapsed:.1f}s)"
+        )
 
     # -- Results --
     print_results_table(results)
