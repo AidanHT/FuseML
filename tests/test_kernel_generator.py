@@ -641,15 +641,13 @@ class TestEpilogueRelu:
 
 @pytest.mark.codegen
 class TestEpilogueGelu:
-    """GeLU post-op: tl.math.tanh hardware intrinsic."""
+    """GeLU post-op: libdevice.tanh hardware intrinsic."""
 
     def test_gelu_emits_tanh_intrinsic(self, gen):
-        """Uses tl.math.tanh hardware intrinsic instead of Padé polynomial."""
+        """Uses libdevice.tanh hardware intrinsic instead of Padé polynomial."""
         node = _make_node(target=torch.ops.aten.gelu.default)
         code = gen.generate_epilogue([node])
-        assert "tl.math.tanh" in code
-        # Must NOT use the slow libdevice path
-        assert "libdevice.tanh" not in code
+        assert "libdevice.tanh" in code
 
     def test_gelu_sqrt_2_over_pi(self, gen):
         """Must use sqrt(2/pi) ≈ 0.7978845608028654 constant."""
@@ -670,13 +668,13 @@ class TestEpilogueGelu:
         assert "0.5 * acc" in code
 
     def test_gelu_modifies_acc(self, gen):
-        """Result must be assigned back to acc using tl.math.tanh."""
+        """Result must be assigned back to acc using libdevice.tanh."""
         node = _make_node(target=torch.ops.aten.gelu.default)
         code = gen.generate_epilogue([node])
-        assert "acc = 0.5 * acc * (1.0 + tl.math.tanh(_gelu_inner))" in code
+        assert "acc = 0.5 * acc * (1.0 + libdevice.tanh(_gelu_inner))" in code
 
     def test_gelu_no_pade_inner_sq(self, gen):
-        """tl.math.tanh replaces Padé — no _inner_sq computation needed."""
+        """libdevice.tanh replaces Padé — no _inner_sq computation needed."""
         node = _make_node(target=torch.ops.aten.gelu.default)
         code = gen.generate_epilogue([node])
         assert "_inner_sq" not in code
@@ -843,7 +841,7 @@ class TestEpilogueChained:
             args=(gelu_node, residual),
         )
         code = gen.generate_epilogue([gelu_node, add_node])
-        assert code.index("tl.math.tanh") < code.index("tl.load")
+        assert code.index("libdevice.tanh") < code.index("tl.load")
 
     def test_add_then_relu(self, gen):
         """Residual add followed by ReLU."""
@@ -928,7 +926,7 @@ class TestEpilogueTransparentOps:
         code = gen.generate_epilogue([relu_node, view_node, gelu_node])
         assert "tl.where" in code        # relu
         assert "no-op" in code            # view
-        assert "tl.math.tanh" in code     # gelu (tl.math.tanh intrinsic)
+        assert "libdevice.tanh" in code     # gelu (libdevice.tanh intrinsic)
 
     def test_unsqueeze_emits_noop(self, gen):
         node = _make_node(target=torch.ops.aten.unsqueeze.default)
@@ -995,7 +993,7 @@ class TestEpilogueEdgeCases:
         code = gen.generate_epilogue([])
         assert "Epilogue" in code
         assert "tl.where" not in code
-        assert "tl.math.tanh" not in code
+        assert "libdevice.tanh" not in code
         assert "tl.load" not in code
 
     def test_placeholder_nodes_skipped(self, gen):
@@ -1003,7 +1001,7 @@ class TestEpilogueEdgeCases:
         ph = _make_node(op="placeholder", name="x")
         code = gen.generate_epilogue([ph])
         assert "tl.where" not in code
-        assert "tl.math.tanh" not in code
+        assert "libdevice.tanh" not in code
         assert "tl.load" not in code
 
     def test_output_nodes_skipped(self, gen):
@@ -1033,7 +1031,7 @@ class TestEpilogueEdgeCases:
         # Only the epilogue header should be emitted, no op code
         assert "Epilogue" in code
         assert "tl.where" not in code
-        assert "tl.math.tanh" not in code
+        assert "libdevice.tanh" not in code
         assert "tl.load" not in code
 
 

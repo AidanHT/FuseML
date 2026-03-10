@@ -259,13 +259,33 @@ class TestFuseMLCompilerBuildLauncher:
         mock_tl_math = types.ModuleType("triton.language.math")
         mock_tl.math = mock_tl_math
 
+        # Mock for triton.language.extra.cuda.libdevice (used by GeLU)
+        mock_libdevice = types.ModuleType("triton.language.extra.cuda.libdevice")
+        mock_cuda = types.ModuleType("triton.language.extra.cuda")
+        mock_cuda.libdevice = mock_libdevice
+        mock_extra = types.ModuleType("triton.language.extra")
+        mock_extra.cuda = mock_cuda
+        mock_tl.extra = mock_extra
+
+        # Mock Config as a simple dict wrapper
+        class MockConfig:
+            def __init__(self, kwargs, num_warps=4, num_stages=2):
+                self.kwargs = kwargs
+                self.num_warps = num_warps
+                self.num_stages = num_stages
+
         mock_triton = types.ModuleType("triton")
         mock_triton.jit = lambda fn: fn
+        mock_triton.autotune = lambda configs, key: (lambda fn: fn)
+        mock_triton.Config = MockConfig
         mock_triton.language = mock_tl
 
         monkeypatch.setitem(sys.modules, "triton", mock_triton)
         monkeypatch.setitem(sys.modules, "triton.language", mock_tl)
         monkeypatch.setitem(sys.modules, "triton.language.math", mock_tl_math)
+        monkeypatch.setitem(sys.modules, "triton.language.extra", mock_extra)
+        monkeypatch.setitem(sys.modules, "triton.language.extra.cuda", mock_cuda)
+        monkeypatch.setitem(sys.modules, "triton.language.extra.cuda.libdevice", mock_libdevice)
 
     def test_returns_launcher_for_valid_group(self):
         """Linear+ReLU group with shape metadata yields a KernelLauncher."""

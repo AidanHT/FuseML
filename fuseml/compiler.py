@@ -40,10 +40,7 @@ from fuseml.codegen.kernel_generator import (
     _classify,
     _identify_matmul_operands,
 )
-from fuseml.codegen.kernel_launcher import (
-    KernelLauncher,
-    compute_launch_params,
-)
+from fuseml.codegen.kernel_launcher import KernelLauncher
 from fuseml.fusion_group import FusionGroup
 from fuseml.passes.control_flow_validation import (
     ControlFlowError,
@@ -417,9 +414,18 @@ class FuseMLCompiler:
             logger.warning("Matmul operand identification failed for %s: %s", group, exc)
             return None
 
-        # ── Code generation ───────────────────────────────────────────
+        # ── Detect reduction early (needed for autotune config) ───────
+        has_reduction = any(
+            hasattr(n, "target") and "sum" in str(getattr(n.target, "__name__", ""))
+            or hasattr(n, "target") and "mean" in str(getattr(n.target, "__name__", ""))
+            or hasattr(n, "target") and "amax" in str(getattr(n.target, "__name__", ""))
+            for n in group.fused_nodes
+        )
+
+        # ── Code generation (autotuned) ──────────────────────────────
         sig = self._generator.generate_signature_and_pointers(
-            input_descs, out_desc, intermediate_descs
+            input_descs, out_desc, intermediate_descs,
+            autotune=True, has_reduction=has_reduction,
         )
         kloop = self._generator.generate_k_loop(input_descs, out_desc)
         all_ids = {id(n) for n in group.all_nodes}
@@ -447,13 +453,7 @@ class FuseMLCompiler:
             reduction_op = self._generator._last_reduction.op
             reduction_axis = self._generator._last_reduction.axis
 
-        # ── Pre-compute launch parameters (off the critical path) ────
-        M = int(left.shape[-2])
-        K = int(left.shape[-1])
-        N = int(right.shape[-1])
-        launch_params = compute_launch_params(M, N, K, out_desc.dtype)
-
-        # ── Assemble launcher ─────────────────────────────────────────
+        # ── Assemble launcher (autotuned — Triton selects block sizes) ─
         launcher = KernelLauncher(
             kernel_fn=kernel_fn,
             input_descriptors=input_descs,
@@ -461,7 +461,7 @@ class FuseMLCompiler:
             intermediate_descriptors=intermediate_descs,
             left_name=left.name,
             right_name=right.name,
-            launch_params=launch_params,
+            is_autotuned=True,
             reduction_op=reduction_op,
             reduction_axis=reduction_axis,
         )

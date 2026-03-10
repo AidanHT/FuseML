@@ -77,8 +77,11 @@ _DTYPE_BYTES: dict[torch.dtype, int] = {
 _AUTOTUNE_SRAM_BUDGET_BYTES: int = 100 * 1024
 
 # Candidate tile dimensions for autotune config generation.
-_AUTOTUNE_BLOCK_M_CHOICES: tuple[int, ...] = (32, 64, 128)
-_AUTOTUNE_BLOCK_N_CHOICES: tuple[int, ...] = (32, 64, 128)
+# Kept small (~12 configs after SRAM pruning) to bound first-run
+# compilation time.  Covers the key performance-relevant axes:
+# tile size (occupancy vs. reuse) and pipeline depth (latency hiding).
+_AUTOTUNE_BLOCK_M_CHOICES: tuple[int, ...] = (64, 128)
+_AUTOTUNE_BLOCK_N_CHOICES: tuple[int, ...] = (64, 128)
 _AUTOTUNE_BLOCK_K_CHOICES: tuple[int, ...] = (32, 64)
 
 # Standard warp counts and software-pipelining depths.
@@ -87,7 +90,7 @@ _AUTOTUNE_BLOCK_K_CHOICES: tuple[int, ...] = (32, 64)
 # cp.async copies with Tensor Core compute, but increase register
 # pressure.  The autotuner selects the optimal balance at runtime.
 _AUTOTUNE_NUM_WARPS_CHOICES: tuple[int, ...] = (4, 8)
-_AUTOTUNE_NUM_STAGES_CHOICES: tuple[int, ...] = (2, 3, 4, 5)
+_AUTOTUNE_NUM_STAGES_CHOICES: tuple[int, ...] = (3, 5)
 
 # Reduction-specialised warp counts — higher counts saturate the SMs
 # during tl.atomic_add / tl.atomic_max cross-thread synchronisation.
@@ -968,7 +971,8 @@ class TritonKernelGenerator:
         # Prepend the required imports so the file is self-contained.
         full_source = (
             "import triton\n"
-            "import triton.language as tl\n\n"
+            "import triton.language as tl\n"
+            "from triton.language.extra.cuda import libdevice\n\n"
             + source
         )
         module_name = f"_fuseml_kernel_{cache_key[:16]}"
@@ -1423,24 +1427,24 @@ class TritonKernelGenerator:
 
     @staticmethod
     def _emit_gelu() -> str:
-        """GeLU activation via ``tl.math.tanh`` (hardware libdevice intrinsic).
+        """GeLU activation via ``libdevice.tanh`` (hardware intrinsic).
 
         Matches PyTorch's ``gelu(approximate='tanh')`` formula::
 
             x * 0.5 * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x³)))
 
-        Uses ``tl.math.tanh`` which maps to a single-instruction
-        ``libdevice`` call on Ada Lovelace — faster and more accurate
-        than a polynomial approximation.  The accumulator stays in FP32
-        through the entire computation for maximum precision.
+        Uses ``libdevice.tanh`` which maps to a single-instruction
+        CUDA libdevice call — faster and more accurate than a polynomial
+        approximation.  The accumulator stays in FP32 through the entire
+        computation for maximum precision.
 
         All arithmetic stays in SRAM registers — no HBM round-trip.
         """
         return "\n".join([
-            "    # GeLU activation — tl.math.tanh intrinsic (all in SRAM registers)",
+            "    # GeLU activation — libdevice.tanh intrinsic (all in SRAM registers)",
             "    # Formula: x * 0.5 * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))",
             "    _gelu_inner = 0.7978845608028654 * (acc + 0.044715 * acc * acc * acc)",
-            "    acc = 0.5 * acc * (1.0 + tl.math.tanh(_gelu_inner))",
+            "    acc = 0.5 * acc * (1.0 + libdevice.tanh(_gelu_inner))",
         ])
 
     @staticmethod

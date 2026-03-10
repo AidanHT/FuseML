@@ -42,8 +42,8 @@ D_INTERMEDIATE: int = 16384
 
 DTYPE = torch.bfloat16
 
-WARMUP_ITERS: int = 20
-MEASURE_ITERS: int = 100
+WARMUP_ITERS: int = 50
+MEASURE_ITERS: int = 200
 MIN_RUN_TIME: float = 5.0  # seconds, for Timer.blocked_autorange
 
 # Number of GPU warmup iterations run BEFORE any benchmark.  These force
@@ -51,7 +51,7 @@ MIN_RUN_TIME: float = 5.0  # seconds, for Timer.blocked_autorange
 # (thermal throttling, DVFS ramp, driver init) from contaminating the
 # first measured mode.  20 dummy matmuls at full problem size is enough to
 # trigger boost clocks on laptop GPUs (RTX 4050/4060/4070).
-GPU_WARMUP_ITERS: int = 20
+GPU_WARMUP_ITERS: int = 50
 
 L2_FLUSH_SIZE_BYTES: int = 128 * 1024 * 1024  # 128 MB (exceeds all known GPU L2 caches)
 
