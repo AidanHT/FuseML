@@ -25,33 +25,47 @@ FuseML achieves up to **21% latency reduction** and **47% HBM traffic eliminatio
 
 ### Latency Comparison
 
-![Latency Comparison](docs/images/latency_comparison.png)
+#### Compute-Bound Workload
 
-*Lower is better. FuseML achieves 1.21x speedup on memory-bound workloads and matches cuBLAS performance on compute-bound workloads.*
+![Latency Compute-Bound](docs/images/latency_compute_bound.png)
 
-### Speedup vs Eager Mode
+*Large preset (276ms): FuseML achieves 1.03x speedup using cuBLAS epilogue fusion.*
+
+#### Memory-Bound Workloads
+
+![Latency Memory-Bound](docs/images/latency_memory_bound.png)
+
+*Memory-bound presets show clear latency reductions with appropriate scale.*
+
+### Performance Metrics
 
 ![Speedup Analysis](docs/images/speedup_analysis.png)
 
-*Values >1.0 indicate FuseML is faster than eager PyTorch. Memory-bound preset shows significant gains (1.21x), while compute-bound presets leverage cuBLAS epilogue fusion for competitive performance.*
-
-### HBM Traffic Reduction
-
-![HBM Traffic](docs/images/hbm_traffic.png)
-
-*FuseML reduces absolute HBM traffic through kernel fusion, translating to lower memory bandwidth requirements and energy consumption.*
-
-### HBM Traffic Savings
+*Values >1.0 indicate FuseML is faster than eager PyTorch.*
 
 ![HBM Saved Percentage](docs/images/hbm_saved_percentage.png)
 
-*FuseML reduces HBM traffic by 35-47% across memory-bound and compute-bound presets, with the largest savings on memory-bound workloads.*
+*FuseML reduces HBM traffic by 35-47% through kernel fusion.*
+
+### Memory Efficiency
+
+#### Compute-Bound Workload
+
+![HBM Compute-Bound](docs/images/hbm_compute_bound.png)
+
+*Large preset: 1024 MB eliminated (34.8% reduction).*
+
+#### Memory-Bound Workloads
+
+![HBM Memory-Bound](docs/images/hbm_memory_bound.png)
+
+*Significant absolute savings: 80 MB (memory_bound), 40 MB (medium).*
 
 ### Kernel Count Reduction
 
 ![Kernel Count](docs/images/kernel_count.png)
 
-*FuseML reduces kernel launches from 4 (eager) to 2-3 (fused), improving GPU utilization and reducing launch overhead.*
+*FuseML reduces kernel launches from 4 (eager) to 2-3 (fused).*
 
 ---
 
