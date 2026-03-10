@@ -391,7 +391,7 @@ class TestEpilogueChainedReduction:
         code = gen.generate_epilogue(
             [gelu_node, max_node], output_descriptor=output_reduced_m,
         )
-        assert code.index("_tanh_approx") < code.index("tl.max")
+        assert code.index("tl.math.tanh") < code.index("tl.max")
 
     def test_add_then_sum(self, gen, output_reduced_m):
         residual = _make_node(op="placeholder", name="res")

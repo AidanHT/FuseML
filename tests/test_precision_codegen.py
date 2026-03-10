@@ -595,7 +595,7 @@ class TestPrecisionIntegration:
     """End-to-end pipeline tests combining multiple precision features."""
 
     def test_fp16_inputs_fp16_output_full_pipeline(self, gen):
-        """FP16 matmul with fp32 accumulation, epilogue downcast, and saturation store."""
+        """FP16 matmul with fp32 accumulation and saturation store."""
         a = TensorDescriptor("a", (128, 64), (64, 1), torch.float16)
         b = TensorDescriptor("b", (64, 256), (256, 1), torch.float16)
         out = TensorDescriptor("out", (128, 256), (256, 1), torch.float16)
@@ -605,15 +605,15 @@ class TestPrecisionIntegration:
 
         # K-loop uses native dtype loads + fp32 accumulation via acc=acc
         assert "acc = tl.dot(a, b, acc=acc)" in kloop
-        # K-loop epilogue downcast: FP16 saturation + narrowing cast
-        assert "65504" in kloop
-        assert "acc.to(tl.float16)" in kloop or ".to(tl.float16)" in kloop
+        # K-loop does NOT downcast — cast happens only in _section_store
+        assert "65504" not in kloop
+        assert ".to(tl.float16)" not in kloop
         # Store has saturation + cast
         assert "65504.0" in store
         assert "acc.to(tl.float16)" in store
 
     def test_bf16_inputs_bf16_output_no_saturation(self, gen):
-        """BF16 matmul with fp32 accumulation and epilogue downcast, no saturation."""
+        """BF16 matmul with fp32 accumulation, no saturation."""
         a = TensorDescriptor("a", (128, 64), (64, 1), torch.bfloat16)
         b = TensorDescriptor("b", (64, 256), (256, 1), torch.bfloat16)
         out = TensorDescriptor("out", (128, 256), (256, 1), torch.bfloat16)
@@ -621,9 +621,9 @@ class TestPrecisionIntegration:
         kloop = gen.generate_k_loop([a, b], out)
         store = gen._section_store(out)
 
-        # K-loop uses native dtype + epilogue downcast to bf16
+        # K-loop uses native dtype — no downcast in k_loop anymore
         assert "acc = tl.dot(a, b, acc=acc)" in kloop
-        assert ".to(tl.bfloat16)" in kloop
+        assert ".to(tl.bfloat16)" not in kloop
         assert "65504" not in store
         assert "acc.to(tl.bfloat16)" in store
 

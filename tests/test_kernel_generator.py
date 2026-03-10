@@ -641,22 +641,21 @@ class TestEpilogueRelu:
 
 @pytest.mark.codegen
 class TestEpilogueGelu:
-    """GeLU post-op: fast-math Padé polynomial approximation."""
+    """GeLU post-op: tl.math.tanh hardware intrinsic."""
 
-    def test_gelu_emits_pade_approx(self, gen):
-        """Uses Padé(3,2) rational polynomial instead of libdevice.tanh."""
+    def test_gelu_emits_tanh_intrinsic(self, gen):
+        """Uses tl.math.tanh hardware intrinsic instead of Padé polynomial."""
         node = _make_node(target=torch.ops.aten.gelu.default)
         code = gen.generate_epilogue([node])
-        assert "_tanh_approx" in code
-        assert "27.0" in code
+        assert "tl.math.tanh" in code
         # Must NOT use the slow libdevice path
         assert "libdevice.tanh" not in code
 
     def test_gelu_sqrt_2_over_pi(self, gen):
-        """Must use sqrt(2/pi) ≈ 0.7978845608 constant."""
+        """Must use sqrt(2/pi) ≈ 0.7978845608028654 constant."""
         node = _make_node(target=torch.ops.aten.gelu.default)
         code = gen.generate_epilogue([node])
-        assert "0.7978845608" in code
+        assert "0.7978845608028654" in code
 
     def test_gelu_cubic_coefficient(self, gen):
         """Must use the 0.044715 coefficient for the x^3 term."""
@@ -671,16 +670,16 @@ class TestEpilogueGelu:
         assert "0.5 * acc" in code
 
     def test_gelu_modifies_acc(self, gen):
-        """Result must be assigned back to acc using the polynomial approx."""
+        """Result must be assigned back to acc using tl.math.tanh."""
         node = _make_node(target=torch.ops.aten.gelu.default)
         code = gen.generate_epilogue([node])
-        assert "acc = 0.5 * acc * (1.0 + _tanh_approx)" in code
+        assert "acc = 0.5 * acc * (1.0 + tl.math.tanh(_gelu_inner))" in code
 
-    def test_gelu_pade_inner_sq(self, gen):
-        """Padé approximation computes inner² for the rational polynomial."""
+    def test_gelu_no_pade_inner_sq(self, gen):
+        """tl.math.tanh replaces Padé — no _inner_sq computation needed."""
         node = _make_node(target=torch.ops.aten.gelu.default)
         code = gen.generate_epilogue([node])
-        assert "_inner_sq = _gelu_inner * _gelu_inner" in code
+        assert "_inner_sq" not in code
 
     def test_gelu_no_hbm_load(self, gen):
         """GeLU is register-only — must not emit tl.load."""
@@ -844,7 +843,7 @@ class TestEpilogueChained:
             args=(gelu_node, residual),
         )
         code = gen.generate_epilogue([gelu_node, add_node])
-        assert code.index("_tanh_approx") < code.index("tl.load")
+        assert code.index("tl.math.tanh") < code.index("tl.load")
 
     def test_add_then_relu(self, gen):
         """Residual add followed by ReLU."""
@@ -929,7 +928,7 @@ class TestEpilogueTransparentOps:
         code = gen.generate_epilogue([relu_node, view_node, gelu_node])
         assert "tl.where" in code        # relu
         assert "no-op" in code            # view
-        assert "_tanh_approx" in code     # gelu (Padé polynomial)
+        assert "tl.math.tanh" in code     # gelu (tl.math.tanh intrinsic)
 
     def test_unsqueeze_emits_noop(self, gen):
         node = _make_node(target=torch.ops.aten.unsqueeze.default)

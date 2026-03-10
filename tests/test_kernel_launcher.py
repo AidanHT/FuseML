@@ -105,8 +105,8 @@ class TestKernelLauncherInit:
 
     def test_default_block_sizes(self, mock_kernel_fn, input_descs, output_desc):
         launcher = KernelLauncher(mock_kernel_fn, input_descs, output_desc, [], "a", "b")
-        assert launcher._launch_params.block_m == 64
-        assert launcher._launch_params.block_n == 64
+        assert launcher._launch_params.block_m == 128
+        assert launcher._launch_params.block_n == 128
         assert launcher._launch_params.block_k == 32
 
     def test_custom_block_sizes(self, mock_kernel_fn, input_descs, output_desc):
@@ -468,31 +468,31 @@ class TestSelectNumWarps:
     """Verify num_warps heuristic returns correct values for various configs."""
 
     def test_tiny_problem_returns_2(self):
-        """M*N < 1024 → 2 warps regardless of dtype."""
-        assert _select_num_warps(16, 16, 64, torch.float32) == 2
-        assert _select_num_warps(16, 16, 64, torch.float16) == 2
+        """block_m*block_n < 1024 → 2 warps regardless of dtype."""
+        assert _select_num_warps(16, 16, torch.float32) == 2
+        assert _select_num_warps(16, 16, torch.float16) == 2
 
     def test_fp32_medium_returns_4(self):
         """FP32 with moderate tile size → 4 warps."""
-        assert _select_num_warps(128, 256, 64, torch.float32) == 4
+        assert _select_num_warps(128, 256, torch.float32) == 4
 
     def test_fp16_large_returns_8(self):
         """FP16 with large tile (>= 4096 elements) → 8 warps for tensor cores."""
-        assert _select_num_warps(128, 256, 64, torch.float16) == 8
+        assert _select_num_warps(128, 256, torch.float16) == 8
 
     def test_bf16_large_returns_8(self):
         """BF16 behaves like FP16."""
-        assert _select_num_warps(128, 256, 64, torch.bfloat16) == 8
+        assert _select_num_warps(128, 256, torch.bfloat16) == 8
 
     def test_fp16_small_tile_returns_4(self):
         """FP16 with tile area < 4096 but >= 1024 → 4 warps (not enough to justify 8)."""
-        assert _select_num_warps(32, 64, 64, torch.float16) == 4
+        assert _select_num_warps(32, 64, torch.float16) == 4
 
     def test_return_value_is_power_of_2(self):
         """All returned num_warps should be powers of 2 (Triton requirement)."""
-        for M, N, K in [(16, 16, 8), (64, 64, 32), (256, 512, 128)]:
+        for block_m, block_n in [(16, 16), (64, 64), (256, 512)]:
             for dt in (torch.float32, torch.float16, torch.bfloat16):
-                nw = _select_num_warps(M, N, K, dt)
+                nw = _select_num_warps(block_m, block_n, dt)
                 assert nw & (nw - 1) == 0, f"num_warps={nw} is not a power of 2"
 
 
@@ -632,8 +632,8 @@ class TestGroupSizeMKwarg:
         grid = call["grid"]
         assert isinstance(grid, tuple)
         assert len(grid) == 1
-        # total_programs = ceil(128/64) * ceil(256/64) = 2 * 4 = 8
-        assert grid[0] == 8
+        # total_programs = ceil(128/128) * ceil(256/128) = 1 * 2 = 2
+        assert grid[0] == 2
 
 
 # ---------------------------------------------------------------------------
@@ -718,7 +718,7 @@ class TestGridBoundaryMasking:
         monkeypatch.setitem(sys.modules, "triton", mock_triton)
 
     def test_non_divisible_m(self, mock_kernel_fn, output_desc):
-        """M=100 with BLOCK_SIZE_M=64 → grid = ceil(100/64) * ceil(256/64) = 2 * 4 = 8."""
+        """M=100 with BLOCK_SIZE_M=128 → grid = ceil(100/128) * ceil(256/128) = 1 * 2 = 2."""
         a_desc = TensorDescriptor("a", (100, 64), (64, 1), torch.float32)
         b_desc = TensorDescriptor("b", (64, 256), (256, 1), torch.float32)
         out_desc = TensorDescriptor("out", (100, 256), (256, 1), torch.float32)
@@ -730,15 +730,15 @@ class TestGridBoundaryMasking:
         launcher(a, b)
         call = mock_kernel_fn.calls[0]
         (total_programs,) = call["grid"]
-        grid_m = (100 + 64 - 1) // 64   # 2
-        grid_n = (256 + 64 - 1) // 64   # 4
+        grid_m = (100 + 128 - 1) // 128   # 1
+        grid_n = (256 + 128 - 1) // 128   # 2
         assert total_programs == grid_m * grid_n
         # M=100, N=256 passed for boundary mask
         assert call["args"][3] == 100
         assert call["args"][4] == 256
 
     def test_non_divisible_n(self, mock_kernel_fn):
-        """N=200 with BLOCK_SIZE_N=64 → grid = 2 * 4 = 8."""
+        """N=200 with BLOCK_SIZE_N=128 → grid = 1 * 2 = 2."""
         a_desc = TensorDescriptor("a", (128, 64), (64, 1), torch.float32)
         b_desc = TensorDescriptor("b", (64, 200), (200, 1), torch.float32)
         out_desc = TensorDescriptor("out", (128, 200), (200, 1), torch.float32)
@@ -750,13 +750,13 @@ class TestGridBoundaryMasking:
         launcher(a, b)
         call = mock_kernel_fn.calls[0]
         (total_programs,) = call["grid"]
-        grid_m = (128 + 64 - 1) // 64   # 2
-        grid_n = (200 + 64 - 1) // 64   # 4
+        grid_m = (128 + 128 - 1) // 128   # 1
+        grid_n = (200 + 128 - 1) // 128   # 2
         assert total_programs == grid_m * grid_n
         assert call["args"][4] == 200  # N passed for mask
 
     def test_both_non_divisible(self, mock_kernel_fn):
-        """Vocab-like shape: M=32001, N=127 with block 64/64."""
+        """Vocab-like shape: M=32001, N=127 with block 128/128."""
         a_desc = TensorDescriptor("a", (32001, 64), (64, 1), torch.float32)
         b_desc = TensorDescriptor("b", (64, 127), (127, 1), torch.float32)
         out_desc = TensorDescriptor("out", (32001, 127), (127, 1), torch.float32)
@@ -768,8 +768,8 @@ class TestGridBoundaryMasking:
         launcher(a, b)
         call = mock_kernel_fn.calls[0]
         (total_programs,) = call["grid"]
-        grid_m = (32001 + 64 - 1) // 64  # 501
-        grid_n = (127 + 64 - 1) // 64    # 2
+        grid_m = (32001 + 128 - 1) // 128  # 251
+        grid_n = (127 + 128 - 1) // 128    # 1
         assert total_programs == grid_m * grid_n
         assert call["args"][3] == 32001
         assert call["args"][4] == 127
@@ -1082,7 +1082,7 @@ class TestZeroOverheadGrid:
         launcher(a, b)
         call = mock_kernel_fn.calls[0]
         (total_programs,) = call["grid"]
-        assert total_programs == 8  # ceil(128/64) * ceil(256/64)
+        assert total_programs == 2  # ceil(128/128) * ceil(256/128)
 
     def test_native_division_matches_cdiv(self, mock_kernel_fn, input_descs, output_desc):
         """Native (a + b - 1) // b matches triton.cdiv for non-divisible dims."""
@@ -1097,7 +1097,7 @@ class TestZeroOverheadGrid:
         launcher(a, b)
         call = mock_kernel_fn.calls[0]
         (total_programs,) = call["grid"]
-        expected = ((100 + 64 - 1) // 64) * ((200 + 64 - 1) // 64)
+        expected = ((100 + 128 - 1) // 128) * ((200 + 128 - 1) // 128)
         assert total_programs == expected
 
     def test_grid_is_lambda_closure(self, mock_kernel_fn, input_descs, output_desc):
@@ -1282,8 +1282,8 @@ class TestComputeLaunchParams:
 
     def test_default_block_sizes(self):
         lp = compute_launch_params(128, 256, 64, torch.float32)
-        assert lp.block_m == 64
-        assert lp.block_n == 64
+        assert lp.block_m == 128
+        assert lp.block_n == 128
         assert lp.block_k == 32
         assert lp.group_size_m == 8
 
