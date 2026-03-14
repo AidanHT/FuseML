@@ -1,6 +1,6 @@
 # FuseML Overview
 
-Designed and built by **Aidan Tran** in under 48 hours (March 8th 6:03POM -March 10 2:48PM)!
+Designed and built by **Aidan Tran** in under 48 hours (March 8th 6:03PM -March 10 2:48PM)!
 
 FuseML is a JIT (Just-in-Time) deep-learning compiler that benchmarked up to **70.0%** HBM traffic elmination and **1.79x** speedup (latency reduction).
 
