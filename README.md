@@ -13,7 +13,7 @@ PyTorch's eager mode (default execution strategy) executes each operation indepe
 
 ## Solution
 
-FuseML intercepts the FX graph at compile time, discovers fusible operator chains (GEMM + pointwise oeprations) and generates custom CUDA kernels that keep intermeidates in SRAM instead of constantly traveling through HBM.
+FuseML intercepts the FX graph at compile time, discovers fusible operator chains (GEMM + pointwise operations) and generates custom CUDA kernels that keep intermediates in SRAM instead of constantly traveling through HBM.
 
 ## 10-Stage Compilation Pipeline
 
@@ -248,42 +248,6 @@ The activation-heavy workload benefits most because eager execution requires 6 s
 **M = 128** | GEMMs too small for profitable fusion. FuseML bypasses compilation, ensuring **zero regression**.
 
 ---
-
-## Three-Tier Execution Model
-
-FuseML uses an adaptive cost model to select the optimal execution strategy per GEMM:
-
-```
-                    Trigger GEMM detected
-                            |
-                            v
-                  is_compute_bound_gemm()?
-                            |
-                    +-------+-------+
-                    |               |
-                    No              Yes
-                    |               |
-                    v               v
-            is_tiny_output()?   Has fusible epilogue?
-                    |           (GeLU, ReLU, bias, add)
-                +---+---+               |
-                |       |           +---+---+
-                No      Yes         No      Yes
-                |       |           |       |
-                v       v           v       v
-             Triton   Eager     Eager    cuBLAS +
-             fused    bypass    bypass   cublasLt
-             kernel                     epilogue
-```
-
-| Strategy            | When Used                                      | Mechanism                                                    |
-| ------------------- | ---------------------------------------------- | ------------------------------------------------------------ |
-| **Triton Fusion**   | Memory-bound GEMMs with sufficient output size | Custom `@triton.jit` kernel fuses GEMM + elementwise in SRAM |
-| **cuBLAS Epilogue** | Compute-bound GEMMs with fusible activation    | `cublasLt` GELU/ReLU epilogue via `_addmm_activation`        |
-| **Eager Bypass**    | Tiny GEMMs or no fusible pattern               | Identical to `torch.compile`-free execution, zero overhead   |
-
----
-
 ## HBM Traffic Analysis
 
 ### MLP Block — Memory-Bound Preset (M=16384, D=256, I=1024, bf16)
